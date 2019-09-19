@@ -3,36 +3,19 @@
 //! # Example
 //!
 //! ```no_run
-//! #![feature(async_await)]
+//! use may_postgres::{Error, Row};
 //!
-//! use futures::{FutureExt, TryStreamExt};
-//! use tokio_postgres::{NoTls, Error, Row};
-//!
-//! # #[cfg(not(feature = "runtime"))] fn main() {}
-//! # #[cfg(feature = "runtime")]
-//! #[tokio::main] // By default, tokio_postgres uses the tokio crate as its runtime.
-//! async fn main() -> Result<(), Error> {
+//! fn main() -> Result<(), Error> {
 //!     // Connect to the database.
-//!     let (mut client, connection) =
-//!         tokio_postgres::connect("host=localhost user=postgres", NoTls).await?;
-//!
-//!     // The connection object performs the actual communication with the database,
-//!     // so spawn it off to run on its own.
-//!     let connection = connection.map(|r| {
-//!         if let Err(e) = r {
-//!             eprintln!("connection error: {}", e);
-//!         }
-//!     });
-//!     tokio::spawn(connection);
+//!     let mut client= may_postgres::connect("host=localhost user=postgres")?;
 //!
 //!     // Now we can prepare a simple statement that just returns its parameter.
-//!     let stmt = client.prepare("SELECT $1::TEXT").await?;
+//!     let stmt = client.prepare("SELECT $1::TEXT")?;
 //!
 //!     // And then execute it, returning a Stream of Rows which we collect into a Vec.
 //!     let rows: Vec<Row> = client
 //!         .query(&stmt, &[&"hello world"])
-//!         .try_collect()
-//!         .await?;
+//!         .try_collect()?
 //!
 //!     // Now we can check that we got back the same string we sent over.
 //!     let value: &str = rows[0].get(0);
@@ -76,36 +59,18 @@
 //! Pipelining happens automatically when futures are polled concurrently (for example, by using the futures `join`
 //! combinator):
 //!
-//! ```rust
-//! use futures::future;
-//! use std::future::Future;
-//! use tokio_postgres::{Client, Error, Statement};
-//!
-//! fn pipelined_prepare(
-//!     client: &mut Client,
-//! ) -> impl Future<Output = Result<(Statement, Statement), Error>>
-//! {
-//!     future::try_join(
-//!         client.prepare("SELECT * FROM foo"),
-//!         client.prepare("INSERT INTO bar (id, name) VALUES ($1, $2)")
-//!     )
-//! }
-//! ```
-//!
-//! # Runtime
-//!
-//! The client works with arbitrary `AsyncRead + AsyncWrite` streams. Convenience APIs are provided to handle the
-//! connection process, but these are gated by the `runtime` Cargo feature, which is enabled by default. If disabled,
-//! all dependence on the tokio runtime is removed.
-//!
-//! # SSL/TLS support
-//!
-//! TLS support is implemented via external libraries. `Client::connect` and `Config::connect` take a TLS implementation
-//! as an argument. The `NoTls` type in this crate can be used when TLS is not required. Otherwise, the
-//! `postgres-openssl` and `postgres-native-tls` crates provide implementations backed by the `openssl` and `native-tls`
-//! crates, respectively.
-#![doc(html_root_url = "https://docs.rs/tokio-postgres/0.4.0-rc.3")]
+#![feature(try_trait)]
+#![doc(html_root_url = "https://docs.rs/may-postgres/0.1.0")]
 #![warn(rust_2018_idioms, clippy::all, missing_docs)]
+
+macro_rules! o_try {
+    ($expr:expr) => {
+        match $expr {
+            Ok(val) => val,
+            Err(err) => return Some(Err(std::convert::From::from(err))),
+        }
+    };
+}
 
 pub use crate::client::Client;
 pub use crate::config::Config;
@@ -114,41 +79,30 @@ use crate::error::DbError;
 pub use crate::error::Error;
 pub use crate::portal::Portal;
 pub use crate::row::{Row, SimpleQueryRow};
-#[cfg(feature = "runtime")]
-pub use crate::socket::Socket;
-#[cfg(feature = "runtime")]
-use crate::tls::MakeTlsConnect;
-pub use crate::tls::NoTls;
 pub use crate::transaction::Transaction;
 pub use statement::{Column, Statement};
 
 mod bind;
-#[cfg(feature = "runtime")]
 mod cancel_query;
 mod cancel_query_raw;
 mod client;
 mod codec;
 pub mod config;
-#[cfg(feature = "runtime")]
 mod connect;
 mod connect_raw;
-#[cfg(feature = "runtime")]
 mod connect_socket;
-mod connect_tls;
 mod connection;
 mod copy_in;
 mod copy_out;
 pub mod error;
-mod maybe_tls_stream;
 mod portal;
 mod prepare;
 mod query;
 pub mod row;
 mod simple_query;
-#[cfg(feature = "runtime")]
-mod socket;
 mod statement;
 mod transaction;
+mod try_iterator;
 pub mod types;
 
 /// A convenience function which parses a connection string and connects to the database.
@@ -158,16 +112,9 @@ pub mod types;
 /// Requires the `runtime` Cargo feature (enabled by default).
 ///
 /// [`Config`]: ./Config.t.html
-#[cfg(feature = "runtime")]
-pub async fn connect<T>(
-    config: &str,
-    tls: T,
-) -> Result<(Client, Connection<Socket, T::Stream>), Error>
-where
-    T: MakeTlsConnect<Socket>,
-{
+pub fn connect(config: &str) -> Result<Client, Error> {
     let config = config.parse::<Config>()?;
-    config.connect(tls).await
+    config.connect()
 }
 
 /// An asynchronous notification.

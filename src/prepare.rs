@@ -6,12 +6,8 @@ use crate::query;
 use crate::types::{Field, Kind, Oid, ToSql, Type};
 use crate::{Column, Error, Statement};
 use fallible_iterator::FallibleIterator;
-use futures::{future, TryStreamExt};
-use pin_utils::pin_mut;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -57,53 +53,46 @@ ORDER BY attnum
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
-pub fn prepare(
-    client: Arc<InnerClient>,
-    query: &str,
-    types: &[Type],
-) -> impl Future<Output = Result<Statement, Error>> + 'static {
+pub fn prepare(client: Arc<InnerClient>, query: &str, types: &[Type]) -> Result<Statement, Error> {
     let name = format!("s{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
-    let buf = encode(&name, query, types);
+    let buf = encode(&name, query, types)?;
 
-    async move {
-        let buf = buf?;
-        let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+    let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
-        match responses.next().await? {
-            Message::ParseComplete => {}
-            _ => return Err(Error::unexpected_message()),
-        }
-
-        let parameter_description = match responses.next().await? {
-            Message::ParameterDescription(body) => body,
-            _ => return Err(Error::unexpected_message()),
-        };
-
-        let row_description = match responses.next().await? {
-            Message::RowDescription(body) => Some(body),
-            Message::NoData => None,
-            _ => return Err(Error::unexpected_message()),
-        };
-
-        let mut parameters = vec![];
-        let mut it = parameter_description.parameters();
-        while let Some(oid) = it.next().map_err(Error::parse)? {
-            let type_ = get_type(&client, oid).await?;
-            parameters.push(type_);
-        }
-
-        let mut columns = vec![];
-        if let Some(row_description) = row_description {
-            let mut it = row_description.fields();
-            while let Some(field) = it.next().map_err(Error::parse)? {
-                let type_ = get_type(&client, field.type_oid()).await?;
-                let column = Column::new(field.name().to_string(), type_);
-                columns.push(column);
-            }
-        }
-
-        Ok(Statement::new(&client, name, parameters, columns))
+    match responses.next()? {
+        Message::ParseComplete => {}
+        _ => return Err(Error::unexpected_message()),
     }
+
+    let parameter_description = match responses.next()? {
+        Message::ParameterDescription(body) => body,
+        _ => return Err(Error::unexpected_message()),
+    };
+
+    let row_description = match responses.next()? {
+        Message::RowDescription(body) => Some(body),
+        Message::NoData => None,
+        _ => return Err(Error::unexpected_message()),
+    };
+
+    let mut parameters = vec![];
+    let mut it = parameter_description.parameters();
+    while let Some(oid) = it.next().map_err(Error::parse)? {
+        let type_ = get_type(&client, oid)?;
+        parameters.push(type_);
+    }
+
+    let mut columns = vec![];
+    if let Some(row_description) = row_description {
+        let mut it = row_description.fields();
+        while let Some(field) = it.next().map_err(Error::parse)? {
+            let type_ = get_type(&client, field.type_oid())?;
+            let column = Column::new(field.name().to_string(), type_);
+            columns.push(column);
+        }
+    }
+
+    Ok(Statement::new(&client, name, parameters, columns))
 }
 
 fn encode(name: &str, query: &str, types: &[Type]) -> Result<Vec<u8>, Error> {
@@ -115,7 +104,7 @@ fn encode(name: &str, query: &str, types: &[Type]) -> Result<Vec<u8>, Error> {
     Ok(buf)
 }
 
-async fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
+fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
     if let Some(type_) = Type::from_oid(oid) {
         return Ok(type_);
     }
@@ -124,14 +113,13 @@ async fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
         return Ok(type_);
     }
 
-    let stmt = typeinfo_statement(client).await?;
+    let stmt = typeinfo_statement(client)?;
 
     let params: &[&dyn ToSql] = &[&oid];
     let buf = query::encode(&stmt, params.iter().cloned());
     let rows = query::query(client.clone(), stmt, buf);
-    pin_mut!(rows);
 
-    let row = match rows.try_next().await? {
+    let row = match rows.next().transpose()? {
         Some(row) => row,
         None => return Err(Error::unexpected_message()),
     };
@@ -145,21 +133,21 @@ async fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
     let relid: Oid = row.try_get(6)?;
 
     let kind = if type_ == b'e' as i8 {
-        let variants = get_enum_variants(client, oid).await?;
+        let variants = get_enum_variants(client, oid)?;
         Kind::Enum(variants)
     } else if type_ == b'p' as i8 {
         Kind::Pseudo
     } else if basetype != 0 {
-        let type_ = get_type_rec(client, basetype).await?;
+        let type_ = get_type_rec(client, basetype)?;
         Kind::Domain(type_)
     } else if elem_oid != 0 {
-        let type_ = get_type_rec(client, elem_oid).await?;
+        let type_ = get_type_rec(client, elem_oid)?;
         Kind::Array(type_)
     } else if relid != 0 {
-        let fields = get_composite_fields(client, relid).await?;
+        let fields = get_composite_fields(client, relid)?;
         Kind::Composite(fields)
     } else if let Some(rngsubtype) = rngsubtype {
-        let type_ = get_type_rec(client, rngsubtype).await?;
+        let type_ = get_type_rec(client, rngsubtype)?;
         Kind::Range(type_)
     } else {
         Kind::Simple
@@ -171,22 +159,19 @@ async fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
     Ok(type_)
 }
 
-fn get_type_rec<'a>(
-    client: &'a Arc<InnerClient>,
-    oid: Oid,
-) -> Pin<Box<dyn Future<Output = Result<Type, Error>> + 'a>> {
-    Box::pin(get_type(client, oid))
+fn get_type_rec(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
+    get_type(client, oid)
 }
 
-async fn typeinfo_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
+fn typeinfo_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
     if let Some(stmt) = client.typeinfo() {
         return Ok(stmt);
     }
 
-    let stmt = match Box::pin(prepare(client.clone(), TYPEINFO_QUERY, &[])).await {
+    let stmt = match prepare(client.clone(), TYPEINFO_QUERY, &[]) {
         Ok(stmt) => stmt,
         Err(ref e) if e.code() == Some(&SqlState::UNDEFINED_TABLE) => {
-            Box::pin(prepare(client.clone(), TYPEINFO_FALLBACK_QUERY, &[])).await?
+            prepare(client.clone(), TYPEINFO_FALLBACK_QUERY, &[])?
         }
         Err(e) => return Err(e),
     };
@@ -195,26 +180,25 @@ async fn typeinfo_statement(client: &Arc<InnerClient>) -> Result<Statement, Erro
     Ok(stmt)
 }
 
-async fn get_enum_variants(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<String>, Error> {
-    let stmt = typeinfo_enum_statement(client).await?;
+fn get_enum_variants(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<String>, Error> {
+    let stmt = typeinfo_enum_statement(client)?;
 
     let params: &[&dyn ToSql] = &[&oid];
     let buf = query::encode(&stmt, params.iter().cloned());
     query::query(client.clone(), stmt, buf)
-        .and_then(|row| future::ready(row.try_get(0)))
-        .try_collect()
-        .await
+        .filter_map(|row| row.ok().map(|r| r.try_get(0)))
+        .collect()
 }
 
-async fn typeinfo_enum_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
+fn typeinfo_enum_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
     if let Some(stmt) = client.typeinfo_enum() {
         return Ok(stmt);
     }
 
-    let stmt = match Box::pin(prepare(client.clone(), TYPEINFO_ENUM_QUERY, &[])).await {
+    let stmt = match prepare(client.clone(), TYPEINFO_ENUM_QUERY, &[]) {
         Ok(stmt) => stmt,
         Err(ref e) if e.code() == Some(&SqlState::UNDEFINED_COLUMN) => {
-            Box::pin(prepare(client.clone(), TYPEINFO_ENUM_FALLBACK_QUERY, &[])).await?
+            prepare(client.clone(), TYPEINFO_ENUM_FALLBACK_QUERY, &[])?
         }
         Err(e) => return Err(e),
     };
@@ -223,32 +207,30 @@ async fn typeinfo_enum_statement(client: &Arc<InnerClient>) -> Result<Statement,
     Ok(stmt)
 }
 
-async fn get_composite_fields(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<Field>, Error> {
-    let stmt = typeinfo_composite_statement(client).await?;
+fn get_composite_fields(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<Field>, Error> {
+    let stmt = typeinfo_composite_statement(client)?;
 
     let params: &[&dyn ToSql] = &[&oid];
     let buf = query::encode(&stmt, params.iter().cloned());
-    let rows = query::query(client.clone(), stmt, buf)
-        .try_collect::<Vec<_>>()
-        .await?;
+    let rows = query::query(client.clone(), stmt, buf).collect::<Result<Vec<_>, _>>()?;
 
     let mut fields = vec![];
     for row in rows {
         let name = row.try_get(0)?;
         let oid = row.try_get(1)?;
-        let type_ = Box::pin(get_type(client, oid)).await?;
+        let type_ = get_type(client, oid)?;
         fields.push(Field::new(name, type_));
     }
 
     Ok(fields)
 }
 
-async fn typeinfo_composite_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
+fn typeinfo_composite_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
     if let Some(stmt) = client.typeinfo_composite() {
         return Ok(stmt);
     }
 
-    let stmt = Box::pin(prepare(client.clone(), TYPEINFO_COMPOSITE_QUERY, &[])).await?;
+    let stmt = prepare(client.clone(), TYPEINFO_COMPOSITE_QUERY, &[])?;
 
     client.set_typeinfo_composite(&stmt);
     Ok(stmt)

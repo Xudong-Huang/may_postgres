@@ -1,21 +1,14 @@
-use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCodec};
+use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCodec, Framed};
 use crate::copy_in::CopyInReceiver;
 use crate::error::DbError;
-use crate::maybe_tls_stream::MaybeTlsStream;
 use crate::{AsyncMessage, Error, Notification};
 use fallible_iterator::FallibleIterator;
-use futures::channel::mpsc;
-use futures::stream::FusedStream;
-use futures::{ready, Sink, Stream, StreamExt};
 use log::trace;
+use may::net::TcpStream;
+use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::collections::{HashMap, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::codec::Framed;
-use tokio::io::{AsyncRead, AsyncWrite};
 
 pub enum RequestMessages {
     Single(FrontendMessage),
@@ -45,27 +38,22 @@ enum State {
 ///
 /// `Connection` implements `Future`, and only resolves when the connection is closed, either because a fatal error has
 /// occurred, or because its associated `Client` has dropped and all outstanding work has completed.
-#[must_use = "futures do nothing unless polled"]
-pub struct Connection<S, T> {
-    stream: Framed<MaybeTlsStream<S, T>, PostgresCodec>,
+pub struct Connection {
+    stream: Framed<TcpStream>,
     parameters: HashMap<String, String>,
-    receiver: mpsc::UnboundedReceiver<Request>,
+    receiver: mpsc::Receiver<Request>,
     pending_request: Option<RequestMessages>,
     pending_response: Option<BackendMessage>,
     responses: VecDeque<Response>,
     state: State,
 }
 
-impl<S, T> Connection<S, T>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-    T: AsyncRead + AsyncWrite + Unpin,
-{
+impl Connection {
     pub(crate) fn new(
-        stream: Framed<MaybeTlsStream<S, T>, PostgresCodec>,
+        stream: Framed<TcpStream>,
         parameters: HashMap<String, String>,
-        receiver: mpsc::UnboundedReceiver<Request>,
-    ) -> Connection<S, T> {
+        receiver: mpsc::Receiver<Request>,
+    ) -> Connection {
         Connection {
             stream,
             parameters,
@@ -320,15 +308,15 @@ where
     }
 }
 
-impl<S, T> Future for Connection<S, T>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    type Output = Result<(), Error>;
+// impl<S, T> Future for Connection<S, T>
+// where
+//     S: AsyncRead + AsyncWrite + Unpin,
+//     T: AsyncRead + AsyncWrite + Unpin,
+// {
+//     type Output = Result<(), Error>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        while let Some(_) = ready!(self.poll_message(cx)?) {}
-        Poll::Ready(Ok(()))
-    }
-}
+//     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+//         while let Some(_) = ready!(self.poll_message(cx)?) {}
+//         Poll::Ready(Ok(()))
+//     }
+// }

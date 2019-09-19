@@ -1,18 +1,10 @@
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
-#[cfg(feature = "runtime")]
-use crate::tls::MakeTlsConnect;
-use crate::tls::TlsConnect;
 use crate::types::{ToSql, Type};
-#[cfg(feature = "runtime")]
-use crate::Socket;
 use crate::{bind, query, Client, Error, Portal, Row, SimpleQueryMessage, Statement};
 use bytes::{Bytes, IntoBuf};
-use futures::{Stream, TryStream};
+use may::net::TcpStream;
 use postgres_protocol::message::frontend;
-use std::error;
-use std::future::Future;
-use tokio::io::{AsyncRead, AsyncWrite};
 
 /// A representation of a PostgreSQL database transaction.
 ///
@@ -54,31 +46,31 @@ impl<'a> Transaction<'a> {
     }
 
     /// Consumes the transaction, committing all changes made within it.
-    pub async fn commit(mut self) -> Result<(), Error> {
+    pub fn commit(mut self) -> Result<(), Error> {
         self.done = true;
         let query = if self.depth == 0 {
             "COMMIT".to_string()
         } else {
             format!("RELEASE sp{}", self.depth)
         };
-        self.client.batch_execute(&query).await
+        self.client.batch_execute(&query)
     }
 
     /// Rolls the transaction back, discarding all changes made within it.
     ///
     /// This is equivalent to `Transaction`'s `Drop` implementation, but provides any error encountered to the caller.
-    pub async fn rollback(mut self) -> Result<(), Error> {
+    pub fn rollback(mut self) -> Result<(), Error> {
         self.done = true;
         let query = if self.depth == 0 {
             "ROLLBACK".to_string()
         } else {
             format!("ROLLBACK TO sp{}", self.depth)
         };
-        self.client.batch_execute(&query).await
+        self.client.batch_execute(&query)
     }
 
     /// Like `Client::prepare`.
-    pub fn prepare(&mut self, query: &str) -> impl Future<Output = Result<Statement, Error>> {
+    pub fn prepare(&mut self, query: &str) -> Result<Statement, Error> {
         self.client.prepare(query)
     }
 
@@ -87,7 +79,7 @@ impl<'a> Transaction<'a> {
         &mut self,
         query: &str,
         parameter_types: &[Type],
-    ) -> impl Future<Output = Result<Statement, Error>> {
+    ) -> Result<Statement, Error> {
         self.client.prepare_typed(query, parameter_types)
     }
 
@@ -96,7 +88,7 @@ impl<'a> Transaction<'a> {
         &mut self,
         statement: &Statement,
         params: &[&dyn ToSql],
-    ) -> impl Stream<Item = Result<Row, Error>> {
+    ) -> impl Iterator<Item = Result<Row, Error>> {
         self.client.query(statement, params)
     }
 
@@ -105,7 +97,7 @@ impl<'a> Transaction<'a> {
         &mut self,
         statement: &Statement,
         params: I,
-    ) -> impl Stream<Item = Result<Row, Error>> + 'static
+    ) -> impl Iterator<Item = Result<Row, Error>> + 'static
     where
         I: IntoIterator<Item = &'b dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
@@ -116,20 +108,12 @@ impl<'a> Transaction<'a> {
     }
 
     /// Like `Client::execute`.
-    pub fn execute(
-        &mut self,
-        statement: &Statement,
-        params: &[&dyn ToSql],
-    ) -> impl Future<Output = Result<u64, Error>> {
+    pub fn execute(&mut self, statement: &Statement, params: &[&dyn ToSql]) -> Result<u64, Error> {
         self.client.execute(statement, params)
     }
 
     /// Like `Client::execute_iter`.
-    pub fn execute_iter<'b, I>(
-        &mut self,
-        statement: &Statement,
-        params: I,
-    ) -> impl Future<Output = Result<u64, Error>>
+    pub fn execute_iter<'b, I>(&mut self, statement: &Statement, params: I) -> Result<u64, Error>
     where
         I: IntoIterator<Item = &'b dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
@@ -147,11 +131,7 @@ impl<'a> Transaction<'a> {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn bind(
-        &mut self,
-        statement: &Statement,
-        params: &[&dyn ToSql],
-    ) -> impl Future<Output = Result<Portal, Error>> {
+    pub fn bind(&mut self, statement: &Statement, params: &[&dyn ToSql]) -> Result<Portal, Error> {
         // https://github.com/rust-lang/rust/issues/63032
         let buf = bind::encode(statement, params.iter().cloned());
         bind::bind(self.client.inner(), statement.clone(), buf)
@@ -160,11 +140,7 @@ impl<'a> Transaction<'a> {
     /// Like [`bind`], but takes an iterator of parameters rather than a slice.
     ///
     /// [`bind`]: #method.bind
-    pub fn bind_iter<'b, I>(
-        &mut self,
-        statement: &Statement,
-        params: I,
-    ) -> impl Future<Output = Result<Portal, Error>>
+    pub fn bind_iter<'b, I>(&mut self, statement: &Statement, params: I) -> Result<Portal, Error>
     where
         I: IntoIterator<Item = &'b dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
@@ -181,22 +157,22 @@ impl<'a> Transaction<'a> {
         &mut self,
         portal: &Portal,
         max_rows: i32,
-    ) -> impl Stream<Item = Result<Row, Error>> {
+    ) -> impl Iterator<Item = Result<Row, Error>> {
         query::query_portal(self.client.inner(), portal.clone(), max_rows)
     }
 
     /// Like `Client::copy_in`.
-    pub fn copy_in<S>(
+    pub fn copy_in<T, E, S>(
         &mut self,
         statement: &Statement,
         params: &[&dyn ToSql],
         stream: S,
-    ) -> impl Future<Output = Result<u64, Error>>
+    ) -> Result<u64, Error>
     where
-        S: TryStream,
-        S::Ok: IntoBuf,
-        <S::Ok as IntoBuf>::Buf: 'static + Send,
-        S::Error: Into<Box<dyn error::Error + Sync + Send>>,
+        S: Iterator<Item = Result<T, E>>,
+        T: IntoBuf,
+        <T as IntoBuf>::Buf: 'static + Send,
+        E: Into<Box<dyn std::error::Error + Sync + Send>>,
     {
         self.client.copy_in(statement, params, stream)
     }
@@ -206,7 +182,7 @@ impl<'a> Transaction<'a> {
         &mut self,
         statement: &Statement,
         params: &[&dyn ToSql],
-    ) -> impl Stream<Item = Result<Bytes, Error>> {
+    ) -> impl Iterator<Item = Result<Bytes, Error>> {
         self.client.copy_out(statement, params)
     }
 
@@ -214,42 +190,30 @@ impl<'a> Transaction<'a> {
     pub fn simple_query(
         &mut self,
         query: &str,
-    ) -> impl Stream<Item = Result<SimpleQueryMessage, Error>> {
+    ) -> impl Iterator<Item = Result<SimpleQueryMessage, Error>> {
         self.client.simple_query(query)
     }
 
     /// Like `Client::batch_execute`.
-    pub fn batch_execute(&mut self, query: &str) -> impl Future<Output = Result<(), Error>> {
+    pub fn batch_execute(&mut self, query: &str) -> Result<(), Error> {
         self.client.batch_execute(query)
     }
 
     /// Like `Client::cancel_query`.
-    #[cfg(feature = "runtime")]
-    pub fn cancel_query<T>(&mut self, tls: T) -> impl Future<Output = Result<(), Error>>
-    where
-        T: MakeTlsConnect<Socket>,
-    {
-        self.client.cancel_query(tls)
+    pub fn cancel_query(&mut self) -> Result<(), Error> {
+        self.client.cancel_query()
     }
 
     /// Like `Client::cancel_query_raw`.
-    pub fn cancel_query_raw<S, T>(
-        &mut self,
-        stream: S,
-        tls: T,
-    ) -> impl Future<Output = Result<(), Error>>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-        T: TlsConnect<S>,
-    {
-        self.client.cancel_query_raw(stream, tls)
+    pub fn cancel_query_raw<S, T>(&mut self, stream: TcpStream) -> Result<(), Error> {
+        self.client.cancel_query_raw(stream)
     }
 
     /// Like `Client::transaction`.
-    pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
+    pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         let depth = self.depth + 1;
         let query = format!("SAVEPOINT sp{}", depth);
-        self.batch_execute(&query).await?;
+        self.batch_execute(&query)?;
 
         Ok(Transaction {
             client: self.client,

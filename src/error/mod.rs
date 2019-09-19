@@ -345,7 +345,6 @@ enum Kind {
     Authentication,
     ConfigParse,
     Config,
-    #[cfg(feature = "runtime")]
     Connect,
 }
 
@@ -383,7 +382,6 @@ impl fmt::Display for Error {
             Kind::Authentication => fmt.write_str("authentication error")?,
             Kind::ConfigParse => fmt.write_str("invalid connection string")?,
             Kind::Config => fmt.write_str("invalid configuration")?,
-            #[cfg(feature = "runtime")]
             Kind::Connect => fmt.write_str("error connecting to server")?,
         };
         if let Some(ref cause) = self.0.cause {
@@ -483,7 +481,6 @@ impl Error {
         Error::new(Kind::Config, Some(e))
     }
 
-    #[cfg(feature = "runtime")]
     pub(crate) fn connect(e: io::Error) -> Error {
         Error::new(Kind::Connect, Some(Box::new(e)))
     }

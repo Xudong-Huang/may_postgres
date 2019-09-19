@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
-pub async fn bind(
+pub fn bind(
     client: Arc<InnerClient>,
     statement: Statement,
     bind: Result<PendingBind, Error>,
@@ -19,7 +19,7 @@ pub async fn bind(
 
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(bind.buf)))?;
 
-    match responses.next().await? {
+    match responses.next()? {
         Message::BindComplete => {}
         _ => return Err(Error::unexpected_message()),
     }

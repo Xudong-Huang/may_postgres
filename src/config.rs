@@ -1,26 +1,15 @@
 //! Connection configuration.
 
-#[cfg(feature = "runtime")]
 use crate::connect::connect;
 use crate::connect_raw::connect_raw;
-#[cfg(feature = "runtime")]
-use crate::tls::MakeTlsConnect;
-use crate::tls::TlsConnect;
-#[cfg(feature = "runtime")]
-use crate::Socket;
-use crate::{Client, Connection, Error};
+use crate::{Client, Error};
 use std::borrow::Cow;
-#[cfg(unix)]
-use std::ffi::OsStr;
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
-use std::path::{Path, PathBuf};
 use std::str;
 use std::str::FromStr;
 use std::time::Duration;
 use std::{error, fmt, iter, mem};
-use tokio::io::{AsyncRead, AsyncWrite};
+
+use may::net::TcpStream;
 
 /// Properties required of a session.
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -33,24 +22,9 @@ pub enum TargetSessionAttrs {
     __NonExhaustive,
 }
 
-/// TLS configuration.
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum SslMode {
-    /// Do not use TLS.
-    Disable,
-    /// Attempt to connect with TLS but allow sessions without.
-    Prefer,
-    /// Require the use of TLS.
-    Require,
-    #[doc(hidden)]
-    __NonExhaustive,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Host {
     Tcp(String),
-    #[cfg(unix)]
-    Unix(PathBuf),
 }
 
 /// Connection configuration.
@@ -133,7 +107,6 @@ pub struct Config {
     pub(crate) dbname: Option<String>,
     pub(crate) options: Option<String>,
     pub(crate) application_name: Option<String>,
-    pub(crate) ssl_mode: SslMode,
     pub(crate) host: Vec<Host>,
     pub(crate) port: Vec<u16>,
     pub(crate) connect_timeout: Option<Duration>,
@@ -157,7 +130,6 @@ impl Config {
             dbname: None,
             options: None,
             application_name: None,
-            ssl_mode: SslMode::Prefer,
             host: vec![],
             port: vec![],
             connect_timeout: None,
@@ -201,14 +173,6 @@ impl Config {
     /// Sets the value of the `application_name` runtime parameter.
     pub fn application_name(&mut self, application_name: &str) -> &mut Config {
         self.application_name = Some(application_name.to_string());
-        self
-    }
-
-    /// Sets the SSL configuration.
-    ///
-    /// Defaults to `prefer`.
-    pub fn ssl_mode(&mut self, ssl_mode: SslMode) -> &mut Config {
-        self.ssl_mode = ssl_mode;
         self
     }
 
@@ -304,15 +268,6 @@ impl Config {
             "application_name" => {
                 self.application_name(&value);
             }
-            "sslmode" => {
-                let mode = match value {
-                    "disable" => SslMode::Disable,
-                    "prefer" => SslMode::Prefer,
-                    "require" => SslMode::Require,
-                    _ => return Err(Error::config_parse(Box::new(InvalidValue("sslmode")))),
-                };
-                self.ssl_mode(mode);
-            }
             "host" => {
                 for host in value.split(',') {
                     self.host(host);
@@ -376,27 +331,15 @@ impl Config {
     /// Opens a connection to a PostgreSQL database.
     ///
     /// Requires the `runtime` Cargo feature (enabled by default).
-    #[cfg(feature = "runtime")]
-    pub async fn connect<T>(&self, tls: T) -> Result<(Client, Connection<Socket, T::Stream>), Error>
-    where
-        T: MakeTlsConnect<Socket>,
-    {
-        connect(tls, self).await
+    pub fn connect(&self) -> Result<Client, Error> {
+        connect(self)
     }
 
     /// Connects to a PostgreSQL database over an arbitrary stream.
     ///
     /// All of the settings other than `user`, `password`, `dbname`, `options`, and `application` name are ignored.
-    pub async fn connect_raw<S, T>(
-        &self,
-        stream: S,
-        tls: T,
-    ) -> Result<(Client, Connection<S, T::Stream>), Error>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-        T: TlsConnect<S>,
-    {
-        connect_raw(stream, tls, self).await
+    pub fn connect_raw(&self, stream: TcpStream) -> Result<Client, Error> {
+        connect_raw(stream, self)
     }
 }
 
@@ -427,7 +370,7 @@ impl fmt::Debug for Config {
             .field("dbname", &self.dbname)
             .field("options", &self.options)
             .field("application_name", &self.application_name)
-            .field("ssl_mode", &self.ssl_mode)
+            // .field("ssl_mode", &self.ssl_mode)
             .field("host", &self.host)
             .field("port", &self.port)
             .field("connect_timeout", &self.connect_timeout)

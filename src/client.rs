@@ -1,32 +1,20 @@
-#[cfg(feature = "runtime")]
 use crate::cancel_query;
 use crate::codec::BackendMessages;
-use crate::config::{Host, SslMode};
+use crate::config::Host;
 use crate::connection::{Request, RequestMessages};
-#[cfg(feature = "runtime")]
-use crate::tls::MakeTlsConnect;
-use crate::tls::TlsConnect;
 use crate::types::{Oid, ToSql, Type};
-#[cfg(feature = "runtime")]
-use crate::Socket;
 use crate::{cancel_query_raw, copy_in, copy_out, query, Transaction};
 use crate::{prepare, SimpleQueryMessage};
 use crate::{simple_query, Row};
 use crate::{Error, Statement};
 use bytes::{Bytes, IntoBuf};
 use fallible_iterator::FallibleIterator;
-use futures::channel::mpsc;
-use futures::{future, Stream, TryStream};
-use futures::{ready, StreamExt};
-use parking_lot::Mutex;
+use may::net::TcpStream;
+use may::sync::{mpsc, Mutex};
 use postgres_protocol::message::backend::Message;
 use std::collections::HashMap;
-use std::error;
-use std::future::Future;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
 
 pub struct Responses {
     receiver: mpsc::Receiver<BackendMessages>,
@@ -34,23 +22,19 @@ pub struct Responses {
 }
 
 impl Responses {
-    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Result<Message, Error>> {
+    pub fn next(&mut self) -> Result<Message, Error> {
         loop {
             match self.cur.next().map_err(Error::parse)? {
-                Some(Message::ErrorResponse(body)) => return Poll::Ready(Err(Error::db(body))),
-                Some(message) => return Poll::Ready(Ok(message)),
+                Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
+                Some(message) => return Ok(message),
                 None => {}
             }
 
-            match ready!(self.receiver.poll_next_unpin(cx)) {
-                Some(messages) => self.cur = messages,
-                None => return Poll::Ready(Err(Error::closed())),
+            match self.receiver.recv() {
+                Ok(messages) => self.cur = messages,
+                Err(_) => return Err(Error::closed()),
             }
         }
-    }
-
-    pub async fn next(&mut self) -> Result<Message, Error> {
-        future::poll_fn(|cx| self.poll_next(cx)).await
     }
 }
 
@@ -62,17 +46,15 @@ struct State {
 }
 
 pub struct InnerClient {
-    sender: mpsc::UnboundedSender<Request>,
+    sender: mpsc::Sender<Request>,
     state: Mutex<State>,
 }
 
 impl InnerClient {
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
-        let (sender, receiver) = mpsc::channel(1);
+        let (sender, receiver) = mpsc::channel();
         let request = Request { messages, sender };
-        self.sender
-            .unbounded_send(request)
-            .map_err(|_| Error::closed())?;
+        self.sender.send(request).map_err(|_| Error::closed())?;
 
         Ok(Responses {
             receiver,
@@ -81,35 +63,35 @@ impl InnerClient {
     }
 
     pub fn typeinfo(&self) -> Option<Statement> {
-        self.state.lock().typeinfo.clone()
+        self.state.lock().unwrap().typeinfo.clone()
     }
 
     pub fn set_typeinfo(&self, statement: &Statement) {
-        self.state.lock().typeinfo = Some(statement.clone());
+        self.state.lock().unwrap().typeinfo = Some(statement.clone());
     }
 
     pub fn typeinfo_composite(&self) -> Option<Statement> {
-        self.state.lock().typeinfo_composite.clone()
+        self.state.lock().unwrap().typeinfo_composite.clone()
     }
 
     pub fn set_typeinfo_composite(&self, statement: &Statement) {
-        self.state.lock().typeinfo_composite = Some(statement.clone());
+        self.state.lock().unwrap().typeinfo_composite = Some(statement.clone());
     }
 
     pub fn typeinfo_enum(&self) -> Option<Statement> {
-        self.state.lock().typeinfo_enum.clone()
+        self.state.lock().unwrap().typeinfo_enum.clone()
     }
 
     pub fn set_typeinfo_enum(&self, statement: &Statement) {
-        self.state.lock().typeinfo_enum = Some(statement.clone());
+        self.state.lock().unwrap().typeinfo_enum = Some(statement.clone());
     }
 
     pub fn type_(&self, oid: Oid) -> Option<Type> {
-        self.state.lock().types.get(&oid).cloned()
+        self.state.lock().unwrap().types.get(&oid).cloned()
     }
 
     pub fn set_type(&self, oid: Oid, type_: &Type) {
-        self.state.lock().types.insert(oid, type_.clone());
+        self.state.lock().unwrap().types.insert(oid, type_.clone());
     }
 }
 
@@ -128,20 +110,13 @@ pub(crate) struct SocketConfig {
 /// through this client object.
 pub struct Client {
     inner: Arc<InnerClient>,
-    #[cfg(feature = "runtime")]
     socket_config: Option<SocketConfig>,
-    ssl_mode: SslMode,
     process_id: i32,
     secret_key: i32,
 }
 
 impl Client {
-    pub(crate) fn new(
-        sender: mpsc::UnboundedSender<Request>,
-        ssl_mode: SslMode,
-        process_id: i32,
-        secret_key: i32,
-    ) -> Client {
+    pub(crate) fn new(sender: mpsc::Sender<Request>, process_id: i32, secret_key: i32) -> Client {
         Client {
             inner: Arc::new(InnerClient {
                 sender,
@@ -152,9 +127,7 @@ impl Client {
                     types: HashMap::new(),
                 }),
             }),
-            #[cfg(feature = "runtime")]
             socket_config: None,
-            ssl_mode,
             process_id,
             secret_key,
         }
@@ -164,7 +137,6 @@ impl Client {
         self.inner.clone()
     }
 
-    #[cfg(feature = "runtime")]
     pub(crate) fn set_socket_config(&mut self, socket_config: SocketConfig) {
         self.socket_config = Some(socket_config);
     }
@@ -173,7 +145,7 @@ impl Client {
     ///
     /// Prepared statements can be executed repeatedly, and may contain query parameters (indicated by `$1`, `$2`, etc),
     /// which are set when executed. Prepared statements can only be used with the connection that created them.
-    pub fn prepare(&mut self, query: &str) -> impl Future<Output = Result<Statement, Error>> {
+    pub fn prepare(&mut self, query: &str) -> Result<Statement, Error> {
         self.prepare_typed(query, &[])
     }
 
@@ -185,7 +157,7 @@ impl Client {
         &mut self,
         query: &str,
         parameter_types: &[Type],
-    ) -> impl Future<Output = Result<Statement, Error>> {
+    ) -> Result<Statement, Error> {
         prepare::prepare(self.inner(), query, parameter_types)
     }
 
@@ -198,7 +170,7 @@ impl Client {
         &mut self,
         statement: &Statement,
         params: &[&dyn ToSql],
-    ) -> impl Stream<Item = Result<Row, Error>> {
+    ) -> impl Iterator<Item = Result<Row, Error>> {
         let buf = query::encode(statement, params.iter().cloned());
         query::query(self.inner(), statement.clone(), buf)
     }
@@ -210,7 +182,7 @@ impl Client {
         &mut self,
         statement: &Statement,
         params: I,
-    ) -> impl Stream<Item = Result<Row, Error>>
+    ) -> impl Iterator<Item = Result<Row, Error>>
     where
         I: IntoIterator<Item = &'a dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
@@ -226,11 +198,7 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn execute(
-        &mut self,
-        statement: &Statement,
-        params: &[&dyn ToSql],
-    ) -> impl Future<Output = Result<u64, Error>> {
+    pub fn execute(&mut self, statement: &Statement, params: &[&dyn ToSql]) -> Result<u64, Error> {
         let buf = query::encode(statement, params.iter().cloned());
         query::execute(self.inner(), buf)
     }
@@ -238,11 +206,7 @@ impl Client {
     /// Like [`execute`], but takes an iterator of parameters rather than a slice.
     ///
     /// [`execute`]: #method.execute
-    pub fn execute_iter<'a, I>(
-        &mut self,
-        statement: &Statement,
-        params: I,
-    ) -> impl Future<Output = Result<u64, Error>>
+    pub fn execute_iter<'a, I>(&mut self, statement: &Statement, params: I) -> Result<u64, Error>
     where
         I: IntoIterator<Item = &'a dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
@@ -259,17 +223,17 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn copy_in<S>(
+    pub fn copy_in<T, E, S>(
         &mut self,
         statement: &Statement,
         params: &[&dyn ToSql],
         stream: S,
-    ) -> impl Future<Output = Result<u64, Error>>
+    ) -> Result<u64, Error>
     where
-        S: TryStream,
-        S::Ok: IntoBuf,
-        <S::Ok as IntoBuf>::Buf: 'static + Send,
-        S::Error: Into<Box<dyn error::Error + Sync + Send>>,
+        S: Iterator<Item = Result<T, E>>,
+        T: IntoBuf,
+        <T as IntoBuf>::Buf: 'static + Send,
+        E: Into<Box<dyn std::error::Error + Sync + Send>>,
     {
         let buf = query::encode(statement, params.iter().cloned());
         copy_in::copy_in(self.inner(), buf, stream)
@@ -284,7 +248,7 @@ impl Client {
         &mut self,
         statement: &Statement,
         params: &[&dyn ToSql],
-    ) -> impl Stream<Item = Result<Bytes, Error>> {
+    ) -> impl Iterator<Item = Result<Bytes, Error>> {
         let buf = query::encode(statement, params.iter().cloned());
         copy_out::copy_out(self.inner(), buf)
     }
@@ -305,7 +269,7 @@ impl Client {
     pub fn simple_query(
         &mut self,
         query: &str,
-    ) -> impl Stream<Item = Result<SimpleQueryMessage, Error>> {
+    ) -> impl Iterator<Item = Result<SimpleQueryMessage, Error>> {
         simple_query::simple_query(self.inner(), query)
     }
 
@@ -319,15 +283,15 @@ impl Client {
     /// Prepared statements should be use for any query which contains user-specified data, as they provided the
     /// functionality to safely embed that data in the request. Do not form statements via string concatenation and pass
     /// them to this method!
-    pub fn batch_execute(&mut self, query: &str) -> impl Future<Output = Result<(), Error>> {
+    pub fn batch_execute(&mut self, query: &str) -> Result<(), Error> {
         simple_query::batch_execute(self.inner(), query)
     }
 
     /// Begins a new database transaction.
     ///
     /// The transaction will roll back by default - use the `commit` method to commit it.
-    pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
-        self.batch_execute("BEGIN").await?;
+    pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
+        self.batch_execute("BEGIN")?;
         Ok(Transaction::new(self))
     }
 
@@ -336,45 +300,21 @@ impl Client {
     /// The server provides no information about whether a cancellation attempt was successful or not. An error will
     /// only be returned if the client was unable to connect to the database.
     ///
-    /// Requires the `runtime` Cargo feature (enabled by default).
-    #[cfg(feature = "runtime")]
-    pub fn cancel_query<T>(&mut self, tls: T) -> impl Future<Output = Result<(), Error>>
-    where
-        T: MakeTlsConnect<Socket>,
-    {
-        cancel_query::cancel_query(
-            self.socket_config.clone(),
-            self.ssl_mode,
-            tls,
-            self.process_id,
-            self.secret_key,
-        )
+    pub fn cancel_query<T>(&mut self) -> Result<(), Error> {
+        cancel_query::cancel_query(self.socket_config.clone(), self.process_id, self.secret_key)
     }
 
     /// Like `cancel_query`, but uses a stream which is already connected to the server rather than opening a new
     /// connection itself.
-    pub fn cancel_query_raw<S, T>(
-        &mut self,
-        stream: S,
-        tls: T,
-    ) -> impl Future<Output = Result<(), Error>>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-        T: TlsConnect<S>,
-    {
-        cancel_query_raw::cancel_query_raw(
-            stream,
-            self.ssl_mode,
-            tls,
-            self.process_id,
-            self.secret_key,
-        )
+    pub fn cancel_query_raw(&mut self, stream: TcpStream) -> Result<(), Error> {
+        cancel_query_raw::cancel_query_raw(stream, self.process_id, self.secret_key)
     }
 
     /// Determines if the connection to the server has already closed.
     ///
     /// In that case, all future queries will fail.
-    pub fn is_closed(&self) -> bool {
-        self.inner.sender.is_closed()
+    pub fn _is_closed(&self) -> bool {
+        // self.inner.sender.is_closed()
+        unimplemented!()
     }
 }

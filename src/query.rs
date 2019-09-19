@@ -1,54 +1,47 @@
 use crate::client::{InnerClient, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
+use crate::try_iterator::TryIterator;
 use crate::types::{IsNull, ToSql};
 use crate::{Error, Portal, Row, Statement};
-use futures::{ready, Stream, TryFutureExt};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 pub fn query(
     client: Arc<InnerClient>,
     statement: Statement,
     buf: Result<Vec<u8>, Error>,
-) -> impl Stream<Item = Result<Row, Error>> {
-    start(client, buf)
-        .map_ok(|responses| Query {
-            statement,
-            responses,
-        })
-        .try_flatten_stream()
+) -> impl Iterator<Item = Result<Row, Error>> {
+    let responses = start(client, buf)?;
+    TryIterator::Iter(Query {
+        statement,
+        responses,
+    })
 }
 
 pub fn query_portal(
     client: Arc<InnerClient>,
     portal: Portal,
     max_rows: i32,
-) -> impl Stream<Item = Result<Row, Error>> {
-    let start = async move {
-        let mut buf = vec![];
-        frontend::execute(portal.name(), max_rows, &mut buf).map_err(Error::encode)?;
-        frontend::sync(&mut buf);
+) -> impl Iterator<Item = Result<Row, Error>> {
+    let mut buf = vec![];
+    frontend::execute(portal.name(), max_rows, &mut buf).map_err(Error::encode)?;
+    frontend::sync(&mut buf);
 
-        let responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+    let responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
-        Ok(Query {
-            statement: portal.statement().clone(),
-            responses,
-        })
-    };
-
-    start.try_flatten_stream()
+    TryIterator::Iter(Query {
+        statement: portal.statement().clone(),
+        responses,
+    })
 }
 
-pub async fn execute(client: Arc<InnerClient>, buf: Result<Vec<u8>, Error>) -> Result<u64, Error> {
-    let mut responses = start(client, buf).await?;
+pub fn execute(client: Arc<InnerClient>, buf: Result<Vec<u8>, Error>) -> Result<u64, Error> {
+    let mut responses = start(client, buf)?;
 
     loop {
-        match responses.next().await? {
+        match responses.next()? {
             Message::DataRow(_) => {}
             Message::CommandComplete(body) => {
                 let rows = body
@@ -67,11 +60,11 @@ pub async fn execute(client: Arc<InnerClient>, buf: Result<Vec<u8>, Error>) -> R
     }
 }
 
-async fn start(client: Arc<InnerClient>, buf: Result<Vec<u8>, Error>) -> Result<Responses, Error> {
+fn start(client: Arc<InnerClient>, buf: Result<Vec<u8>, Error>) -> Result<Responses, Error> {
     let buf = buf?;
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
-    match responses.next().await? {
+    match responses.next()? {
         Message::BindComplete => {}
         _ => return Err(Error::unexpected_message()),
     }
@@ -136,19 +129,17 @@ struct Query {
     responses: Responses,
 }
 
-impl Stream for Query {
+impl Iterator for Query {
     type Item = Result<Row, Error>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match ready!(self.responses.poll_next(cx)?) {
-            Message::DataRow(body) => {
-                Poll::Ready(Some(Ok(Row::new(self.statement.clone(), body)?)))
-            }
+    fn next(&mut self) -> Option<Self::Item> {
+        match o_try!(self.responses.next()) {
+            Message::DataRow(body) => Some(Ok(o_try!(Row::new(self.statement.clone(), body)))),
             Message::EmptyQueryResponse
             | Message::CommandComplete(_)
-            | Message::PortalSuspended => Poll::Ready(None),
-            Message::ErrorResponse(body) => Poll::Ready(Some(Err(Error::db(body)))),
-            _ => Poll::Ready(Some(Err(Error::unexpected_message()))),
+            | Message::PortalSuspended => None,
+            Message::ErrorResponse(body) => Some(Err(Error::db(body))),
+            _ => Some(Err(Error::unexpected_message())),
         }
     }
 }

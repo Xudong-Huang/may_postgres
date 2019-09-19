@@ -1,9 +1,8 @@
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::message::backend;
 use postgres_protocol::message::frontend::CopyData;
-use std::io;
-use tokio::codec::{Decoder, Encoder};
+use std::io::{self, Read};
 
 pub enum FrontendMessage {
     Raw(Vec<u8>),
@@ -37,11 +36,9 @@ impl FallibleIterator for BackendMessages {
 
 pub struct PostgresCodec;
 
-impl Encoder for PostgresCodec {
-    type Item = FrontendMessage;
-    type Error = io::Error;
-
-    fn encode(&mut self, item: FrontendMessage, dst: &mut BytesMut) -> io::Result<()> {
+// impl Encoder
+impl PostgresCodec {
+    pub fn encode(&mut self, item: FrontendMessage, dst: &mut BytesMut) -> io::Result<()> {
         match item {
             FrontendMessage::Raw(buf) => dst.extend_from_slice(&buf),
             FrontendMessage::CopyData(data) => data.write(dst),
@@ -51,11 +48,9 @@ impl Encoder for PostgresCodec {
     }
 }
 
-impl Decoder for PostgresCodec {
-    type Item = BackendMessage;
-    type Error = io::Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<BackendMessage>, io::Error> {
+// impl Decoder
+impl PostgresCodec {
+    pub fn decode(&mut self, src: &mut BytesMut) -> Result<Option<BackendMessage>, io::Error> {
         let mut idx = 0;
         let mut request_complete = false;
 
@@ -94,6 +89,59 @@ impl Decoder for PostgresCodec {
                 messages: BackendMessages(src.split_to(idx)),
                 request_complete,
             }))
+        }
+    }
+}
+
+pub struct Framed<S> {
+    r_stream: S,
+    read_buf: BytesMut,
+    codec: PostgresCodec,
+}
+
+impl<S: Read> Framed<S> {
+    pub fn new(s: S) -> Self {
+        Framed {
+            r_stream: s,
+            read_buf: BytesMut::with_capacity(4096 * 8),
+            codec: PostgresCodec,
+        }
+    }
+
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.r_stream
+    }
+}
+
+impl<S: Read> Iterator for Framed<S> {
+    type Item = io::Result<BackendMessage>;
+
+    fn next(&mut self) -> Option<io::Result<BackendMessage>> {
+        loop {
+            let msg = self.codec.decode(&mut self.read_buf).transpose();
+            if msg.is_some() {
+                return msg;
+            }
+
+            // try to read more data from stream
+            // read the socket for reqs
+            if self.read_buf.remaining_mut() < 1024 {
+                self.read_buf.reserve(4096 * 8);
+            }
+
+            let n = {
+                let read_buf = unsafe { self.read_buf.bytes_mut() };
+                match self.r_stream.read(read_buf) {
+                    Ok(n) => n,
+                    Err(e) => return Some(Err(e)),
+                }
+            };
+            //connection was closed
+            if n == 0 {
+                #[cold]
+                return None;
+            }
+            unsafe { self.read_buf.advance_mut(n) };
         }
     }
 }
