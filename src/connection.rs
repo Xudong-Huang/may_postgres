@@ -31,12 +31,60 @@ pub struct Response {
     sender: mpsc::Sender<BackendMessages>,
 }
 
-/// A connection to a PostgreSQL database.
-pub struct Connection {
+struct ConnectionWriteHalf {
     data_count: AtomicUsize,
     data_queue: SegQueue<Request>,
     writer: TcpStream,
     responses: Arc<spsc::Queue<Response>>,
+}
+
+impl ConnectionWriteHalf {
+    /// send a request to the connection
+    fn send(&self, req: Request) -> std::io::Result<()> {
+        self.data_queue.push(req);
+        let mut cnt = self.data_count.fetch_add(1, Ordering::AcqRel);
+        if cnt == 0 {
+            #[allow(clippy::cast_ref_to_mut)]
+            let writer = unsafe { &mut *(&self.writer as *const _ as *mut TcpStream) };
+
+            loop {
+                let mut totoal_data = BytesMut::with_capacity(1024);
+                while let Ok(req) = self.data_queue.pop() {
+                    let sender = req.sender;
+                    match req.messages {
+                        RequestMessages::Single(msg) => {
+                            PostgresCodec.encode(msg, &mut totoal_data)?
+                        }
+                        RequestMessages::CopyIn(rcv) => {
+                            for msg in rcv {
+                                PostgresCodec.encode(msg, &mut totoal_data)?;
+                            }
+                        }
+                    }
+
+                    self.responses.push(Response { sender });
+                    cnt += 1;
+                }
+
+                if let Err(e) = writer.write_all(&totoal_data[..]) {
+                    error!("QueuedWriter failed, err={}", e);
+                    return Err(e);
+                }
+
+                if self.data_count.fetch_sub(cnt, Ordering::AcqRel) == cnt {
+                    break;
+                }
+
+                cnt = 0;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A connection to a PostgreSQL database.
+pub struct Connection {
+    writer: Arc<ConnectionWriteHalf>,
     handle: JoinHandle<()>,
 }
 
@@ -60,6 +108,13 @@ impl Connection {
             .expect("failed to clone stream for wirter");
         let responses = Arc::new(spsc::Queue::<Response>::new());
         let rsps = responses.clone();
+        let writer_half = Arc::new(ConnectionWriteHalf {
+            data_count: AtomicUsize::new(0),
+            data_queue: SegQueue::new(),
+            writer,
+            responses,
+        });
+        let writer_half_share = writer_half.clone();
         let handle = go!(move || {
             let mut main = || -> Result<(), Error> {
                 #[allow(clippy::while_let_on_iterator)]
@@ -101,61 +156,26 @@ impl Connection {
 
             if let Err(e) = main() {
                 error!("receiver closed. err={}", e);
-                // let mut request = vec![];
-                // frontend::terminate(&mut request);
-                // RequestMessages::Single(FrontendMessage::Raw(request))
+                let mut request = vec![];
+                frontend::terminate(&mut request);
+                let (tx, _rx) = mpsc::channel();
+                let req = Request {
+                    messages: RequestMessages::Single(FrontendMessage::Raw(request)),
+                    sender: tx,
+                };
+                writer_half_share.send(req).ok();
             }
             stream.inner_mut().shutdown(std::net::Shutdown::Both).ok();
         });
 
         Connection {
-            data_count: AtomicUsize::new(0),
-            data_queue: SegQueue::new(),
-            writer,
-            responses,
+            writer: writer_half,
             handle,
         }
     }
 
     /// send a request to the connection
     pub fn send(&self, req: Request) -> std::io::Result<()> {
-        self.data_queue.push(req);
-        let mut cnt = self.data_count.fetch_add(1, Ordering::AcqRel);
-        if cnt == 0 {
-            #[allow(clippy::cast_ref_to_mut)]
-            let writer = unsafe { &mut *(&self.writer as *const _ as *mut TcpStream) };
-
-            loop {
-                let mut totoal_data = BytesMut::with_capacity(1024);
-                while let Ok(req) = self.data_queue.pop() {
-                    let sender = req.sender;
-                    match req.messages {
-                        RequestMessages::Single(msg) => {
-                            PostgresCodec.encode(msg, &mut totoal_data)?
-                        }
-                        RequestMessages::CopyIn(rcv) => {
-                            for msg in rcv {
-                                PostgresCodec.encode(msg, &mut totoal_data)?;
-                            }
-                        }
-                    }
-
-                    self.responses.push(Response { sender });
-                    cnt += 1;
-                }
-
-                if let Err(e) = writer.write_all(&totoal_data[..]) {
-                    error!("QueuedWriter failed, err={}", e);
-                    return Err(e);
-                }
-
-                if self.data_count.fetch_sub(cnt, Ordering::AcqRel) == cnt {
-                    break;
-                }
-
-                cnt = 0;
-            }
-        }
-        Ok(())
+        self.writer.send(req)
     }
 }
