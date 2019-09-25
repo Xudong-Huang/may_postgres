@@ -83,7 +83,7 @@ impl ConnectionWriteHalf {
 }
 
 /// A connection to a PostgreSQL database.
-pub struct Connection {
+pub(crate) struct Connection {
     writer: Arc<ConnectionWriteHalf>,
     handle: JoinHandle<()>,
 }

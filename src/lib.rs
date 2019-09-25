@@ -74,7 +74,6 @@ macro_rules! o_try {
 
 pub use crate::client::Client;
 pub use crate::config::Config;
-pub use crate::connection::Connection;
 use crate::error::DbError;
 pub use crate::error::Error;
 pub use crate::portal::Portal;
