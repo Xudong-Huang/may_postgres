@@ -22,9 +22,9 @@ pub fn connect(config: &Config) -> Result<Client, Error> {
             .or_else(|| config.port.get(0))
             .unwrap_or(&5432);
 
-        let hostname = match host {
-            Host::Tcp(host) => &**host,
-        };
+        // let hostname = match host {
+        //     Host::Tcp(host) => &**host,
+        // };
 
         match connect_once(host, port, config) {
             Ok(client) => return Ok(client),

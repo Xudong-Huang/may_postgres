@@ -11,7 +11,7 @@ use postgres_protocol::message::frontend;
 /// Transactions will implicitly roll back when dropped. Use the `commit` method to commit the changes made in the
 /// transaction. Transactions can be nested, with inner transactions implemented via safepoints.
 pub struct Transaction<'a> {
-    client: &'a mut Client,
+    client: &'a Client,
     depth: u32,
     done: bool,
 }
@@ -37,7 +37,7 @@ impl<'a> Drop for Transaction<'a> {
 }
 
 impl<'a> Transaction<'a> {
-    pub(crate) fn new(client: &'a mut Client) -> Transaction<'a> {
+    pub(crate) fn new(client: &'a Client) -> Transaction<'a> {
         Transaction {
             client,
             depth: 0,

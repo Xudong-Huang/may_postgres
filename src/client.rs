@@ -1,7 +1,7 @@
 use crate::cancel_query;
 use crate::codec::BackendMessages;
 use crate::config::Host;
-use crate::connection::{Request, RequestMessages};
+use crate::connection::{Connection, Request, RequestMessages};
 use crate::types::{Oid, ToSql, Type};
 use crate::{cancel_query_raw, copy_in, copy_out, query, Transaction};
 use crate::{prepare, SimpleQueryMessage};
@@ -46,7 +46,7 @@ struct State {
 }
 
 pub struct InnerClient {
-    sender: mpsc::Sender<Request>,
+    sender: Connection,
     state: Mutex<State>,
 }
 
@@ -116,7 +116,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub(crate) fn new(sender: mpsc::Sender<Request>, process_id: i32, secret_key: i32) -> Client {
+    pub(crate) fn new(sender: Connection, process_id: i32, secret_key: i32) -> Client {
         Client {
             inner: Arc::new(InnerClient {
                 sender,
@@ -145,7 +145,7 @@ impl Client {
     ///
     /// Prepared statements can be executed repeatedly, and may contain query parameters (indicated by `$1`, `$2`, etc),
     /// which are set when executed. Prepared statements can only be used with the connection that created them.
-    pub fn prepare(&mut self, query: &str) -> Result<Statement, Error> {
+    pub fn prepare(&self, query: &str) -> Result<Statement, Error> {
         self.prepare_typed(query, &[])
     }
 
@@ -153,11 +153,7 @@ impl Client {
     ///
     /// The list of types may be smaller than the number of parameters - the types of the remaining parameters will be
     /// inferred. For example, `client.prepare_typed(query, &[])` is equivalent to `client.prepare(query)`.
-    pub fn prepare_typed(
-        &mut self,
-        query: &str,
-        parameter_types: &[Type],
-    ) -> Result<Statement, Error> {
+    pub fn prepare_typed(&self, query: &str, parameter_types: &[Type]) -> Result<Statement, Error> {
         prepare::prepare(self.inner(), query, parameter_types)
     }
 
@@ -167,7 +163,7 @@ impl Client {
     ///
     /// Panics if the number of parameters provided does not match the number expected.
     pub fn query(
-        &mut self,
+        &self,
         statement: &Statement,
         params: &[&dyn ToSql],
     ) -> impl Iterator<Item = Result<Row, Error>> {
@@ -179,7 +175,7 @@ impl Client {
     ///
     /// [`query`]: #method.query
     pub fn query_iter<'a, I>(
-        &mut self,
+        &self,
         statement: &Statement,
         params: I,
     ) -> impl Iterator<Item = Result<Row, Error>>
@@ -198,7 +194,7 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn execute(&mut self, statement: &Statement, params: &[&dyn ToSql]) -> Result<u64, Error> {
+    pub fn execute(&self, statement: &Statement, params: &[&dyn ToSql]) -> Result<u64, Error> {
         let buf = query::encode(statement, params.iter().cloned());
         query::execute(self.inner(), buf)
     }
@@ -206,7 +202,7 @@ impl Client {
     /// Like [`execute`], but takes an iterator of parameters rather than a slice.
     ///
     /// [`execute`]: #method.execute
-    pub fn execute_iter<'a, I>(&mut self, statement: &Statement, params: I) -> Result<u64, Error>
+    pub fn execute_iter<'a, I>(&self, statement: &Statement, params: I) -> Result<u64, Error>
     where
         I: IntoIterator<Item = &'a dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
@@ -224,7 +220,7 @@ impl Client {
     ///
     /// Panics if the number of parameters provided does not match the number expected.
     pub fn copy_in<T, E, S>(
-        &mut self,
+        &self,
         statement: &Statement,
         params: &[&dyn ToSql],
         stream: S,
@@ -245,7 +241,7 @@ impl Client {
     ///
     /// Panics if the number of parameters provided does not match the number expected.
     pub fn copy_out(
-        &mut self,
+        &self,
         statement: &Statement,
         params: &[&dyn ToSql],
     ) -> impl Iterator<Item = Result<Bytes, Error>> {
@@ -267,7 +263,7 @@ impl Client {
     /// functionality to safely embed that data in the request. Do not form statements via string concatenation and pass
     /// them to this method!
     pub fn simple_query(
-        &mut self,
+        &self,
         query: &str,
     ) -> impl Iterator<Item = Result<SimpleQueryMessage, Error>> {
         simple_query::simple_query(self.inner(), query)
@@ -283,14 +279,14 @@ impl Client {
     /// Prepared statements should be use for any query which contains user-specified data, as they provided the
     /// functionality to safely embed that data in the request. Do not form statements via string concatenation and pass
     /// them to this method!
-    pub fn batch_execute(&mut self, query: &str) -> Result<(), Error> {
+    pub fn batch_execute(&self, query: &str) -> Result<(), Error> {
         simple_query::batch_execute(self.inner(), query)
     }
 
     /// Begins a new database transaction.
     ///
     /// The transaction will roll back by default - use the `commit` method to commit it.
-    pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
+    pub fn transaction(&self) -> Result<Transaction<'_>, Error> {
         self.batch_execute("BEGIN")?;
         Ok(Transaction::new(self))
     }
@@ -300,13 +296,13 @@ impl Client {
     /// The server provides no information about whether a cancellation attempt was successful or not. An error will
     /// only be returned if the client was unable to connect to the database.
     ///
-    pub fn cancel_query<T>(&mut self) -> Result<(), Error> {
+    pub fn cancel_query(&self) -> Result<(), Error> {
         cancel_query::cancel_query(self.socket_config.clone(), self.process_id, self.secret_key)
     }
 
     /// Like `cancel_query`, but uses a stream which is already connected to the server rather than opening a new
     /// connection itself.
-    pub fn cancel_query_raw(&mut self, stream: TcpStream) -> Result<(), Error> {
+    pub fn cancel_query_raw(&self, stream: TcpStream) -> Result<(), Error> {
         cancel_query_raw::cancel_query_raw(stream, self.process_id, self.secret_key)
     }
 

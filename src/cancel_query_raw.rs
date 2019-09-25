@@ -3,7 +3,11 @@ use may::net::TcpStream;
 use postgres_protocol::message::frontend;
 use std::io::Write;
 
-pub fn cancel_query_raw(stream: TcpStream, process_id: i32, secret_key: i32) -> Result<(), Error> {
+pub fn cancel_query_raw(
+    mut stream: TcpStream,
+    process_id: i32,
+    secret_key: i32,
+) -> Result<(), Error> {
     let mut buf = vec![];
     frontend::cancel_request(process_id, secret_key, &mut buf);
 

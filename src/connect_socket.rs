@@ -12,8 +12,8 @@ pub(crate) fn connect_socket(
     host: &Host,
     port: u16,
     connect_timeout: Option<Duration>,
-    keepalives: bool,
-    keepalives_idle: Duration,
+    _keepalives: bool,
+    _keepalives_idle: Duration,
 ) -> Result<TcpStream, Error> {
     match host {
         Host::Tcp(host) => {

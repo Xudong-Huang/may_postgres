@@ -59,7 +59,7 @@ impl Iterator for CopyInReceiver {
 pub fn copy_in<T, E, S>(
     client: Arc<InnerClient>,
     buf: Result<Vec<u8>, Error>,
-    stream: S,
+    mut stream: S,
 ) -> Result<u64, Error>
 where
     S: Iterator<Item = Result<T, E>>,
@@ -69,7 +69,7 @@ where
 {
     let buf = buf?;
 
-    let (mut sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::channel();
     let receiver = CopyInReceiver::new(receiver);
     let mut responses = client.send(RequestMessages::CopyIn(receiver))?;
 

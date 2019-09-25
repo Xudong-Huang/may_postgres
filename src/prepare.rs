@@ -117,7 +117,7 @@ fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
 
     let params: &[&dyn ToSql] = &[&oid];
     let buf = query::encode(&stmt, params.iter().cloned());
-    let rows = query::query(client.clone(), stmt, buf);
+    let mut rows = query::query(client.clone(), stmt, buf);
 
     let row = match rows.next().transpose()? {
         Some(row) => row,

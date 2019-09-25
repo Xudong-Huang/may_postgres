@@ -1,10 +1,10 @@
-use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCodec, Framed};
+use crate::codec::{BackendMessage, BackendMessages, Framed, FrontendMessage, PostgresCodec};
 use crate::config::Config;
+use crate::connection::Connection;
 use crate::{Client, Error};
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use may::net::TcpStream;
-use may::sync::mpsc;
 use postgres_protocol::authentication;
 use postgres_protocol::authentication::sasl;
 use postgres_protocol::authentication::sasl::ScramSha256;
@@ -58,10 +58,8 @@ pub fn connect_raw(stream: TcpStream, config: &Config) -> Result<Client, Error> 
     authenticate(&mut stream, config)?;
     let (process_id, secret_key, parameters) = read_info(&mut stream)?;
 
-    let (sender, receiver) = mpsc::channel();
-    // start background receiver to dispatch messages
-    let recv_service = receiver;
-    let client = Client::new(sender, process_id, secret_key);
+    let connection = Connection::new(stream.inner, parameters);
+    let client = Client::new(connection, process_id, secret_key);
 
     Ok(client)
 }
@@ -163,9 +161,7 @@ fn authenticate_sasl(
         }
     }
 
-    let (channel_binding, mechanism) = if has_scram_plus {
-        (sasl::ChannelBinding::unsupported(), sasl::SCRAM_SHA_256)
-    } else if has_scram {
+    let (channel_binding, mechanism) = if has_scram_plus || has_scram {
         (sasl::ChannelBinding::unsupported(), sasl::SCRAM_SHA_256)
     } else {
         return Err(Error::authentication("unsupported SASL mechanism".into()));
