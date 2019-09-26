@@ -9,6 +9,13 @@ use std::str::FromStr;
 use std::time::Duration;
 use std::{error, fmt, iter, mem};
 
+#[cfg(unix)]
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::path::Path;
+
 use may::net::TcpStream;
 
 /// Properties required of a session.
@@ -196,12 +203,13 @@ impl Config {
     ///
     /// Unlike `host`, this method allows non-UTF8 paths.
     #[cfg(unix)]
-    pub fn host_path<T>(&mut self, host: T) -> &mut Config
+    pub fn host_path<T>(&mut self, _host: T) -> &mut Config
     where
         T: AsRef<Path>,
     {
-        self.host.push(Host::Unix(host.as_ref().to_path_buf()));
-        self
+        // self.host.push(Host::Unix(host.as_ref().to_path_buf()));
+        // self
+        unimplemented!()
     }
 
     /// Adds a port to the configuration.
