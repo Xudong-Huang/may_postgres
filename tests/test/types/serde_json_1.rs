@@ -18,7 +18,6 @@ fn test_json_params() {
             (None, "NULL"),
         ],
     )
-    
 }
 
 #[test]
@@ -37,5 +36,4 @@ fn test_jsonb_params() {
             (None, "NULL"),
         ],
     )
-    
 }
