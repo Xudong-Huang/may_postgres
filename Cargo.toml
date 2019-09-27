@@ -1,11 +1,11 @@
 [package]
-name = "may-postgres"
+name = "may_postgres"
 version = "0.1.0"
 authors = ["Xudong Huang <huangxu008@hotmail.com>"]
 edition = "2018"
 license = "MIT/Apache-2.0"
 description = "A coroutine based PostgreSQL client"
-repository = "https://github.com/Xudong-Huang/may-postgres"
+repository = "https://github.com/Xudong-Huang/may_postgres"
 readme = "README.md"
 keywords = ["database", "postgres", "postgresql", "sql", "async"]
 categories = ["database"]
