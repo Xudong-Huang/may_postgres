@@ -13,7 +13,7 @@ use may_queue::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -83,12 +83,18 @@ impl ConnectionWriteHalf {
 pub(crate) struct Connection {
     writer: Arc<ConnectionWriteHalf>,
     handle: JoinHandle<()>,
+    thread_writer: JoinHandle<()>,
+    thread_writer_tx: mpsc::Sender<Request>,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
         let bg = self.handle.coroutine();
-        unsafe { bg.cancel() }
+        let sd = self.thread_writer.coroutine();
+        unsafe {
+            bg.cancel();
+            sd.cancel();
+        }
     }
 }
 
@@ -163,14 +169,30 @@ impl Connection {
             stream.inner_mut().shutdown(std::net::Shutdown::Both).ok();
         });
 
+        let writer_1 = writer_half.clone();
+        let (tx, rx) = mpsc::channel();
+        let thread_writer = go!(move || {
+            while let Ok(req) = rx.recv() {
+                writer_1.send(req).ok();
+            }
+        });
+
         Connection {
             writer: writer_half,
             handle,
+            thread_writer,
+            thread_writer_tx: tx,
         }
     }
 
     /// send a request to the connection
-    pub fn send(&self, req: Request) -> std::io::Result<()> {
-        self.writer.send(req)
+    pub fn send(&self, req: Request) -> io::Result<()> {
+        if may::coroutine::is_coroutine() {
+            self.writer.send(req)
+        } else {
+            self.thread_writer_tx
+                .send(req)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "send req failed"))
+        }
     }
 }
