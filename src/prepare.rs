@@ -115,8 +115,7 @@ fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
 
     let stmt = typeinfo_statement(client)?;
 
-    let params: &[&dyn ToSql] = &[&oid];
-    let buf = query::encode(&stmt, params.iter().cloned());
+    let buf = query::encode(&stmt, (&[&oid as &dyn ToSql]).iter().cloned());
     let mut rows = query::query(client.clone(), stmt, buf);
 
     let row = match rows.next().transpose()? {
@@ -138,16 +137,16 @@ fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
     } else if type_ == b'p' as i8 {
         Kind::Pseudo
     } else if basetype != 0 {
-        let type_ = get_type_rec(client, basetype)?;
+        let type_ = get_type(client, basetype)?;
         Kind::Domain(type_)
     } else if elem_oid != 0 {
-        let type_ = get_type_rec(client, elem_oid)?;
+        let type_ = get_type(client, elem_oid)?;
         Kind::Array(type_)
     } else if relid != 0 {
         let fields = get_composite_fields(client, relid)?;
         Kind::Composite(fields)
     } else if let Some(rngsubtype) = rngsubtype {
-        let type_ = get_type_rec(client, rngsubtype)?;
+        let type_ = get_type(client, rngsubtype)?;
         Kind::Range(type_)
     } else {
         Kind::Simple
@@ -157,10 +156,6 @@ fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
     client.set_type(oid, &type_);
 
     Ok(type_)
-}
-
-fn get_type_rec(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
-    get_type(client, oid)
 }
 
 fn typeinfo_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
@@ -183,10 +178,9 @@ fn typeinfo_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
 fn get_enum_variants(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<String>, Error> {
     let stmt = typeinfo_enum_statement(client)?;
 
-    let params: &[&dyn ToSql] = &[&oid];
-    let buf = query::encode(&stmt, params.iter().cloned());
+    let buf = query::encode(&stmt, (&[&oid as &dyn ToSql]).iter().cloned());
     query::query(client.clone(), stmt, buf)
-        .filter_map(|row| row.ok().map(|r| r.try_get(0)))
+        .map(|row| row.and_then(|r| r.try_get(0)))
         .collect()
 }
 
@@ -210,8 +204,7 @@ fn typeinfo_enum_statement(client: &Arc<InnerClient>) -> Result<Statement, Error
 fn get_composite_fields(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<Field>, Error> {
     let stmt = typeinfo_composite_statement(client)?;
 
-    let params: &[&dyn ToSql] = &[&oid];
-    let buf = query::encode(&stmt, params.iter().cloned());
+    let buf = query::encode(&stmt, (&[&oid as &dyn ToSql]).iter().cloned());
     let rows = query::query(client.clone(), stmt, buf).collect::<Result<Vec<_>, _>>()?;
 
     let mut fields = vec![];

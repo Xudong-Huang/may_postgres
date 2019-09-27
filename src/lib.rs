@@ -7,7 +7,7 @@
 //!
 //! fn main() -> Result<(), Error> {
 //!     // Connect to the database.
-//!     let mut client= may_postgres::connect("host=localhost user=postgres")?;
+//!     let client= may_postgres::connect("host=localhost user=postgres")?;
 //!
 //!     // Now we can prepare a simple statement that just returns its parameter.
 //!     let stmt = client.prepare("SELECT $1::TEXT")?;
@@ -15,7 +15,7 @@
 //!     // And then execute it, returning a Stream of Rows which we collect into a Vec.
 //!     let rows: Vec<Row> = client
 //!         .query(&stmt, &[&"hello world"])
-//!         .try_collect()?
+//!         .collect::<Result<Vec<_>, _>>()?;
 //!
 //!     // Now we can check that we got back the same string we sent over.
 //!     let value: &str = rows[0].get(0);

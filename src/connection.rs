@@ -8,7 +8,7 @@ use log::error;
 use may::coroutine::JoinHandle;
 use may::go;
 use may::net::TcpStream;
-use may::sync::mpsc;
+use may::sync::{mpsc, Mutex};
 use may_queue::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -34,7 +34,7 @@ pub struct Response {
 struct ConnectionWriteHalf {
     data_count: AtomicUsize,
     data_queue: SegQueue<Request>,
-    writer: TcpStream,
+    writer: Mutex<TcpStream>,
     responses: Arc<spsc::Queue<Response>>,
 }
 
@@ -44,29 +44,26 @@ impl ConnectionWriteHalf {
         self.data_queue.push(req);
         let mut cnt = self.data_count.fetch_add(1, Ordering::AcqRel);
         if cnt == 0 {
-            #[allow(clippy::cast_ref_to_mut)]
-            let writer = unsafe { &mut *(&self.writer as *const _ as *mut TcpStream) };
+            let mut buf = BytesMut::with_capacity(1024);
+            let mut writer = self.writer.lock().unwrap();
 
             loop {
-                let mut totoal_data = BytesMut::with_capacity(1024);
                 while let Ok(req) = self.data_queue.pop() {
-                    let sender = req.sender;
                     match req.messages {
-                        RequestMessages::Single(msg) => {
-                            PostgresCodec.encode(msg, &mut totoal_data)?
-                        }
+                        RequestMessages::Single(msg) => PostgresCodec.encode(msg, &mut buf)?,
                         RequestMessages::CopyIn(rcv) => {
                             for msg in rcv {
-                                PostgresCodec.encode(msg, &mut totoal_data)?;
+                                PostgresCodec.encode(msg, &mut buf)?;
                             }
                         }
                     }
 
-                    self.responses.push(Response { sender });
+                    self.responses.push(Response { sender: req.sender });
                     cnt += 1;
                 }
-
-                if let Err(e) = writer.write_all(&totoal_data[..]) {
+                let len = buf.len();
+                let data = buf.split_to(len);
+                if let Err(e) = writer.write_all(&data) {
                     error!("QueuedWriter failed, err={}", e);
                     return Err(e);
                 }
@@ -87,8 +84,6 @@ pub(crate) struct Connection {
     writer: Arc<ConnectionWriteHalf>,
     handle: JoinHandle<()>,
 }
-
-unsafe impl Sync for Connection {}
 
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -111,7 +106,7 @@ impl Connection {
         let writer_half = Arc::new(ConnectionWriteHalf {
             data_count: AtomicUsize::new(0),
             data_queue: SegQueue::new(),
-            writer,
+            writer: Mutex::new(writer),
             responses,
         });
         let writer_half_share = writer_half.clone();
@@ -145,7 +140,7 @@ impl Connection {
 
                             response.sender.send(messages).ok();
 
-                            if !request_complete {
+                            if request_complete {
                                 rsps.pop();
                             }
                         }
