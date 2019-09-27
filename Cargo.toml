@@ -31,8 +31,8 @@ arrayvec = "0.5"
 bytes = "0.4"
 crossbeam = "0.7"
 fallible-iterator = "0.2"
-may = { path = "../../../may" }
-may_queue = { path = "../../../may/may_queue" }
+may = { git = "https://github.com/Xudong-Huang/may.git" }
+may_queue = { git = "https://github.com/Xudong-Huang/may.git" }
 log = "0.4"
 percent-encoding = "2"
 phf = "0.7.23"
