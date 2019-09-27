@@ -26,31 +26,53 @@ impl CopyInReceiver {
             done: false,
         }
     }
-}
 
-impl Iterator for CopyInReceiver {
-    type Item = FrontendMessage;
-
-    fn next(&mut self) -> Option<FrontendMessage> {
+    pub fn try_recv(&mut self) -> Result<Option<FrontendMessage>, ()> {
+        use std::sync::mpsc::TryRecvError;
         if self.done {
-            return None;
+            return Err(());
         }
 
-        match self.receiver.recv() {
-            Ok(CopyInMessage::Message(message)) => Some(message),
+        match self.receiver.try_recv() {
+            Ok(CopyInMessage::Message(message)) => Ok(Some(message)),
             Ok(CopyInMessage::Done) => {
                 self.done = true;
                 let mut buf = vec![];
                 frontend::copy_done(&mut buf);
                 frontend::sync(&mut buf);
-                Some(FrontendMessage::Raw(buf))
+                Ok(Some(FrontendMessage::Raw(buf)))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(_) => {
+                self.done = true;
+                let mut buf = vec![];
+                frontend::copy_fail("", &mut buf).unwrap();
+                frontend::sync(&mut buf);
+                Ok(Some(FrontendMessage::Raw(buf)))
+            }
+        }
+    }
+
+    pub fn recv(&mut self) -> Result<Option<FrontendMessage>, ()> {
+        if self.done {
+            return Err(());
+        }
+
+        match self.receiver.recv() {
+            Ok(CopyInMessage::Message(message)) => Ok(Some(message)),
+            Ok(CopyInMessage::Done) => {
+                self.done = true;
+                let mut buf = vec![];
+                frontend::copy_done(&mut buf);
+                frontend::sync(&mut buf);
+                Ok(Some(FrontendMessage::Raw(buf)))
             }
             Err(_) => {
                 self.done = true;
                 let mut buf = vec![];
                 frontend::copy_fail("", &mut buf).unwrap();
                 frontend::sync(&mut buf);
-                Some(FrontendMessage::Raw(buf))
+                Ok(Some(FrontendMessage::Raw(buf)))
             }
         }
     }

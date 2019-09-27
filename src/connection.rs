@@ -49,16 +49,31 @@ impl ConnectionWriteHalf {
 
             loop {
                 while let Ok(req) = self.data_queue.pop() {
+                    self.responses.push(Response { sender: req.sender });
                     match req.messages {
                         RequestMessages::Single(msg) => PostgresCodec.encode(msg, &mut buf)?,
-                        RequestMessages::CopyIn(rcv) => {
-                            for msg in rcv {
-                                PostgresCodec.encode(msg, &mut buf)?;
+                        RequestMessages::CopyIn(mut rcv) => {
+                            let mut copy_in_msg = rcv.try_recv();
+                            loop {
+                                match copy_in_msg {
+                                    Ok(Some(msg)) => {
+                                        PostgresCodec.encode(msg, &mut buf)?;
+                                        copy_in_msg = rcv.try_recv();
+                                    }
+                                    Ok(None) => {
+                                        let len = buf.len();
+                                        let data = buf.split_to(len);
+                                        writer.write_all(&data)?;
+
+                                        // no data found we just write all the data and wait
+                                        copy_in_msg = rcv.recv();
+                                    }
+                                    Err(_) => break,
+                                }
                             }
                         }
                     }
 
-                    self.responses.push(Response { sender: req.sender });
                     cnt += 1;
                 }
                 let len = buf.len();
