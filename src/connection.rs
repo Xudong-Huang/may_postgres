@@ -8,7 +8,7 @@ use log::error;
 use may::coroutine::JoinHandle;
 use may::go;
 use may::net::TcpStream;
-use may::sync::{mpsc, Mutex};
+use may::sync::mpsc;
 use may_queue::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -34,7 +34,7 @@ pub struct Response {
 struct ConnectionWriteHalf {
     data_count: AtomicUsize,
     data_queue: SegQueue<Request>,
-    writer: Mutex<TcpStream>,
+    writer: TcpStream,
     responses: Arc<spsc::Queue<Response>>,
 }
 
@@ -45,7 +45,8 @@ impl ConnectionWriteHalf {
         let mut cnt = self.data_count.fetch_add(1, Ordering::AcqRel);
         if cnt == 0 {
             let mut buf = BytesMut::with_capacity(1024);
-            let mut writer = self.writer.lock().unwrap();
+            #[allow(clippy::cast_ref_to_mut)]
+            let writer = unsafe { &mut *(&self.writer as *const _ as *mut TcpStream) };
 
             loop {
                 while let Ok(req) = self.data_queue.pop() {
@@ -127,7 +128,7 @@ impl Connection {
         let writer_half = Arc::new(ConnectionWriteHalf {
             data_count: AtomicUsize::new(0),
             data_queue: SegQueue::new(),
-            writer: Mutex::new(writer),
+            writer,
             responses,
         });
         let writer_half_share = writer_half.clone();
