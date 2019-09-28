@@ -13,7 +13,7 @@ pub fn query(
     statement: Statement,
     buf: Result<Vec<u8>, Error>,
 ) -> impl Iterator<Item = Result<Row, Error>> {
-    let responses = start(client, buf)?;
+    let responses = i_try!(start(client, buf));
     TryIterator::Iter(Query {
         statement,
         responses,
@@ -26,10 +26,10 @@ pub fn query_portal(
     max_rows: i32,
 ) -> impl Iterator<Item = Result<Row, Error>> {
     let mut buf = vec![];
-    frontend::execute(portal.name(), max_rows, &mut buf).map_err(Error::encode)?;
+    i_try!(frontend::execute(portal.name(), max_rows, &mut buf).map_err(Error::encode));
     frontend::sync(&mut buf);
 
-    let responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+    let responses = i_try!(client.send(RequestMessages::Single(FrontendMessage::Raw(buf))));
 
     TryIterator::Iter(Query {
         statement: portal.statement().clone(),

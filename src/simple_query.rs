@@ -12,9 +12,9 @@ pub fn simple_query(
     client: Arc<InnerClient>,
     query: &str,
 ) -> impl Iterator<Item = Result<SimpleQueryMessage, Error>> {
-    let buf = encode(query)?;
+    let buf = i_try!(encode(query));
 
-    let responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+    let responses = i_try!(client.send(RequestMessages::Single(FrontendMessage::Raw(buf))));
 
     TryIterator::Iter(SimpleQuery {
         responses,

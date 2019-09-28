@@ -59,7 +59,6 @@
 //! Pipelining happens automatically when futures are polled concurrently (for example, by using the futures `join`
 //! combinator):
 //!
-#![feature(try_trait)]
 #![doc(html_root_url = "https://docs.rs/may-postgres/0.1.0")]
 #![warn(rust_2018_idioms, clippy::all, missing_docs)]
 
@@ -68,6 +67,15 @@ macro_rules! o_try {
         match $expr {
             Ok(val) => val,
             Err(err) => return Some(Err(std::convert::From::from(err))),
+        }
+    };
+}
+
+macro_rules! i_try {
+    ($expr:expr) => {
+        match $expr {
+            Ok(val) => val,
+            Err(err) => return crate::try_iterator::TryIterator::Err(Some(err)),
         }
     };
 }

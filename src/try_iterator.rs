@@ -20,28 +20,29 @@ where
     }
 }
 
-impl<T, E, I> std::ops::Try for TryIterator<T, E, I>
-where
-    I: Iterator<Item = Result<T, E>>,
-{
-    type Ok = I;
-    type Error = E;
+// #![feature(try_trait)]
+// impl<T, E, I> std::ops::Try for TryIterator<T, E, I>
+// where
+//     I: Iterator<Item = Result<T, E>>,
+// {
+//     type Ok = I;
+//     type Error = E;
 
-    #[inline]
-    fn into_result(self) -> Result<Self::Ok, Self::Error> {
-        match self {
-            Self::Err(e) => Err(e.unwrap()),
-            Self::Iter(i) => Ok(i),
-        }
-    }
+//     #[inline]
+//     fn into_result(self) -> Result<Self::Ok, Self::Error> {
+//         match self {
+//             Self::Err(e) => Err(e.unwrap()),
+//             Self::Iter(i) => Ok(i),
+//         }
+//     }
 
-    #[inline]
-    fn from_ok(v: Self::Ok) -> Self {
-        Self::Iter(v)
-    }
+//     #[inline]
+//     fn from_ok(v: Self::Ok) -> Self {
+//         Self::Iter(v)
+//     }
 
-    #[inline]
-    fn from_error(e: Self::Error) -> Self {
-        Self::Err(Some(e))
-    }
-}
+//     #[inline]
+//     fn from_error(e: Self::Error) -> Self {
+//         Self::Err(Some(e))
+//     }
+// }

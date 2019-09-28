@@ -11,7 +11,7 @@ pub fn copy_out(
     client: Arc<InnerClient>,
     buf: Result<Vec<u8>, Error>,
 ) -> impl Iterator<Item = Result<Bytes, Error>> {
-    let responses = start(client, buf)?;
+    let responses = i_try!(start(client, buf));
     TryIterator::Iter(CopyOut { responses })
 }
 
