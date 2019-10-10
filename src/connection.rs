@@ -2,19 +2,16 @@ use crate::codec::{BackendMessage, BackendMessages, Framed, FrontendMessage, Pos
 use crate::copy_in::CopyInReceiver;
 use crate::Error;
 use bytes::BytesMut;
-use crossbeam::queue::SegQueue;
-use fallible_iterator::FallibleIterator;
 use log::error;
 use may::coroutine::JoinHandle;
 use may::go;
 use may::net::TcpStream;
-use may::sync::mpsc;
-use may_queue::spsc;
+use may::sync::{mpsc, Mutex};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub enum RequestMessages {
@@ -28,88 +25,23 @@ pub struct Request {
 }
 
 pub struct Response {
-    sender: mpsc::Sender<BackendMessages>,
-}
-
-struct ConnectionWriteHalf {
-    data_count: AtomicUsize,
-    data_queue: SegQueue<Request>,
-    writer: TcpStream,
-    responses: Arc<spsc::Queue<Response>>,
-}
-
-impl ConnectionWriteHalf {
-    /// send a request to the connection
-    fn send(&self, req: Request) -> std::io::Result<()> {
-        self.data_queue.push(req);
-        let mut cnt = self.data_count.fetch_add(1, Ordering::AcqRel);
-        if cnt == 0 {
-            let mut buf = BytesMut::with_capacity(1024);
-            #[allow(clippy::cast_ref_to_mut)]
-            let writer = unsafe { &mut *(&self.writer as *const _ as *mut TcpStream) };
-
-            loop {
-                while let Ok(req) = self.data_queue.pop() {
-                    self.responses.push(Response { sender: req.sender });
-                    match req.messages {
-                        RequestMessages::Single(msg) => PostgresCodec.encode(msg, &mut buf)?,
-                        RequestMessages::CopyIn(mut rcv) => {
-                            let mut copy_in_msg = rcv.try_recv();
-                            loop {
-                                match copy_in_msg {
-                                    Ok(Some(msg)) => {
-                                        PostgresCodec.encode(msg, &mut buf)?;
-                                        copy_in_msg = rcv.try_recv();
-                                    }
-                                    Ok(None) => {
-                                        let len = buf.len();
-                                        let data = buf.split_to(len);
-                                        writer.write_all(&data)?;
-
-                                        // no data found we just write all the data and wait
-                                        copy_in_msg = rcv.recv();
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                        }
-                    }
-
-                    cnt += 1;
-                }
-                let len = buf.len();
-                let data = buf.split_to(len);
-                if let Err(e) = writer.write_all(&data) {
-                    error!("QueuedWriter failed, err={}", e);
-                    return Err(e);
-                }
-
-                if self.data_count.fetch_sub(cnt, Ordering::AcqRel) == cnt {
-                    break;
-                }
-
-                cnt = 0;
-            }
-        }
-        Ok(())
-    }
+    tx: mpsc::Sender<BackendMessages>,
 }
 
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
-    writer: Arc<ConnectionWriteHalf>,
-    handle: JoinHandle<()>,
-    thread_writer: JoinHandle<()>,
-    thread_writer_tx: mpsc::Sender<Request>,
+    rx_handle: JoinHandle<()>,
+    tx_handle: JoinHandle<()>,
+    req_tx: mpsc::Sender<Request>,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let bg = self.handle.coroutine();
-        let sd = self.thread_writer.coroutine();
+        let rx = self.rx_handle.coroutine();
+        let tx = self.tx_handle.coroutine();
         unsafe {
-            bg.cancel();
-            sd.cancel();
+            rx.cancel();
+            tx.cancel();
         }
     }
 }
@@ -119,96 +51,130 @@ impl Connection {
         mut stream: Framed<TcpStream>,
         mut parameters: HashMap<String, String>,
     ) -> Connection {
-        let writer = stream
+        let mut writer = stream
             .inner_mut()
             .try_clone()
             .expect("failed to clone stream for wirter");
-        let responses = Arc::new(spsc::Queue::<Response>::new());
-        let rsps = responses.clone();
-        let writer_half = Arc::new(ConnectionWriteHalf {
-            data_count: AtomicUsize::new(0),
-            data_queue: SegQueue::new(),
-            writer,
-            responses,
-        });
-        let writer_half_share = writer_half.clone();
-        let handle = go!(move || {
-            let mut main = || -> Result<(), Error> {
-                #[allow(clippy::while_let_on_iterator)]
-                while let Some(rsp) = stream.next() {
-                    match rsp.map_err(Error::io)? {
-                        BackendMessage::Async(Message::NoticeResponse(_body)) => {}
-                        BackendMessage::Async(Message::NotificationResponse(_body)) => {}
-                        BackendMessage::Async(Message::ParameterStatus(body)) => {
-                            parameters.insert(
-                                body.name().map_err(Error::parse)?.to_string(),
-                                body.value().map_err(Error::parse)?.to_string(),
-                            );
-                        }
-                        BackendMessage::Async(_) => unreachable!(),
-                        BackendMessage::Normal {
-                            mut messages,
-                            request_complete,
-                        } => {
-                            let response = match unsafe { rsps.peek() } {
-                                Some(response) => response,
-                                None => match messages.next().map_err(Error::parse)? {
-                                    Some(Message::ErrorResponse(error)) => {
-                                        return Err(Error::db(error))
-                                    }
-                                    _ => return Err(Error::unexpected_message()),
-                                },
-                            };
+        let rsp_queue = Arc::new(Mutex::new(VecDeque::with_capacity(512)));
+        let (req_tx, req_rx) = mpsc::channel();
+        let rx_handle = {
+            let rsp_queue: Arc<Mutex<VecDeque<Response>>> = rsp_queue.clone();
+            let req_tx = req_tx.clone();
+            go!(move || {
+                let mut main = || -> Result<(), Error> {
+                    #[allow(clippy::while_let_on_iterator)]
+                    while let Some(rsp) = stream.next() {
+                        match rsp.map_err(Error::io)? {
+                            BackendMessage::Async(Message::NoticeResponse(_body)) => {}
+                            BackendMessage::Async(Message::NotificationResponse(_body)) => {}
+                            BackendMessage::Async(Message::ParameterStatus(body)) => {
+                                parameters.insert(
+                                    body.name().map_err(Error::parse)?.to_string(),
+                                    body.value().map_err(Error::parse)?.to_string(),
+                                );
+                            }
+                            BackendMessage::Async(_) => unreachable!(),
+                            BackendMessage::Normal {
+                                messages,
+                                request_complete,
+                            } => {
+                                let mut rsp_queue = rsp_queue.lock().unwrap();
+                                let response = &rsp_queue[0];
+                                response.tx.send(messages).ok();
 
-                            response.sender.send(messages).ok();
-
-                            if request_complete {
-                                rsps.pop();
+                                if request_complete {
+                                    rsp_queue.pop_front();
+                                }
                             }
                         }
                     }
+                    Ok(())
+                };
+
+                if let Err(e) = main() {
+                    error!("receiver closed. err={}", e);
+                    let mut request = vec![];
+                    frontend::terminate(&mut request);
+                    let (tx, _rx) = mpsc::channel();
+                    let req = Request {
+                        messages: RequestMessages::Single(FrontendMessage::Raw(request)),
+                        sender: tx,
+                    };
+                    req_tx.send(req).ok();
                 }
-                Ok(())
+                stream.inner_mut().shutdown(std::net::Shutdown::Both).ok();
+            })
+        };
+
+        let tx_handle = go!(move || {
+            let mut main = || -> Result<(), io::Error> {
+                let mut buf = BytesMut::with_capacity(1024);
+                use std::sync::mpsc::TryRecvError;
+                let mut request = req_rx.try_recv();
+                loop {
+                    match request {
+                        Ok(req) => {
+                            let mut rsp_queue = rsp_queue.lock().unwrap();
+                            rsp_queue.push_back(Response { tx: req.sender });
+                            drop(rsp_queue);
+                            match req.messages {
+                                RequestMessages::Single(msg) => {
+                                    PostgresCodec.encode(msg, &mut buf)?;
+                                }
+                                RequestMessages::CopyIn(mut rcv) => {
+                                    let mut copy_in_msg = rcv.try_recv();
+                                    loop {
+                                        match copy_in_msg {
+                                            Ok(Some(msg)) => {
+                                                PostgresCodec.encode(msg, &mut buf)?;
+                                                copy_in_msg = rcv.try_recv();
+                                            }
+                                            Ok(None) => {
+                                                let n = writer.write(&buf)?;
+                                                buf.advance(n);
+
+                                                // no data found we just write all the data and wait
+                                                copy_in_msg = rcv.recv();
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                            }
+                            request = req_rx.try_recv();
+                        }
+                        Err(TryRecvError::Empty) => {
+                            writer.write_all(&buf)?;
+                            buf.clear();
+                            request = req_rx.recv().map_err(|_| TryRecvError::Empty);
+                        }
+                        Err(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "request queue closed",
+                            ));
+                        }
+                    }
+                }
             };
 
             if let Err(e) = main() {
-                error!("receiver closed. err={}", e);
-                let mut request = vec![];
-                frontend::terminate(&mut request);
-                let (tx, _rx) = mpsc::channel();
-                let req = Request {
-                    messages: RequestMessages::Single(FrontendMessage::Raw(request)),
-                    sender: tx,
-                };
-                writer_half_share.send(req).ok();
+                error!("writer closed. err={}", e);
             }
-            stream.inner_mut().shutdown(std::net::Shutdown::Both).ok();
-        });
-
-        let writer_1 = writer_half.clone();
-        let (tx, rx) = mpsc::channel();
-        let thread_writer = go!(move || {
-            while let Ok(req) = rx.recv() {
-                writer_1.send(req).ok();
-            }
+            writer.shutdown(std::net::Shutdown::Both).ok();
         });
 
         Connection {
-            writer: writer_half,
-            handle,
-            thread_writer,
-            thread_writer_tx: tx,
+            rx_handle,
+            tx_handle,
+            req_tx,
         }
     }
 
     /// send a request to the connection
     pub fn send(&self, req: Request) -> io::Result<()> {
-        if may::coroutine::is_coroutine() {
-            self.writer.send(req)
-        } else {
-            self.thread_writer_tx
-                .send(req)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "send req failed"))
-        }
+        self.req_tx
+            .send(req)
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "send req failed"))
     }
 }
