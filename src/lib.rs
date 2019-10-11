@@ -111,6 +111,7 @@ mod statement;
 mod transaction;
 mod try_iterator;
 pub mod types;
+mod vec_buf;
 
 /// A convenience function which parses a connection string and connects to the database.
 ///

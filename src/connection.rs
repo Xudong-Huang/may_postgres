@@ -1,5 +1,6 @@
-use crate::codec::{BackendMessage, BackendMessages, Framed, FrontendMessage, PostgresCodec};
+use crate::codec::{BackendMessage, BackendMessages, Framed, FrontendMessage};
 use crate::copy_in::CopyInReceiver;
+use crate::vec_buf::VecBufs;
 use crate::Error;
 use bytes::BytesMut;
 use log::error;
@@ -11,7 +12,7 @@ use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::io::{self, Write};
+use std::io;
 use std::sync::Arc;
 
 pub enum RequestMessages {
@@ -51,7 +52,7 @@ impl Connection {
         mut stream: Framed<TcpStream>,
         mut parameters: HashMap<String, String>,
     ) -> Connection {
-        let mut writer = stream
+        let writer = stream
             .inner_mut()
             .try_clone()
             .expect("failed to clone stream for wirter");
@@ -107,8 +108,8 @@ impl Connection {
         };
 
         let tx_handle = go!(move || {
+            let mut writer = VecBufs::new(writer);
             let mut main = || -> Result<(), io::Error> {
-                let mut buf = BytesMut::with_capacity(1024);
                 use std::sync::mpsc::TryRecvError;
                 let mut request = req_rx.try_recv();
                 loop {
@@ -118,20 +119,33 @@ impl Connection {
                             rsp_queue.push_back(Response { tx: req.sender });
                             drop(rsp_queue);
                             match req.messages {
-                                RequestMessages::Single(msg) => {
-                                    PostgresCodec.encode(msg, &mut buf)?;
-                                }
+                                RequestMessages::Single(msg) => match msg {
+                                    FrontendMessage::Raw(buf) => writer.push_vec(buf.into())?,
+                                    FrontendMessage::CopyData(data) => {
+                                        let mut buf = BytesMut::new();
+                                        data.write(&mut buf);
+                                        writer.push_vec(buf.into())?;
+                                    }
+                                },
                                 RequestMessages::CopyIn(mut rcv) => {
                                     let mut copy_in_msg = rcv.try_recv();
                                     loop {
                                         match copy_in_msg {
                                             Ok(Some(msg)) => {
-                                                PostgresCodec.encode(msg, &mut buf)?;
+                                                match msg {
+                                                    FrontendMessage::Raw(buf) => {
+                                                        writer.push_vec(buf.into())?
+                                                    }
+                                                    FrontendMessage::CopyData(data) => {
+                                                        let mut buf = BytesMut::new();
+                                                        data.write(&mut buf);
+                                                        writer.push_vec(buf.into())?;
+                                                    }
+                                                }
                                                 copy_in_msg = rcv.try_recv();
                                             }
                                             Ok(None) => {
-                                                let n = writer.write(&buf)?;
-                                                buf.advance(n);
+                                                writer.write_all()?;
 
                                                 // no data found we just write all the data and wait
                                                 copy_in_msg = rcv.recv();
@@ -144,8 +158,7 @@ impl Connection {
                             request = req_rx.try_recv();
                         }
                         Err(TryRecvError::Empty) => {
-                            writer.write_all(&buf)?;
-                            buf.clear();
+                            writer.write_all()?;
                             request = req_rx.recv().map_err(|_| TryRecvError::Empty);
                         }
                         Err(_) => {
@@ -161,7 +174,7 @@ impl Connection {
             if let Err(e) = main() {
                 error!("writer closed. err={}", e);
             }
-            writer.shutdown(std::net::Shutdown::Both).ok();
+            writer.inner_mut().shutdown(std::net::Shutdown::Both).ok();
         });
 
         Connection {
