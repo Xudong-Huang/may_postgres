@@ -29,16 +29,7 @@ impl<W: Write> VecBufs<W> {
         &mut self.writer
     }
 
-    // fn get_io_slice(&self) -> &[IoSlice<'static>; MAX_VEC_BUF] {
-    //     let first = IoSlice::new(&self.bufs[self.block][self.pos..]);
-    //     ret.push(first);
-    //     for buf in self.bufs.iter().skip(self.block + 1) {
-    //         ret.push(IoSlice::new(buf))
-    //     }
-    //     ret
-    // }
-
-    pub fn push_vec(&mut self, buf: Bytes) -> std::io::Result<()> {
+    pub fn write_bytes(&mut self, buf: Bytes) -> std::io::Result<()> {
         if self.len < MAX_VEC_BUF {
             let slice = IoSlice::new(unsafe { std::mem::transmute(&buf[..]) });
             self.bufs.push(buf);
@@ -47,7 +38,7 @@ impl<W: Write> VecBufs<W> {
         }
 
         if self.len == MAX_VEC_BUF {
-            self.write_all()?;
+            self.flush()?;
         }
 
         Ok(())
@@ -78,7 +69,7 @@ impl<W: Write> VecBufs<W> {
     }
 
     // write all data from the vecs to the writer
-    pub fn write_all(&mut self) -> std::io::Result<()> {
+    pub fn flush(&mut self) -> std::io::Result<()> {
         while !self.is_empty() {
             let n = self
                 .writer

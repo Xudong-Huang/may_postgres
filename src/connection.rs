@@ -120,11 +120,11 @@ impl Connection {
                             drop(rsp_queue);
                             match req.messages {
                                 RequestMessages::Single(msg) => match msg {
-                                    FrontendMessage::Raw(buf) => writer.push_vec(buf.into())?,
+                                    FrontendMessage::Raw(buf) => writer.write_bytes(buf.into())?,
                                     FrontendMessage::CopyData(data) => {
                                         let mut buf = BytesMut::new();
                                         data.write(&mut buf);
-                                        writer.push_vec(buf.into())?;
+                                        writer.write_bytes(buf.into())?;
                                     }
                                 },
                                 RequestMessages::CopyIn(mut rcv) => {
@@ -134,18 +134,18 @@ impl Connection {
                                             Ok(Some(msg)) => {
                                                 match msg {
                                                     FrontendMessage::Raw(buf) => {
-                                                        writer.push_vec(buf.into())?
+                                                        writer.write_bytes(buf.into())?
                                                     }
                                                     FrontendMessage::CopyData(data) => {
                                                         let mut buf = BytesMut::new();
                                                         data.write(&mut buf);
-                                                        writer.push_vec(buf.into())?;
+                                                        writer.write_bytes(buf.into())?;
                                                     }
                                                 }
                                                 copy_in_msg = rcv.try_recv();
                                             }
                                             Ok(None) => {
-                                                writer.write_all()?;
+                                                writer.flush()?;
 
                                                 // no data found we just write all the data and wait
                                                 copy_in_msg = rcv.recv();
@@ -158,7 +158,7 @@ impl Connection {
                             request = req_rx.try_recv();
                         }
                         Err(TryRecvError::Empty) => {
-                            writer.write_all()?;
+                            writer.flush()?;
                             request = req_rx.recv().map_err(|_| TryRecvError::Empty);
                         }
                         Err(_) => {
