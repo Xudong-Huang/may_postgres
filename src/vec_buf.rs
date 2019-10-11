@@ -9,7 +9,6 @@ pub struct VecBufs<W> {
     pos: usize,
     bufs: Vec<Bytes>,
     io_slice: [IoSlice<'static>; MAX_VEC_BUF],
-    len: usize, // track how many vecs
     writer: W,
 }
 
@@ -20,7 +19,6 @@ impl<W: Write> VecBufs<W> {
             pos: 0,
             bufs: Vec::new(),
             io_slice: unsafe { MaybeUninit::uninit().assume_init() },
-            len: 0,
             writer,
         }
     }
@@ -30,14 +28,13 @@ impl<W: Write> VecBufs<W> {
     }
 
     pub fn write_bytes(&mut self, buf: Bytes) -> std::io::Result<()> {
-        if self.len < MAX_VEC_BUF {
-            let slice = IoSlice::new(unsafe { std::mem::transmute(&buf[..]) });
-            self.bufs.push(buf);
-            self.io_slice[self.len] = slice;
-            self.len += 1;
-        }
+        let len = self.bufs.len();
+        assert!(len < MAX_VEC_BUF);
+        let slice = IoSlice::new(unsafe { std::mem::transmute(&buf[..]) });
+        self.bufs.push(buf);
+        self.io_slice[len] = slice;
 
-        if self.len == MAX_VEC_BUF {
+        if len + 1 == MAX_VEC_BUF {
             self.flush()?;
         }
 
@@ -73,13 +70,12 @@ impl<W: Write> VecBufs<W> {
         while !self.is_empty() {
             let n = self
                 .writer
-                .write_vectored(&self.io_slice[self.block..self.len])?;
+                .write_vectored(&self.io_slice[self.block..self.bufs.len()])?;
             self.advance(n);
         }
         self.bufs.clear();
         self.block = 0;
         self.pos = 0;
-        self.len = 0;
         Ok(())
     }
 }
