@@ -3,16 +3,17 @@ use crate::copy_in::CopyInReceiver;
 use crate::vec_buf::VecBufs;
 use crate::Error;
 use bytes::BytesMut;
+use fallible_iterator::FallibleIterator;
 use log::error;
 use may::coroutine::JoinHandle;
 use may::net::TcpStream;
-use may::sync::{mpsc, Mutex, RwLock, RwLockReadGuard};
+use may::sync::{mpsc, RwLock, RwLockReadGuard};
 use may::{coroutine_local, go};
+use may_queue::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 
@@ -62,10 +63,10 @@ impl Connection {
             .inner_mut()
             .try_clone()
             .expect("failed to clone stream for wirter");
-        let rsp_queue = Arc::new(Mutex::new(VecDeque::with_capacity(512)));
+        let rsp_queue = Arc::new(spsc::Queue::new());
         let (req_tx, req_rx) = mpsc::channel();
         let rx_handle = {
-            let rsp_queue: Arc<Mutex<VecDeque<Response>>> = rsp_queue.clone();
+            let rsp_queue: Arc<spsc::Queue<Response>> = rsp_queue.clone();
             let req_tx = req_tx.clone();
             go!(move || {
                 let mut main = || -> Result<(), Error> {
@@ -82,15 +83,23 @@ impl Connection {
                             }
                             BackendMessage::Async(_) => unreachable!(),
                             BackendMessage::Normal {
-                                messages,
+                                mut messages,
                                 request_complete,
                             } => {
-                                let mut rsp_queue = rsp_queue.lock().unwrap();
-                                let response = &rsp_queue[0];
+                                let response = match unsafe { rsp_queue.peek() } {
+                                    Some(response) => response,
+                                    None => match messages.next().map_err(Error::parse)? {
+                                        Some(Message::ErrorResponse(error)) => {
+                                            return Err(Error::db(error))
+                                        }
+                                        _ => return Err(Error::unexpected_message()),
+                                    },
+                                };
+
                                 response.tx.send(messages).ok();
 
                                 if request_complete {
-                                    rsp_queue.pop_front();
+                                    rsp_queue.pop();
                                 }
                             }
                         }
@@ -124,9 +133,7 @@ impl Connection {
                 loop {
                     match request {
                         Ok(req) => {
-                            let mut rsp_queue = rsp_queue.lock().unwrap();
-                            rsp_queue.push_back(Response { tx: req.sender });
-                            drop(rsp_queue);
+                            rsp_queue.push(Response { tx: req.sender });
                             match req.messages {
                                 RequestMessages::Single(msg) => match msg {
                                     FrontendMessage::Raw(buf) => writer.write_bytes(buf.into())?,
