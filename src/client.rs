@@ -167,6 +167,7 @@ impl Client {
         statement: &Statement,
         params: &[&dyn ToSql],
     ) -> impl Iterator<Item = Result<Row, Error>> {
+        self.inner.sender.read_lock();
         let buf = query::encode(statement, params.iter().cloned());
         query::query(self.inner(), statement.clone(), buf)
     }

@@ -5,15 +5,20 @@ use crate::Error;
 use bytes::BytesMut;
 use log::error;
 use may::coroutine::JoinHandle;
-use may::go;
 use may::net::TcpStream;
-use may::sync::{mpsc, Mutex};
+use may::sync::{mpsc, Mutex, RwLock, RwLockReadGuard};
+use may::{coroutine_local, go};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
+
+coroutine_local! {
+    static READER_LOCK: RefCell<Option<RwLockReadGuard<'static, ()>>> = RefCell::new(None)
+}
 
 pub enum RequestMessages {
     Single(FrontendMessage),
@@ -34,6 +39,7 @@ pub(crate) struct Connection {
     rx_handle: JoinHandle<()>,
     tx_handle: JoinHandle<()>,
     req_tx: mpsc::Sender<Request>,
+    rw_lock: Arc<RwLock<()>>,
 }
 
 impl Drop for Connection {
@@ -107,6 +113,9 @@ impl Connection {
             })
         };
 
+        let rw_lock = Arc::new(RwLock::new(()));
+        let rw_lock_1 = rw_lock.clone();
+
         let tx_handle = go!(move || {
             let mut writer = VecBufs::new(writer);
             let mut main = || -> Result<(), io::Error> {
@@ -158,6 +167,14 @@ impl Connection {
                             request = req_rx.try_recv();
                         }
                         Err(TryRecvError::Empty) => {
+                            let _g = rw_lock_1.write().unwrap();
+                            request = req_rx.try_recv();
+                            match &request {
+                                Err(TryRecvError::Empty) => {}
+                                _ => continue,
+                            }
+                            drop(_g);
+
                             writer.flush()?;
                             request = req_rx.recv().map_err(|_| TryRecvError::Empty);
                         }
@@ -181,13 +198,22 @@ impl Connection {
             rx_handle,
             tx_handle,
             req_tx,
+            rw_lock,
         }
     }
 
     /// send a request to the connection
     pub fn send(&self, req: Request) -> io::Result<()> {
-        self.req_tx
+        let ret = self
+            .req_tx
             .send(req)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "send req failed"))
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "send req failed"));
+        READER_LOCK.with(|l| l.borrow_mut().take());
+        ret
+    }
+
+    pub fn read_lock(&self) {
+        let lock = unsafe { std::mem::transmute(self.rw_lock.read().unwrap()) };
+        READER_LOCK.with(|l| l.borrow_mut().replace(lock));
     }
 }
