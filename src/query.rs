@@ -54,6 +54,7 @@ where
 
     loop {
         match responses.next()? {
+            Message::BindComplete => continue,
             Message::DataRow(_) => {}
             Message::CommandComplete(body) => {
                 let rows = body
@@ -73,14 +74,7 @@ where
 }
 
 fn start(client: &InnerClient, buf: Bytes) -> Result<Responses, Error> {
-    let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
-
-    match responses.next()? {
-        Message::BindComplete => {}
-        _ => return Err(Error::unexpected_message()),
-    }
-
-    Ok(responses)
+    client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))
 }
 
 pub fn encode<'a, I>(client: &InnerClient, statement: &Statement, params: I) -> Result<Bytes, Error>
@@ -148,13 +142,16 @@ impl Iterator for RowStream {
     type Item = Result<Row, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match o_try!(self.responses.next()) {
-            Message::DataRow(body) => Some(Ok(o_try!(Row::new(self.statement.clone(), body)))),
-            Message::EmptyQueryResponse
-            | Message::CommandComplete(_)
-            | Message::PortalSuspended => None,
-            Message::ErrorResponse(body) => Some(Err(Error::db(body))),
-            _ => Some(Err(Error::unexpected_message())),
+        loop {
+            return match o_try!(self.responses.next()) {
+                Message::DataRow(body) => Some(Ok(o_try!(Row::new(self.statement.clone(), body)))),
+                Message::EmptyQueryResponse
+                | Message::CommandComplete(_)
+                | Message::PortalSuspended => None,
+                Message::ErrorResponse(body) => Some(Err(Error::db(body))),
+                Message::BindComplete => continue,
+                _ => Some(Err(Error::unexpected_message())),
+            };
         }
     }
 }
