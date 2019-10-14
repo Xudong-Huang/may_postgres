@@ -2,7 +2,7 @@ use bytes::Bytes;
 use std::io::{IoSlice, Write};
 use std::mem::MaybeUninit;
 
-const MAX_VEC_BUF: usize = 64;
+const MAX_VEC_BUF: usize = 128;
 
 pub struct VecBufs<W> {
     block: usize,

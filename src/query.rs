@@ -16,7 +16,6 @@ where
     I: IntoIterator<Item = &'a dyn ToSql>,
     I::IntoIter: ExactSizeIterator,
 {
-    client.sender.read_lock();
     let buf = encode(client, &statement, params)?;
     let responses = start(client, buf)?;
     Ok(RowStream {
@@ -133,6 +132,7 @@ where
     }
 }
 
+/// stream of rows returned by query
 pub struct RowStream {
     statement: Statement,
     responses: Responses,

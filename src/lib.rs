@@ -75,10 +75,11 @@ pub use crate::config::Config;
 use crate::error::DbError;
 pub use crate::error::Error;
 pub use crate::portal::Portal;
+pub use crate::query::RowStream;
 pub use crate::row::{Row, SimpleQueryRow};
 pub use crate::to_statement::ToStatement;
 pub use crate::transaction::Transaction;
-use crate::types::ToSql;
+pub use crate::types::ToSql;
 pub use statement::{Column, Statement};
 
 mod bind;

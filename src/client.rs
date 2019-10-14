@@ -246,6 +246,7 @@ impl Client {
         I: IntoIterator<Item = &'a dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
     {
+        self.inner.sender.read_lock();
         let statement = statement.__convert().into_statement(self)?;
         query::query(&self.inner, statement, params)
     }
