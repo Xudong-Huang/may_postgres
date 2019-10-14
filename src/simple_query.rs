@@ -1,30 +1,25 @@
 use crate::client::{InnerClient, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
-use crate::try_iterator::TryIterator;
 use crate::{Error, SimpleQueryMessage, SimpleQueryRow};
+use bytes::Bytes;
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::sync::Arc;
 
-pub fn simple_query(
-    client: Arc<InnerClient>,
-    query: &str,
-) -> impl Iterator<Item = Result<SimpleQueryMessage, Error>> {
-    let buf = i_try!(encode(query));
+pub fn simple_query(client: &InnerClient, query: &str) -> Result<SimpleQueryStream, Error> {
+    let buf = encode(client, query)?;
+    let responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
-    let responses = i_try!(client.send(RequestMessages::Single(FrontendMessage::Raw(buf))));
-
-    TryIterator::Iter(SimpleQuery {
+    Ok(SimpleQueryStream {
         responses,
         columns: None,
     })
 }
 
-pub fn batch_execute(client: Arc<InnerClient>, query: &str) -> Result<(), Error> {
-    let buf = encode(query)?;
-
+pub fn batch_execute(client: &InnerClient, query: &str) -> Result<(), Error> {
+    let buf = encode(client, query)?;
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
     loop {
@@ -39,18 +34,19 @@ pub fn batch_execute(client: Arc<InnerClient>, query: &str) -> Result<(), Error>
     }
 }
 
-fn encode(query: &str) -> Result<Vec<u8>, Error> {
-    let mut buf = vec![];
-    frontend::query(query, &mut buf).map_err(Error::encode)?;
-    Ok(buf)
+fn encode(client: &InnerClient, query: &str) -> Result<Bytes, Error> {
+    client.with_buf(|buf| {
+        frontend::query(query, buf).map_err(Error::encode)?;
+        Ok(buf.take().freeze())
+    })
 }
 
-struct SimpleQuery {
+pub struct SimpleQueryStream {
     responses: Responses,
     columns: Option<Arc<[String]>>,
 }
 
-impl Iterator for SimpleQuery {
+impl Iterator for SimpleQueryStream {
     type Item = Result<SimpleQueryMessage, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {

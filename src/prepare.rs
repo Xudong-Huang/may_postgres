@@ -2,9 +2,10 @@ use crate::client::InnerClient;
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::error::SqlState;
-use crate::query;
-use crate::types::{Field, Kind, Oid, ToSql, Type};
+use crate::types::{Field, Kind, Oid, Type};
+use crate::{query, slice_iter};
 use crate::{Column, Error, Statement};
+use bytes::Bytes;
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -53,10 +54,9 @@ ORDER BY attnum
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
-pub fn prepare(client: Arc<InnerClient>, query: &str, types: &[Type]) -> Result<Statement, Error> {
+pub fn prepare(client: &Arc<InnerClient>, query: &str, types: &[Type]) -> Result<Statement, Error> {
     let name = format!("s{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
-    let buf = encode(&name, query, types)?;
-
+    let buf = encode(client, &name, query, types)?;
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
     match responses.next()? {
@@ -95,13 +95,13 @@ pub fn prepare(client: Arc<InnerClient>, query: &str, types: &[Type]) -> Result<
     Ok(Statement::new(&client, name, parameters, columns))
 }
 
-fn encode(name: &str, query: &str, types: &[Type]) -> Result<Vec<u8>, Error> {
-    let mut buf = vec![];
-    frontend::parse(name, query, types.iter().map(Type::oid), &mut buf).map_err(Error::encode)?;
-    frontend::describe(b'S', &name, &mut buf).map_err(Error::encode)?;
-    frontend::sync(&mut buf);
-
-    Ok(buf)
+fn encode(client: &InnerClient, name: &str, query: &str, types: &[Type]) -> Result<Bytes, Error> {
+    client.with_buf(|buf| {
+        frontend::parse(name, query, types.iter().map(Type::oid), buf).map_err(Error::encode)?;
+        frontend::describe(b'S', &name, buf).map_err(Error::encode)?;
+        frontend::sync(buf);
+        Ok(buf.take().freeze())
+    })
 }
 
 fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
@@ -115,8 +115,7 @@ fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
 
     let stmt = typeinfo_statement(client)?;
 
-    let buf = query::encode(&stmt, (&[&oid as &dyn ToSql]).iter().cloned());
-    let mut rows = query::query(client.clone(), stmt, buf);
+    let mut rows = query::query(client, stmt, slice_iter(&[&oid]))?;
 
     let row = match rows.next().transpose()? {
         Some(row) => row,
@@ -163,10 +162,10 @@ fn typeinfo_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
         return Ok(stmt);
     }
 
-    let stmt = match prepare(client.clone(), TYPEINFO_QUERY, &[]) {
+    let stmt = match prepare(client, TYPEINFO_QUERY, &[]) {
         Ok(stmt) => stmt,
         Err(ref e) if e.code() == Some(&SqlState::UNDEFINED_TABLE) => {
-            prepare(client.clone(), TYPEINFO_FALLBACK_QUERY, &[])?
+            prepare(client, TYPEINFO_FALLBACK_QUERY, &[])?
         }
         Err(e) => return Err(e),
     };
@@ -178,8 +177,7 @@ fn typeinfo_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
 fn get_enum_variants(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<String>, Error> {
     let stmt = typeinfo_enum_statement(client)?;
 
-    let buf = query::encode(&stmt, (&[&oid as &dyn ToSql]).iter().cloned());
-    query::query(client.clone(), stmt, buf)
+    query::query(client, stmt, slice_iter(&[&oid]))?
         .map(|row| row.and_then(|r| r.try_get(0)))
         .collect()
 }
@@ -189,10 +187,10 @@ fn typeinfo_enum_statement(client: &Arc<InnerClient>) -> Result<Statement, Error
         return Ok(stmt);
     }
 
-    let stmt = match prepare(client.clone(), TYPEINFO_ENUM_QUERY, &[]) {
+    let stmt = match prepare(client, TYPEINFO_ENUM_QUERY, &[]) {
         Ok(stmt) => stmt,
         Err(ref e) if e.code() == Some(&SqlState::UNDEFINED_COLUMN) => {
-            prepare(client.clone(), TYPEINFO_ENUM_FALLBACK_QUERY, &[])?
+            prepare(client, TYPEINFO_ENUM_FALLBACK_QUERY, &[])?
         }
         Err(e) => return Err(e),
     };
@@ -204,8 +202,7 @@ fn typeinfo_enum_statement(client: &Arc<InnerClient>) -> Result<Statement, Error
 fn get_composite_fields(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<Field>, Error> {
     let stmt = typeinfo_composite_statement(client)?;
 
-    let buf = query::encode(&stmt, (&[&oid as &dyn ToSql]).iter().cloned());
-    let rows = query::query(client.clone(), stmt, buf).collect::<Result<Vec<_>, _>>()?;
+    let rows = query::query(client, stmt, slice_iter(&[&oid]))?.collect::<Result<Vec<_>, _>>()?;
 
     let mut fields = vec![];
     for row in rows {
@@ -223,7 +220,7 @@ fn typeinfo_composite_statement(client: &Arc<InnerClient>) -> Result<Statement, 
         return Ok(stmt);
     }
 
-    let stmt = prepare(client.clone(), TYPEINFO_COMPOSITE_QUERY, &[])?;
+    let stmt = prepare(client, TYPEINFO_COMPOSITE_QUERY, &[])?;
 
     client.set_typeinfo_composite(&stmt);
     Ok(stmt)

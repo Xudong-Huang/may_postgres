@@ -1,11 +1,11 @@
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::message::backend;
 use postgres_protocol::message::frontend::CopyData;
 use std::io::{self, Read};
 
 pub enum FrontendMessage {
-    Raw(Vec<u8>),
+    Raw(Bytes),
     CopyData(CopyData<Box<dyn Buf + Send>>),
 }
 

@@ -2,17 +2,23 @@ use crate::cancel_query;
 use crate::codec::BackendMessages;
 use crate::config::Host;
 use crate::connection::{Connection, Request, RequestMessages};
+use crate::copy_out::CopyStream;
+use crate::query::RowStream;
+use crate::simple_query::SimpleQueryStream;
+use crate::slice_iter;
+use crate::to_statement::ToStatement;
 use crate::types::{Oid, ToSql, Type};
 use crate::{cancel_query_raw, copy_in, copy_out, query, Transaction};
 use crate::{prepare, SimpleQueryMessage};
 use crate::{simple_query, Row};
 use crate::{Error, Statement};
-use bytes::{Bytes, IntoBuf};
+use bytes::{BytesMut, IntoBuf};
 use fallible_iterator::FallibleIterator;
 use may::net::TcpStream;
 use may::sync::{mpsc, Mutex};
 use postgres_protocol::message::backend::Message;
 use std::collections::HashMap;
+use std::error;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,10 +49,11 @@ struct State {
     typeinfo_composite: Option<Statement>,
     typeinfo_enum: Option<Statement>,
     types: HashMap<Oid, Type>,
+    buf: BytesMut,
 }
 
 pub struct InnerClient {
-    sender: Connection,
+    pub(crate) sender: Connection,
     state: Mutex<State>,
 }
 
@@ -93,6 +100,16 @@ impl InnerClient {
     pub fn set_type(&self, oid: Oid, type_: &Type) {
         self.state.lock().unwrap().types.insert(oid, type_.clone());
     }
+
+    pub fn with_buf<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut BytesMut) -> R,
+    {
+        let mut state = self.state.lock().unwrap();
+        let r = f(&mut state.buf);
+        state.buf.clear();
+        r
+    }
 }
 
 #[derive(Clone)]
@@ -125,6 +142,7 @@ impl Client {
                     typeinfo_composite: None,
                     typeinfo_enum: None,
                     types: HashMap::new(),
+                    buf: BytesMut::new(),
                 }),
             }),
             socket_config: None,
@@ -133,8 +151,8 @@ impl Client {
         }
     }
 
-    pub(crate) fn inner(&self) -> Arc<InnerClient> {
-        self.inner.clone()
+    pub(crate) fn inner(&self) -> &Arc<InnerClient> {
+        &self.inner
     }
 
     pub(crate) fn set_socket_config(&mut self, socket_config: SocketConfig) {
@@ -154,62 +172,127 @@ impl Client {
     /// The list of types may be smaller than the number of parameters - the types of the remaining parameters will be
     /// inferred. For example, `client.prepare_typed(query, &[])` is equivalent to `client.prepare(query)`.
     pub fn prepare_typed(&self, query: &str, parameter_types: &[Type]) -> Result<Statement, Error> {
-        prepare::prepare(self.inner(), query, parameter_types)
+        prepare::prepare(&self.inner, query, parameter_types)
     }
 
-    /// Executes a statement, returning a stream of the resulting rows.
+    /// Executes a statement, returning a vector of the resulting rows.
+    ///
+    /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
+    /// provided, 1-indexed.
+    ///
+    /// The `statement` argument can either be a `Statement`, or a raw query string. If the same statement will be
+    /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
+    /// with the `prepare` method.
     ///
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn query(
-        &self,
-        statement: &Statement,
-        params: &[&dyn ToSql],
-    ) -> impl Iterator<Item = Result<Row, Error>> {
-        self.inner.sender.read_lock();
-        let buf = query::encode(statement, params.iter().cloned());
-        query::query(self.inner(), statement.clone(), buf)
+    pub fn query<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        self.query_raw(statement, slice_iter(params))?.collect()
     }
 
-    /// Like [`query`], but takes an iterator of parameters rather than a slice.
+    /// Executes a statement which returns a single row, returning it.
+    ///
+    /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
+    /// provided, 1-indexed.
+    ///
+    /// The `statement` argument can either be a `Statement`, or a raw query string. If the same statement will be
+    /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
+    /// with the `prepare` method.
+    ///
+    /// Returns an error if the query does not return exactly one row.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of parameters provided does not match the number expected.
+    pub fn query_one<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Row, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        let mut stream = self.query_raw(statement, slice_iter(params))?;
+
+        let row = match stream.next().transpose()? {
+            Some(row) => row,
+            None => return Err(Error::row_count()),
+        };
+
+        if stream.next().transpose()?.is_some() {
+            return Err(Error::row_count());
+        }
+
+        Ok(row)
+    }
+
+    /// The maximally flexible version of [`query`].
+    ///
+    /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
+    /// provided, 1-indexed.
+    ///
+    /// The `statement` argument can either be a `Statement`, or a raw query string. If the same statement will be
+    /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
+    /// with the `prepare` method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of parameters provided does not match the number expected.
     ///
     /// [`query`]: #method.query
-    pub fn query_iter<'a, I>(
-        &self,
-        statement: &Statement,
-        params: I,
-    ) -> impl Iterator<Item = Result<Row, Error>>
+    pub fn query_raw<'a, T, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
     where
+        T: ?Sized + ToStatement,
         I: IntoIterator<Item = &'a dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
     {
-        let buf = query::encode(statement, params);
-        query::query(self.inner(), statement.clone(), buf)
+        let statement = statement.__convert().into_statement(self)?;
+        query::query(&self.inner, statement, params)
     }
 
     /// Executes a statement, returning the number of rows modified.
+    ///
+    /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
+    /// provided, 1-indexed.
+    ///
+    /// The `statement` argument can either be a `Statement`, or a raw query string. If the same statement will be
+    /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
+    /// with the `prepare` method.
     ///
     /// If the statement does not modify any rows (e.g. `SELECT`), 0 is returned.
     ///
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn execute(&self, statement: &Statement, params: &[&dyn ToSql]) -> Result<u64, Error> {
-        let buf = query::encode(statement, params.iter().cloned());
-        query::execute(self.inner(), buf)
+    pub fn execute<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        self.execute_raw(statement, slice_iter(params))
     }
 
-    /// Like [`execute`], but takes an iterator of parameters rather than a slice.
+    /// The maximally flexible version of [`execute`].
+    ///
+    /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
+    /// provided, 1-indexed.
+    ///
+    /// The `statement` argument can either be a `Statement`, or a raw query string. If the same statement will be
+    /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
+    /// with the `prepare` method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of parameters provided does not match the number expected.
     ///
     /// [`execute`]: #method.execute
-    pub fn execute_iter<'a, I>(&self, statement: &Statement, params: I) -> Result<u64, Error>
+    pub fn execute_raw<'a, T, I>(&self, statement: &T, params: I) -> Result<u64, Error>
     where
+        T: ?Sized + ToStatement,
         I: IntoIterator<Item = &'a dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
     {
-        let buf = query::encode(statement, params);
-        query::execute(self.inner(), buf)
+        let statement = statement.__convert().into_statement(self)?;
+        query::execute(self.inner(), statement, params)
     }
 
     /// Executes a `COPY FROM STDIN` statement, returning the number of rows created.
@@ -220,20 +303,22 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn copy_in<T, E, S>(
+    pub fn copy_in<T, E, S, M>(
         &self,
-        statement: &Statement,
-        params: &[&dyn ToSql],
+        statement: &M,
+        params: &[&(dyn ToSql + Sync)],
         stream: S,
     ) -> Result<u64, Error>
     where
+        M: ?Sized + ToStatement,
         S: Iterator<Item = Result<T, E>>,
         T: IntoBuf,
         <T as IntoBuf>::Buf: 'static + Send,
-        E: Into<Box<dyn std::error::Error + Sync + Send>>,
+        E: Into<Box<dyn error::Error + Sync + Send>>,
     {
-        let buf = query::encode(statement, params.iter().cloned());
-        copy_in::copy_in(self.inner(), buf, stream)
+        let statement = statement.__convert().into_statement(self)?;
+        let params = slice_iter(params);
+        copy_in::copy_in(self.inner(), statement, params, stream)
     }
 
     /// Executes a `COPY TO STDOUT` statement, returning a stream of the resulting data.
@@ -241,13 +326,17 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn copy_out(
+    pub fn copy_out<T>(
         &self,
-        statement: &Statement,
-        params: &[&dyn ToSql],
-    ) -> impl Iterator<Item = Result<Bytes, Error>> {
-        let buf = query::encode(statement, params.iter().cloned());
-        copy_out::copy_out(self.inner(), buf)
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<CopyStream, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        let statement = statement.__convert().into_statement(self)?;
+        let params = slice_iter(params);
+        copy_out::copy_out(self.inner(), statement, params)
     }
 
     /// Executes a sequence of SQL statements using the simple query protocol, returning the resulting rows.
@@ -263,10 +352,11 @@ impl Client {
     /// Prepared statements should be use for any query which contains user-specified data, as they provided the
     /// functionality to safely embed that data in the request. Do not form statements via string concatenation and pass
     /// them to this method!
-    pub fn simple_query(
-        &self,
-        query: &str,
-    ) -> impl Iterator<Item = Result<SimpleQueryMessage, Error>> {
+    pub fn simple_query(&self, query: &str) -> Result<Vec<SimpleQueryMessage>, Error> {
+        self.simple_query_raw(query)?.collect()
+    }
+
+    pub(crate) fn simple_query_raw(&self, query: &str) -> Result<SimpleQueryStream, Error> {
         simple_query::simple_query(self.inner(), query)
     }
 
@@ -287,7 +377,7 @@ impl Client {
     /// Begins a new database transaction.
     ///
     /// The transaction will roll back by default - use the `commit` method to commit it.
-    pub fn transaction(&self) -> Result<Transaction<'_>, Error> {
+    pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         self.batch_execute("BEGIN")?;
         Ok(Transaction::new(self))
     }

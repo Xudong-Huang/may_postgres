@@ -109,10 +109,7 @@ fn insert_select() {
         .unwrap();
 
     let _ = client.execute(&insert, &[&"alice", &"bob"]).unwrap();
-    let rows = client
-        .query(&select, &[])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let rows = client.query(&select, &[]).unwrap();
 
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].get::<_, i32>(0), 1);
@@ -245,7 +242,6 @@ fn simple_query() {
             INSERT INTO foo (name) VALUES ('steven'), ('joe');
             SELECT * FROM foo ORDER BY id;",
         )
-        .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
     match messages[0] {
@@ -300,7 +296,7 @@ fn cancel_query_raw() {
 
 #[test]
 fn transaction_commit() {
-    let client = connect("user=postgres");
+    let mut client = connect("user=postgres");
 
     client
         .batch_execute(
@@ -311,17 +307,14 @@ fn transaction_commit() {
         )
         .unwrap();
 
-    let mut transaction = client.transaction().unwrap();
+    let transaction = client.transaction().unwrap();
     transaction
         .batch_execute("INSERT INTO foo (name) VALUES ('steven')")
         .unwrap();
     transaction.commit().unwrap();
 
     let stmt = client.prepare("SELECT name FROM foo").unwrap();
-    let rows = client
-        .query(&stmt, &[])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let rows = client.query(&stmt, &[]).unwrap();
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, &str>(0), "steven");
@@ -329,7 +322,7 @@ fn transaction_commit() {
 
 #[test]
 fn transaction_rollback() {
-    let client = connect("user=postgres");
+    let mut client = connect("user=postgres");
 
     client
         .batch_execute(
@@ -340,24 +333,21 @@ fn transaction_rollback() {
         )
         .unwrap();
 
-    let mut transaction = client.transaction().unwrap();
+    let transaction = client.transaction().unwrap();
     transaction
         .batch_execute("INSERT INTO foo (name) VALUES ('steven')")
         .unwrap();
     transaction.rollback().unwrap();
 
     let stmt = client.prepare("SELECT name FROM foo").unwrap();
-    let rows = client
-        .query(&stmt, &[])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let rows = client.query(&stmt, &[]).unwrap();
 
     assert_eq!(rows.len(), 0);
 }
 
 #[test]
 fn transaction_rollback_drop() {
-    let client = connect("user=postgres");
+    let mut client = connect("user=postgres");
 
     client
         .batch_execute(
@@ -368,17 +358,14 @@ fn transaction_rollback_drop() {
         )
         .unwrap();
 
-    let mut transaction = client.transaction().unwrap();
+    let transaction = client.transaction().unwrap();
     transaction
         .batch_execute("INSERT INTO foo (name) VALUES ('steven')")
         .unwrap();
     drop(transaction);
 
     let stmt = client.prepare("SELECT name FROM foo").unwrap();
-    let rows = client
-        .query(&stmt, &[])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let rows = client.query(&stmt, &[]).unwrap();
 
     assert_eq!(rows.len(), 0);
 }
@@ -406,10 +393,7 @@ fn copy_in() {
     let stmt = client
         .prepare("SELECT id, name FROM foo ORDER BY id")
         .unwrap();
-    let rows = client
-        .query(&stmt, &[])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let rows = client.query(&stmt, &[]).unwrap();
 
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].get::<_, i32>(0), 1);
@@ -469,10 +453,7 @@ fn copy_in_error() {
     let stmt = client
         .prepare("SELECT id, name FROM foo ORDER BY id")
         .unwrap();
-    let rows = client
-        .query(&stmt, &[])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let rows = client.query(&stmt, &[]).unwrap();
     assert_eq!(rows.len(), 0);
 }
 
@@ -494,6 +475,7 @@ fn copy_out() {
     let stmt = client.prepare("COPY foo TO STDOUT").unwrap();
     let data = client
         .copy_out(&stmt, &[])
+        .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
         .concat();
@@ -534,7 +516,7 @@ fn copy_out() {
 
 #[test]
 fn query_portal() {
-    let client = connect("user=postgres");
+    let mut client = connect("user=postgres");
 
     client
         .batch_execute(
@@ -551,21 +533,12 @@ fn query_portal() {
         .prepare("SELECT id, name FROM foo ORDER BY id")
         .unwrap();
 
-    let mut transaction = client.transaction().unwrap();
+    let transaction = client.transaction().unwrap();
 
     let portal = transaction.bind(&stmt, &[]).unwrap();
-    let r1 = transaction
-        .query_portal(&portal, 2)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let r2 = transaction
-        .query_portal(&portal, 2)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let r3 = transaction
-        .query_portal(&portal, 2)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let r1 = transaction.query_portal(&portal, 2).unwrap();
+    let r2 = transaction.query_portal(&portal, 2).unwrap();
+    let r3 = transaction.query_portal(&portal, 2).unwrap();
 
     assert_eq!(r1.len(), 2);
     assert_eq!(r1[0].get::<_, i32>(0), 1);
@@ -580,100 +553,27 @@ fn query_portal() {
     assert_eq!(r3.len(), 0);
 }
 
-/*
 #[test]
-fn poll_idle_running() {
-    struct DelayStream(Delay);
+fn query_one() {
+    let client = connect("user=postgres");
 
-    impl Stream for DelayStream {
-        type Item = Vec<u8>;
-        type Error = tokio_postgres::Error;
+    client
+        .batch_execute(
+            "
+        CREATE TEMPORARY TABLE foo (
+            name TEXT
+        );
+        INSERT INTO foo (name) VALUES ('alice'), ('bob'), ('carol');
+    ",
+        )
+        .unwrap();
 
-        fn poll(&mut self) -> Poll<Option<Vec<u8>>, tokio_postgres::Error> {
-            try_ready!(self.0.poll().map_err(|e| panic!("{}", e)));
-            QUERY_DONE.store(true, Ordering::SeqCst);
-            Ok(Async::Ready(None))
-        }
-    }
-
-    struct IdleFuture(tokio_postgres::Client);
-
-    impl Future for IdleFuture {
-        type Item = ();
-        type Error = tokio_postgres::Error;
-
-        fn poll(&mut self) -> Poll<(), tokio_postgres::Error> {
-            try_ready!(self.0.poll_idle());
-            assert!(QUERY_DONE.load(Ordering::SeqCst));
-            Ok(Async::Ready(()))
-        }
-    }
-
-    static QUERY_DONE: AtomicBool = AtomicBool::new(false);
-
-    let _ = env_logger::try_init();
-    let mut runtime = Runtime::new().unwrap();
-
-    let (mut client, connection) = runtime.block_on(connect("user=postgres")).unwrap();
-    let connection = connection.map_err(|e| panic!("{}", e));
-    runtime.handle().spawn(connection).unwrap();
-
-    let execute = client
-        .simple_query("CREATE TEMPORARY TABLE foo (id INT)")
-        .for_each(|_| Ok(()));
-    runtime.block_on(execute).unwrap();
-
-    let prepare = client.prepare("COPY foo FROM STDIN");
-    let stmt = runtime.block_on(prepare).unwrap();
-    let copy_in = client.copy_in(
-        &stmt,
-        &[],
-        DelayStream(Delay::new(Instant::now() + Duration::from_millis(10))),
-    );
-    let copy_in = copy_in.map(|_| ()).map_err(|e| panic!("{}", e));
-    runtime.spawn(copy_in);
-
-    let future = IdleFuture(client);
-    runtime.block_on(future).unwrap();
+    client
+        .query_one("SELECT * FROM foo WHERE name = 'dave'", &[])
+        .err()
+        .unwrap();
+    client
+        .query_one("SELECT * FROM foo WHERE name = 'alice'", &[])
+        .unwrap();
+    client.query_one("SELECT * FROM foo", &[]).err().unwrap();
 }
-
-#[test]
-fn poll_idle_new() {
-    struct IdleFuture {
-        client: tokio_postgres::Client,
-        prepare: Option<impls::Prepare>,
-    }
-
-    impl Future for IdleFuture {
-        type Item = ();
-        type Error = tokio_postgres::Error;
-
-        fn poll(&mut self) -> Poll<(), tokio_postgres::Error> {
-            match self.prepare.take() {
-                Some(_future) => {
-                    assert!(!self.client.poll_idle().unwrap().is_ready());
-                    Ok(Async::NotReady)
-                }
-                None => {
-                    assert!(self.client.poll_idle().unwrap().is_ready());
-                    Ok(Async::Ready(()))
-                }
-            }
-        }
-    }
-
-    let _ = env_logger::try_init();
-    let mut runtime = Runtime::new().unwrap();
-
-    let (mut client, connection) = runtime.block_on(connect("user=postgres")).unwrap();
-    let connection = connection.map_err(|e| panic!("{}", e));
-    runtime.handle().spawn(connection).unwrap();
-
-    let prepare = client.prepare("");
-    let future = IdleFuture {
-        client,
-        prepare: Some(prepare),
-    };
-    runtime.block_on(future).unwrap();
-}
-*/

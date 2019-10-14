@@ -1,8 +1,12 @@
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
+use crate::copy_out::CopyStream;
+use crate::query::RowStream;
 use crate::types::{ToSql, Type};
-use crate::{bind, query, Client, Error, Portal, Row, SimpleQueryMessage, Statement};
-use bytes::{Bytes, IntoBuf};
+use crate::{
+    bind, query, slice_iter, Client, Error, Portal, Row, SimpleQueryMessage, Statement, ToStatement,
+};
+use bytes::IntoBuf;
 use may::net::TcpStream;
 use postgres_protocol::message::frontend;
 
@@ -11,7 +15,7 @@ use postgres_protocol::message::frontend;
 /// Transactions will implicitly roll back when dropped. Use the `commit` method to commit the changes made in the
 /// transaction. Transactions can be nested, with inner transactions implemented via safepoints.
 pub struct Transaction<'a> {
-    client: &'a Client,
+    client: &'a mut Client,
     depth: u32,
     done: bool,
 }
@@ -22,13 +26,15 @@ impl<'a> Drop for Transaction<'a> {
             return;
         }
 
-        let mut buf = vec![];
         let query = if self.depth == 0 {
             "ROLLBACK".to_string()
         } else {
             format!("ROLLBACK TO sp{}", self.depth)
         };
-        frontend::query(&query, &mut buf).unwrap();
+        let buf = self.client.inner().with_buf(|buf| {
+            frontend::query(&query, buf).unwrap();
+            buf.take().freeze()
+        });
         let _ = self
             .client
             .inner()
@@ -37,7 +43,7 @@ impl<'a> Drop for Transaction<'a> {
 }
 
 impl<'a> Transaction<'a> {
-    pub(crate) fn new(client: &'a Client) -> Transaction<'a> {
+    pub(crate) fn new(client: &'a mut Client) -> Transaction<'a> {
         Transaction {
             client,
             depth: 0,
@@ -84,43 +90,47 @@ impl<'a> Transaction<'a> {
     }
 
     /// Like `Client::query`.
-    pub fn query(
-        &mut self,
-        statement: &Statement,
-        params: &[&dyn ToSql],
-    ) -> impl Iterator<Item = Result<Row, Error>> {
+    pub fn query<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
         self.client.query(statement, params)
     }
 
-    /// Like `Client::query_iter`.
-    pub fn query_iter<'b, I>(
-        &mut self,
-        statement: &Statement,
-        params: I,
-    ) -> impl Iterator<Item = Result<Row, Error>> + 'static
+    /// Like `Client::query_one`.
+    pub fn query_one<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Row, Error>
     where
+        T: ?Sized + ToStatement,
+    {
+        self.client.query_one(statement, params)
+    }
+
+    /// Like `Client::query_raw`.
+    pub fn query_raw<'b, T, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
+    where
+        T: ?Sized + ToStatement,
         I: IntoIterator<Item = &'b dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
     {
-        // https://github.com/rust-lang/rust/issues/63032
-        let buf = query::encode(statement, params);
-        query::query(self.client.inner(), statement.clone(), buf)
+        self.client.query_raw(statement, params)
     }
 
     /// Like `Client::execute`.
-    pub fn execute(&mut self, statement: &Statement, params: &[&dyn ToSql]) -> Result<u64, Error> {
+    pub fn execute<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
         self.client.execute(statement, params)
     }
 
     /// Like `Client::execute_iter`.
-    pub fn execute_iter<'b, I>(&mut self, statement: &Statement, params: I) -> Result<u64, Error>
+    pub fn execute_raw<'b, I, T>(&self, statement: &Statement, params: I) -> Result<u64, Error>
     where
+        T: ?Sized + ToStatement,
         I: IntoIterator<Item = &'b dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
     {
-        // https://github.com/rust-lang/rust/issues/63032
-        let buf = query::encode(statement, params);
-        query::execute(self.client.inner(), buf)
+        self.client.execute_raw(statement, params)
     }
 
     /// Binds a statement to a set of parameters, creating a `Portal` which can be incrementally queried.
@@ -131,44 +141,48 @@ impl<'a> Transaction<'a> {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn bind(&mut self, statement: &Statement, params: &[&dyn ToSql]) -> Result<Portal, Error> {
-        // https://github.com/rust-lang/rust/issues/63032
-        let buf = bind::encode(statement, params.iter().cloned());
-        bind::bind(self.client.inner(), statement.clone(), buf)
+    pub fn bind<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Portal, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        self.bind_iter(statement, slice_iter(params))
     }
 
     /// Like [`bind`], but takes an iterator of parameters rather than a slice.
     ///
     /// [`bind`]: #method.bind
-    pub fn bind_iter<'b, I>(&mut self, statement: &Statement, params: I) -> Result<Portal, Error>
+    pub fn bind_iter<'b, T, I>(&self, statement: &T, params: I) -> Result<Portal, Error>
     where
+        T: ?Sized + ToStatement,
         I: IntoIterator<Item = &'b dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
     {
-        let buf = bind::encode(statement, params);
-        bind::bind(self.client.inner(), statement.clone(), buf)
+        let statement = statement.__convert().into_statement(&self.client)?;
+        bind::bind(self.client.inner(), statement, params)
     }
 
     /// Continues execution of a portal, returning a stream of the resulting rows.
     ///
     /// Unlike `query`, portals can be incrementally evaluated by limiting the number of rows returned in each call to
     /// `query_portal`. If the requested number is negative or 0, all rows will be returned.
-    pub fn query_portal(
-        &mut self,
-        portal: &Portal,
-        max_rows: i32,
-    ) -> impl Iterator<Item = Result<Row, Error>> {
-        query::query_portal(self.client.inner(), portal.clone(), max_rows)
+    pub fn query_portal(&self, portal: &Portal, max_rows: i32) -> Result<Vec<Row>, Error> {
+        self.query_portal_raw(portal, max_rows)?.collect()
+    }
+
+    /// The maximally flexible version of `query_portal`.
+    pub fn query_portal_raw(&self, portal: &Portal, max_rows: i32) -> Result<RowStream, Error> {
+        query::query_portal(self.client.inner(), portal, max_rows)
     }
 
     /// Like `Client::copy_in`.
-    pub fn copy_in<T, E, S>(
-        &mut self,
-        statement: &Statement,
-        params: &[&dyn ToSql],
+    pub fn copy_in<T, E, S, M>(
+        &self,
+        statement: &M,
+        params: &[&(dyn ToSql + Sync)],
         stream: S,
     ) -> Result<u64, Error>
     where
+        M: ?Sized + ToStatement,
         S: Iterator<Item = Result<T, E>>,
         T: IntoBuf,
         <T as IntoBuf>::Buf: 'static + Send,
@@ -178,34 +192,34 @@ impl<'a> Transaction<'a> {
     }
 
     /// Like `Client::copy_out`.
-    pub fn copy_out(
-        &mut self,
-        statement: &Statement,
-        params: &[&dyn ToSql],
-    ) -> impl Iterator<Item = Result<Bytes, Error>> {
+    pub fn copy_out<T>(
+        &self,
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<CopyStream, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
         self.client.copy_out(statement, params)
     }
 
     /// Like `Client::simple_query`.
-    pub fn simple_query(
-        &mut self,
-        query: &str,
-    ) -> impl Iterator<Item = Result<SimpleQueryMessage, Error>> {
+    pub fn simple_query(&self, query: &str) -> Result<Vec<SimpleQueryMessage>, Error> {
         self.client.simple_query(query)
     }
 
     /// Like `Client::batch_execute`.
-    pub fn batch_execute(&mut self, query: &str) -> Result<(), Error> {
+    pub fn batch_execute(&self, query: &str) -> Result<(), Error> {
         self.client.batch_execute(query)
     }
 
     /// Like `Client::cancel_query`.
-    pub fn cancel_query(&mut self) -> Result<(), Error> {
+    pub fn cancel_query(&self) -> Result<(), Error> {
         self.client.cancel_query()
     }
 
     /// Like `Client::cancel_query_raw`.
-    pub fn cancel_query_raw<S, T>(&mut self, stream: TcpStream) -> Result<(), Error> {
+    pub fn cancel_query_raw<S, T>(&self, stream: TcpStream) -> Result<(), Error> {
         self.client.cancel_query_raw(stream)
     }
 

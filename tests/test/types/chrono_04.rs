@@ -13,7 +13,7 @@ fn test_naive_date_time_params() {
     }
     test_type(
         "TIMESTAMP",
-        vec![
+        &[
             make_check("'1970-01-01 00:00:00.010000000'"),
             make_check("'1965-09-25 11:19:33.100314000'"),
             make_check("'2010-02-09 23:11:45.120200000'"),
@@ -34,7 +34,7 @@ fn test_with_special_naive_date_time_params() {
     }
     test_type(
         "TIMESTAMP",
-        vec![
+        &[
             make_check("'1970-01-01 00:00:00.010000000'"),
             make_check("'1965-09-25 11:19:33.100314000'"),
             make_check("'2010-02-09 23:11:45.120200000'"),
@@ -57,7 +57,7 @@ fn test_date_time_params() {
     }
     test_type(
         "TIMESTAMP WITH TIME ZONE",
-        vec![
+        &[
             make_check("'1970-01-01 00:00:00.010000000'"),
             make_check("'1965-09-25 11:19:33.100314000'"),
             make_check("'2010-02-09 23:11:45.120200000'"),
@@ -79,7 +79,7 @@ fn test_with_special_date_time_params() {
     }
     test_type(
         "TIMESTAMP WITH TIME ZONE",
-        vec![
+        &[
             make_check("'1970-01-01 00:00:00.010000000'"),
             make_check("'1965-09-25 11:19:33.100314000'"),
             make_check("'2010-02-09 23:11:45.120200000'"),
@@ -99,7 +99,7 @@ fn test_date_params() {
     }
     test_type(
         "DATE",
-        vec![
+        &[
             make_check("'1970-01-01'"),
             make_check("'1965-09-25'"),
             make_check("'2010-02-09'"),
@@ -118,7 +118,7 @@ fn test_with_special_date_params() {
     }
     test_type(
         "DATE",
-        vec![
+        &[
             make_check("'1970-01-01'"),
             make_check("'1965-09-25'"),
             make_check("'2010-02-09'"),
@@ -138,7 +138,7 @@ fn test_time_params() {
     }
     test_type(
         "TIME",
-        vec![
+        &[
             make_check("'00:00:00.010000000'"),
             make_check("'11:19:33.100314000'"),
             make_check("'23:11:45.120200000'"),

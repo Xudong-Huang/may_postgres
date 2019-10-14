@@ -109,11 +109,11 @@ impl Connection {
 
                 if let Err(e) = main() {
                     error!("receiver closed. err={}", e);
-                    let mut request = vec![];
+                    let mut request = BytesMut::new();
                     frontend::terminate(&mut request);
                     let (tx, _rx) = mpsc::channel();
                     let req = Request {
-                        messages: RequestMessages::Single(FrontendMessage::Raw(request)),
+                        messages: RequestMessages::Single(FrontendMessage::Raw(request.freeze())),
                         sender: tx,
                     };
                     req_tx.send(req).ok();
@@ -136,11 +136,11 @@ impl Connection {
                             rsp_queue.push(Response { tx: req.sender });
                             match req.messages {
                                 RequestMessages::Single(msg) => match msg {
-                                    FrontendMessage::Raw(buf) => writer.write_bytes(buf.into())?,
+                                    FrontendMessage::Raw(buf) => writer.write_bytes(buf)?,
                                     FrontendMessage::CopyData(data) => {
                                         let mut buf = BytesMut::new();
                                         data.write(&mut buf);
-                                        writer.write_bytes(buf.into())?;
+                                        writer.write_bytes(buf.freeze())?;
                                     }
                                 },
                                 RequestMessages::CopyIn(mut rcv) => {
@@ -150,12 +150,12 @@ impl Connection {
                                             Ok(Some(msg)) => {
                                                 match msg {
                                                     FrontendMessage::Raw(buf) => {
-                                                        writer.write_bytes(buf.into())?
+                                                        writer.write_bytes(buf)?
                                                     }
                                                     FrontendMessage::CopyData(data) => {
                                                         let mut buf = BytesMut::new();
                                                         data.write(&mut buf);
-                                                        writer.write_bytes(buf.into())?;
+                                                        writer.write_bytes(buf.freeze())?;
                                                     }
                                                 }
                                                 copy_in_msg = rcv.try_recv();

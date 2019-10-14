@@ -15,9 +15,11 @@ struct StatementInner {
 impl Drop for StatementInner {
     fn drop(&mut self) {
         if let Some(client) = self.client.upgrade() {
-            let mut buf = vec![];
-            frontend::close(b'S', &self.name, &mut buf).expect("statement name not valid");
-            frontend::sync(&mut buf);
+            let buf = client.with_buf(|buf| {
+                frontend::close(b'S', &self.name, buf).unwrap();
+                frontend::sync(buf);
+                buf.take().freeze()
+            });
             let _ = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)));
         }
     }

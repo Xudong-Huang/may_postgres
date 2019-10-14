@@ -11,10 +11,7 @@ fn smoke_test(s: &str) {
     let client = connect(s);
 
     let stmt = client.prepare("SELECT $1::INT").unwrap();
-    let rows = client
-        .query(&stmt, &[&1i32])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let rows = client.query(&stmt, &[&1i32]).unwrap();
     assert_eq!(rows[0].get::<_, i32>(0), 1i32);
 }
 

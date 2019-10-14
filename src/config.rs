@@ -68,6 +68,9 @@ pub(crate) enum Host {
 /// * `target_session_attrs` - Specifies requirements of the session. If set to `read-write`, the client will check that
 ///     the `transaction_read_write` session parameter is set to `on`. This can be used to connect to the primary server
 ///     in a database cluster as opposed to the secondary read-only mirrors. Defaults to `all`.
+/// * `channel_binding` - Controls usage of channel binding in the authentication process. If set to `disable`, channel
+///     binding will not be used. If set to `prefer`, channel binding will be used if available, but not used otherwise.
+///     If set to `require`, the authentication process will fail if channel binding is not used. Defaults to `prefer`.
 ///
 /// ## Examples
 ///

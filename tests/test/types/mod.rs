@@ -1,5 +1,5 @@
-use may_postgres::to_sql_checked;
 use may_postgres::types::{FromSql, FromSqlOwned, IsNull, Kind, ToSql, Type, WrongType};
+use postgres_types::to_sql_checked;
 use std::collections::HashMap;
 use std::error::Error;
 use std::f32;
@@ -10,9 +10,10 @@ use std::result;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::connect;
+use bytes::BytesMut;
 
-#[cfg(feature = "with-bit-vec-0_7")]
-mod bit_vec_07;
+#[cfg(feature = "with-bit-vec-0_6")]
+mod bit_vec_06;
 #[cfg(feature = "with-chrono-0_4")]
 mod chrono_04;
 #[cfg(feature = "with-eui48-0_4")]
@@ -24,31 +25,25 @@ mod serde_json_1;
 #[cfg(feature = "with-uuid-0_7")]
 mod uuid_07;
 
-fn test_type<T, S>(sql_type: &str, checks: Vec<(T, S)>)
+fn test_type<T, S>(sql_type: &str, checks: &[(T, S)])
 where
-    T: PartialEq + for<'a> FromSqlOwned + ToSql,
+    T: PartialEq + for<'a> FromSqlOwned + ToSql + Sync,
     S: fmt::Display,
 {
     let client = connect("user=postgres");
 
     for (val, repr) in checks {
-        let stmt = client
-            .prepare(&format!("SELECT {}::{}", repr, sql_type))
-            .unwrap();
         let rows = client
-            .query(&stmt, &[])
-            .collect::<Result<Vec<_>, _>>()
+            .query(&*format!("SELECT {}::{}", repr, sql_type), &[])
             .unwrap();
         let result = rows[0].get(0);
-        assert_eq!(val, result);
+        assert_eq!(val, &result);
 
-        let stmt = client.prepare(&format!("SELECT $1::{}", sql_type)).unwrap();
         let rows = client
-            .query(&stmt, &[&val])
-            .collect::<Result<Vec<_>, _>>()
+            .query(&*format!("SELECT $1::{}", sql_type), &[&val])
             .unwrap();
         let result = rows[0].get(0);
-        assert_eq!(val, result);
+        assert_eq!(val, &result);
     }
 }
 
@@ -56,20 +51,20 @@ where
 fn test_bool_params() {
     test_type(
         "BOOL",
-        vec![(Some(true), "'t'"), (Some(false), "'f'"), (None, "NULL")],
+        &[(Some(true), "'t'"), (Some(false), "'f'"), (None, "NULL")],
     );
 }
 
 #[test]
 fn test_i8_params() {
-    test_type("\"char\"", vec![(Some('a' as i8), "'a'"), (None, "NULL")]);
+    test_type("\"char\"", &[(Some('a' as i8), "'a'"), (None, "NULL")]);
 }
 
 #[test]
 fn test_name_params() {
     test_type(
         "NAME",
-        vec![
+        &[
             (Some("hello world".to_owned()), "'hello world'"),
             (
                 Some("イロハニホヘト チリヌルヲ".to_owned()),
@@ -84,7 +79,7 @@ fn test_name_params() {
 fn test_i16_params() {
     test_type(
         "SMALLINT",
-        vec![
+        &[
             (Some(15001i16), "15001"),
             (Some(-15001i16), "-15001"),
             (None, "NULL"),
@@ -96,7 +91,7 @@ fn test_i16_params() {
 fn test_i32_params() {
     test_type(
         "INT",
-        vec![
+        &[
             (Some(2_147_483_548i32), "2147483548"),
             (Some(-2_147_483_548i32), "-2147483548"),
             (None, "NULL"),
@@ -108,7 +103,7 @@ fn test_i32_params() {
 fn test_oid_params() {
     test_type(
         "OID",
-        vec![
+        &[
             (Some(2_147_483_548u32), "2147483548"),
             (Some(4_000_000_000), "4000000000"),
             (None, "NULL"),
@@ -120,7 +115,7 @@ fn test_oid_params() {
 fn test_i64_params() {
     test_type(
         "BIGINT",
-        vec![
+        &[
             (Some(9_223_372_036_854_775_708i64), "9223372036854775708"),
             (Some(-9_223_372_036_854_775_708i64), "-9223372036854775708"),
             (None, "NULL"),
@@ -132,7 +127,7 @@ fn test_i64_params() {
 fn test_f32_params() {
     test_type(
         "REAL",
-        vec![
+        &[
             (Some(f32::INFINITY), "'infinity'"),
             (Some(f32::NEG_INFINITY), "'-infinity'"),
             (Some(1000.55), "1000.55"),
@@ -145,7 +140,7 @@ fn test_f32_params() {
 fn test_f64_params() {
     test_type(
         "DOUBLE PRECISION",
-        vec![
+        &[
             (Some(f64::INFINITY), "'infinity'"),
             (Some(f64::NEG_INFINITY), "'-infinity'"),
             (Some(10000.55), "10000.55"),
@@ -158,7 +153,7 @@ fn test_f64_params() {
 fn test_varchar_params() {
     test_type(
         "VARCHAR",
-        vec![
+        &[
             (Some("hello world".to_owned()), "'hello world'"),
             (
                 Some("イロハニホヘト チリヌルヲ".to_owned()),
@@ -173,7 +168,7 @@ fn test_varchar_params() {
 fn test_text_params() {
     test_type(
         "TEXT",
-        vec![
+        &[
             (Some("hello world".to_owned()), "'hello world'"),
             (
                 Some("イロハニホヘト チリヌルヲ".to_owned()),
@@ -189,10 +184,7 @@ fn test_borrowed_text() {
     let client = connect("user=postgres");
 
     let stmt = client.prepare("SELECT 'foo'").unwrap();
-    let rows = client
-        .query(&stmt, &[])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let rows = client.query(&stmt, &[]).unwrap();
     let s: &str = rows[0].get(0);
     assert_eq!(s, "foo");
 }
@@ -220,9 +212,10 @@ fn test_bpchar_params() {
     let stmt = client.prepare("SELECT b FROM foo ORDER BY id").unwrap();
     let rows = client
         .query(&stmt, &[])
-        .map(|row| row.and_then(|r| Ok(r.get(0))))
-        .collect::<Result<Vec<Option<String>>, _>>()
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect::<Vec<Option<String>>>();
 
     assert_eq!(
         vec![Some("12345".to_owned()), Some("123  ".to_owned()), None],
@@ -255,9 +248,10 @@ fn test_citext_params() {
         .unwrap();
     let rows = client
         .query(&stmt, &[])
-        .map(|row| row.and_then(|r| Ok(r.get(0))))
-        .collect::<Result<Vec<String>, _>>()
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect::<Vec<String>>();
 
     assert_eq!(vec!["foobar".to_string(), "FooBar".to_string()], rows,);
 }
@@ -266,7 +260,7 @@ fn test_citext_params() {
 fn test_bytea_params() {
     test_type(
         "BYTEA",
-        vec![
+        &[
             (Some(vec![0u8, 1, 2, 3, 254, 255]), "'\\x00010203feff'"),
             (None, "NULL"),
         ],
@@ -277,10 +271,7 @@ fn test_bytea_params() {
 fn test_borrowed_bytea() {
     let client = connect("user=postgres");
     let stmt = client.prepare("SELECT 'foo'::BYTEA").unwrap();
-    let rows = client
-        .query(&stmt, &[])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let rows = client.query(&stmt, &[]).unwrap();
     let s: &[u8] = rows[0].get(0);
     assert_eq!(s, b"foo");
 }
@@ -297,7 +288,7 @@ macro_rules! make_map {
 fn test_hstore_params() {
     test_type(
         "hstore",
-        vec![
+        &[
             (
                 Some(make_map!("a".to_owned() => Some("1".to_owned()))),
                 "'a=>1'",
@@ -317,7 +308,7 @@ fn test_hstore_params() {
 fn test_array_params() {
     test_type(
         "integer[]",
-        vec![
+        &[
             (Some(vec![1i32, 2i32]), "ARRAY[1,2]"),
             (Some(vec![1i32]), "ARRAY[1]"),
             (Some(vec![]), "ARRAY[]"),
@@ -336,10 +327,7 @@ where
     let stmt = client
         .prepare(&format!("SELECT 'NaN'::{}", sql_type))
         .unwrap();
-    let rows = client
-        .query(&stmt, &[])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let rows = client.query(&stmt, &[]).unwrap();
     let val: T = rows[0].get(0);
     assert!(val != val);
 }
@@ -358,10 +346,7 @@ fn test_f64_nan_param() {
 fn test_pg_database_datname() {
     let client = connect("user=postgres");
     let stmt = client.prepare("SELECT datname FROM pg_database").unwrap();
-    let rows = client
-        .query(&stmt, &[])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let rows = client.query(&stmt, &[]).unwrap();
     assert_eq!(rows[0].get::<_, &str>(0), "postgres");
 }
 
@@ -384,9 +369,10 @@ fn test_slice() {
         .unwrap();
     let rows = client
         .query(&stmt, &[&&[1i32, 3, 4][..]])
-        .map(|row| row.and_then(|r| Ok(r.get(0))))
-        .collect::<Result<Vec<String>, _>>()
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect::<Vec<String>>();
 
     assert_eq!(vec!["a".to_owned(), "c".to_owned(), "d".to_owned()], rows);
 }
@@ -406,11 +392,7 @@ fn test_slice_wrong_type() {
     let stmt = client
         .prepare("SELECT * FROM foo WHERE id = ANY($1)")
         .unwrap();
-    let err = client
-        .query(&stmt, &[&&[&"hi"][..]])
-        .collect::<Result<Vec<_>, _>>()
-        .err()
-        .unwrap();
+    let err = client.query(&stmt, &[&&[&"hi"][..]]).err().unwrap();
     match err.source() {
         Some(e) if e.is::<WrongType>() => {}
         _ => panic!("Unexpected error {:?}", err),
@@ -422,11 +404,7 @@ fn test_slice_range() {
     let client = connect("user=postgres");
 
     let stmt = client.prepare("SELECT $1::INT8RANGE").unwrap();
-    let err = client
-        .query(&stmt, &[&&[&1i64][..]])
-        .collect::<Result<Vec<_>, _>>()
-        .err()
-        .unwrap();
+    let err = client.query(&stmt, &[&&[&1i64][..]]).err().unwrap();
     match err.source() {
         Some(e) if e.is::<WrongType>() => {}
         _ => panic!("Unexpected error {:?}", err),
@@ -442,7 +420,7 @@ fn domain() {
         fn to_sql(
             &self,
             ty: &Type,
-            out: &mut Vec<u8>,
+            out: &mut BytesMut,
         ) -> result::Result<IsNull, Box<dyn Error + Sync + Send>> {
             let inner = match *ty.kind() {
                 Kind::Domain(ref inner) => inner,
@@ -492,10 +470,7 @@ fn domain() {
     client.execute(&stmt, &[&id]).unwrap();
 
     let stmt = client.prepare("SELECT id FROM pg_temp.foo").unwrap();
-    let rows = client
-        .query(&stmt, &[])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let rows = client.query(&stmt, &[]).unwrap();
     assert_eq!(id, rows[0].get(0));
 }
 
@@ -555,7 +530,7 @@ fn enum_() {
 fn system_time() {
     test_type(
         "TIMESTAMP",
-        vec![
+        &[
             (
                 Some(UNIX_EPOCH + Duration::from_millis(1_010)),
                 "'1970-01-01 00:00:01.01'",
@@ -577,7 +552,7 @@ fn system_time() {
 fn inet() {
     test_type(
         "INET",
-        vec![
+        &[
             (Some("127.0.0.1".parse::<IpAddr>().unwrap()), "'127.0.0.1'"),
             (
                 Some("127.0.0.1".parse::<IpAddr>().unwrap()),

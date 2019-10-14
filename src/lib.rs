@@ -14,8 +14,7 @@
 //!
 //!     // And then execute it, returning a Stream of Rows which we collect into a Vec.
 //!     let rows: Vec<Row> = client
-//!         .query(&stmt, &[&"hello world"])
-//!         .collect::<Result<Vec<_>, _>>()?;
+//!         .query(&stmt, &[&"hello world"])?;
 //!
 //!     // Now we can check that we got back the same string we sent over.
 //!     let value: &str = rows[0].get(0);
@@ -71,22 +70,15 @@ macro_rules! o_try {
     };
 }
 
-macro_rules! i_try {
-    ($expr:expr) => {
-        match $expr {
-            Ok(val) => val,
-            Err(err) => return crate::try_iterator::TryIterator::Err(Some(err)),
-        }
-    };
-}
-
 pub use crate::client::Client;
 pub use crate::config::Config;
 use crate::error::DbError;
 pub use crate::error::Error;
 pub use crate::portal::Portal;
 pub use crate::row::{Row, SimpleQueryRow};
+pub use crate::to_statement::ToStatement;
 pub use crate::transaction::Transaction;
+use crate::types::ToSql;
 pub use statement::{Column, Statement};
 
 mod bind;
@@ -108,8 +100,8 @@ mod query;
 pub mod row;
 mod simple_query;
 mod statement;
+mod to_statement;
 mod transaction;
-mod try_iterator;
 pub mod types;
 mod vec_buf;
 
@@ -119,7 +111,7 @@ mod vec_buf;
 ///
 /// Requires the `runtime` Cargo feature (enabled by default).
 ///
-/// [`Config`]: ./Config.t.html
+/// [`Config`]: config/struct.Config.html
 pub fn connect(config: &str) -> Result<Client, Error> {
     let config = config.parse::<Config>()?;
     config.connect()
@@ -175,4 +167,10 @@ pub enum SimpleQueryMessage {
     CommandComplete(u64),
     #[doc(hidden)]
     __NonExhaustive,
+}
+
+fn slice_iter<'a>(
+    s: &'a [&'a (dyn ToSql + Sync)],
+) -> impl ExactSizeIterator<Item = &'a dyn ToSql> + 'a {
+    s.iter().map(|s| *s as _)
 }

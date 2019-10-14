@@ -1,22 +1,26 @@
 use crate::client::{InnerClient, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
-use crate::try_iterator::TryIterator;
-use crate::Error;
+use crate::types::ToSql;
+use crate::{query, Error, Statement};
 use bytes::Bytes;
 use postgres_protocol::message::backend::Message;
-use std::sync::Arc;
 
-pub fn copy_out(
-    client: Arc<InnerClient>,
-    buf: Result<Vec<u8>, Error>,
-) -> impl Iterator<Item = Result<Bytes, Error>> {
-    let responses = i_try!(start(client, buf));
-    TryIterator::Iter(CopyOut { responses })
+pub fn copy_out<'a, I>(
+    client: &InnerClient,
+    statement: Statement,
+    params: I,
+) -> Result<CopyStream, Error>
+where
+    I: IntoIterator<Item = &'a dyn ToSql>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let buf = query::encode(client, &statement, params)?;
+    let responses = start(client, buf)?;
+    Ok(CopyStream { responses })
 }
 
-fn start(client: Arc<InnerClient>, buf: Result<Vec<u8>, Error>) -> Result<Responses, Error> {
-    let buf = buf?;
+fn start(client: &InnerClient, buf: Bytes) -> Result<Responses, Error> {
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
     match responses.next()? {
@@ -32,11 +36,11 @@ fn start(client: Arc<InnerClient>, buf: Result<Vec<u8>, Error>) -> Result<Respon
     Ok(responses)
 }
 
-struct CopyOut {
+pub struct CopyStream {
     responses: Responses,
 }
 
-impl Iterator for CopyOut {
+impl Iterator for CopyStream {
     type Item = Result<Bytes, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {

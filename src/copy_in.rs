@@ -1,13 +1,14 @@
 use crate::client::InnerClient;
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
-use crate::Error;
+use crate::types::ToSql;
+use crate::{query, Error, Statement};
 use bytes::{Buf, BufMut, BytesMut, IntoBuf};
 use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use postgres_protocol::message::frontend::CopyData;
-use std::sync::Arc;
+use std::error;
 
 enum CopyInMessage {
     Message(FrontendMessage),
@@ -37,18 +38,18 @@ impl CopyInReceiver {
             Ok(CopyInMessage::Message(message)) => Ok(Some(message)),
             Ok(CopyInMessage::Done) => {
                 self.done = true;
-                let mut buf = vec![];
+                let mut buf = BytesMut::new();
                 frontend::copy_done(&mut buf);
                 frontend::sync(&mut buf);
-                Ok(Some(FrontendMessage::Raw(buf)))
+                Ok(Some(FrontendMessage::Raw(buf.freeze())))
             }
             Err(TryRecvError::Empty) => Ok(None),
             Err(_) => {
                 self.done = true;
-                let mut buf = vec![];
+                let mut buf = BytesMut::new();
                 frontend::copy_fail("", &mut buf).unwrap();
                 frontend::sync(&mut buf);
-                Ok(Some(FrontendMessage::Raw(buf)))
+                Ok(Some(FrontendMessage::Raw(buf.freeze())))
             }
         }
     }
@@ -62,34 +63,37 @@ impl CopyInReceiver {
             Ok(CopyInMessage::Message(message)) => Ok(Some(message)),
             Ok(CopyInMessage::Done) => {
                 self.done = true;
-                let mut buf = vec![];
+                let mut buf = BytesMut::new();
                 frontend::copy_done(&mut buf);
                 frontend::sync(&mut buf);
-                Ok(Some(FrontendMessage::Raw(buf)))
+                Ok(Some(FrontendMessage::Raw(buf.freeze())))
             }
             Err(_) => {
                 self.done = true;
-                let mut buf = vec![];
+                let mut buf = BytesMut::new();
                 frontend::copy_fail("", &mut buf).unwrap();
                 frontend::sync(&mut buf);
-                Ok(Some(FrontendMessage::Raw(buf)))
+                Ok(Some(FrontendMessage::Raw(buf.freeze())))
             }
         }
     }
 }
 
-pub fn copy_in<T, E, S>(
-    client: Arc<InnerClient>,
-    buf: Result<Vec<u8>, Error>,
+pub fn copy_in<'a, T, E, I, S>(
+    client: &InnerClient,
+    statement: Statement,
+    params: I,
     mut stream: S,
 ) -> Result<u64, Error>
 where
+    I: IntoIterator<Item = &'a dyn ToSql>,
+    I::IntoIter: ExactSizeIterator,
     S: Iterator<Item = Result<T, E>>,
     T: IntoBuf,
     <T as IntoBuf>::Buf: 'static + Send,
-    E: Into<Box<dyn std::error::Error + Sync + Send>>,
+    E: Into<Box<dyn error::Error + Sync + Send>>,
 {
-    let buf = buf?;
+    let buf = query::encode(client, &statement, params)?;
 
     let (sender, receiver) = mpsc::channel();
     let receiver = CopyInReceiver::new(receiver);

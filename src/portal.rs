@@ -14,9 +14,11 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         if let Some(client) = self.client.upgrade() {
-            let mut buf = vec![];
-            frontend::close(b'P', &self.name, &mut buf).expect("portal name not valid");
-            frontend::sync(&mut buf);
+            let buf = client.with_buf(|buf| {
+                frontend::close(b'P', &self.name, buf).unwrap();
+                frontend::sync(buf);
+                buf.take().freeze()
+            });
             let _ = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)));
         }
     }

@@ -1,43 +1,55 @@
 use crate::client::{InnerClient, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
-use crate::try_iterator::TryIterator;
 use crate::types::{IsNull, ToSql};
 use crate::{Error, Portal, Row, Statement};
+use bytes::{Bytes, BytesMut};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
-use std::sync::Arc;
 
-pub fn query(
-    client: Arc<InnerClient>,
+pub fn query<'a, I>(
+    client: &InnerClient,
     statement: Statement,
-    buf: Result<Vec<u8>, Error>,
-) -> impl Iterator<Item = Result<Row, Error>> {
-    let responses = i_try!(start(client, buf));
-    TryIterator::Iter(Query {
+    params: I,
+) -> Result<RowStream, Error>
+where
+    I: IntoIterator<Item = &'a dyn ToSql>,
+    I::IntoIter: ExactSizeIterator,
+{
+    client.sender.read_lock();
+    let buf = encode(client, &statement, params)?;
+    let responses = start(client, buf)?;
+    Ok(RowStream {
         statement,
         responses,
     })
 }
 
 pub fn query_portal(
-    client: Arc<InnerClient>,
-    portal: Portal,
+    client: &InnerClient,
+    portal: &Portal,
     max_rows: i32,
-) -> impl Iterator<Item = Result<Row, Error>> {
-    let mut buf = vec![];
-    i_try!(frontend::execute(portal.name(), max_rows, &mut buf).map_err(Error::encode));
-    frontend::sync(&mut buf);
+) -> Result<RowStream, Error> {
+    let buf = client.with_buf(|buf| {
+        frontend::execute(portal.name(), max_rows, buf).map_err(Error::encode)?;
+        frontend::sync(buf);
+        Ok(buf.take().freeze())
+    })?;
 
-    let responses = i_try!(client.send(RequestMessages::Single(FrontendMessage::Raw(buf))));
+    let responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
-    TryIterator::Iter(Query {
+    Ok(RowStream {
         statement: portal.statement().clone(),
         responses,
     })
 }
 
-pub fn execute(client: Arc<InnerClient>, buf: Result<Vec<u8>, Error>) -> Result<u64, Error> {
+pub fn execute<'a, I>(client: &InnerClient, statement: Statement, params: I) -> Result<u64, Error>
+where
+    I: IntoIterator<Item = &'a dyn ToSql>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let buf = encode(client, &statement, params)?;
     let mut responses = start(client, buf)?;
 
     loop {
@@ -60,8 +72,7 @@ pub fn execute(client: Arc<InnerClient>, buf: Result<Vec<u8>, Error>) -> Result<
     }
 }
 
-fn start(client: Arc<InnerClient>, buf: Result<Vec<u8>, Error>) -> Result<Responses, Error> {
-    let buf = buf?;
+fn start(client: &InnerClient, buf: Bytes) -> Result<Responses, Error> {
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
     match responses.next()? {
@@ -72,19 +83,25 @@ fn start(client: Arc<InnerClient>, buf: Result<Vec<u8>, Error>) -> Result<Respon
     Ok(responses)
 }
 
-pub fn encode<'a, I>(statement: &Statement, params: I) -> Result<Vec<u8>, Error>
+pub fn encode<'a, I>(client: &InnerClient, statement: &Statement, params: I) -> Result<Bytes, Error>
 where
     I: IntoIterator<Item = &'a dyn ToSql>,
     I::IntoIter: ExactSizeIterator,
 {
-    let mut buf = encode_bind(statement, params, "")?;
-    frontend::execute("", 0, &mut buf).map_err(Error::encode)?;
-    frontend::sync(&mut buf);
-
-    Ok(buf)
+    client.with_buf(|buf| {
+        encode_bind(statement, params, "", buf)?;
+        frontend::execute("", 0, buf).map_err(Error::encode)?;
+        frontend::sync(buf);
+        Ok(buf.take().freeze())
+    })
 }
 
-pub fn encode_bind<'a, I>(statement: &Statement, params: I, portal: &str) -> Result<Vec<u8>, Error>
+pub fn encode_bind<'a, I>(
+    statement: &Statement,
+    params: I,
+    portal: &str,
+    buf: &mut BytesMut,
+) -> Result<(), Error>
 where
     I: IntoIterator<Item = &'a dyn ToSql>,
     I::IntoIter: ExactSizeIterator,
@@ -97,8 +114,6 @@ where
         statement.params().len(),
         params.len()
     );
-
-    let mut buf = vec![];
 
     let mut error_idx = 0;
     let r = frontend::bind(
@@ -115,21 +130,21 @@ where
             }
         },
         Some(1),
-        &mut buf,
+        buf,
     );
     match r {
-        Ok(()) => Ok(buf),
+        Ok(()) => Ok(()),
         Err(frontend::BindError::Conversion(e)) => Err(Error::to_sql(e, error_idx)),
         Err(frontend::BindError::Serialization(e)) => Err(Error::encode(e)),
     }
 }
 
-struct Query {
+pub struct RowStream {
     statement: Statement,
     responses: Responses,
 }
 
-impl Iterator for Query {
+impl Iterator for RowStream {
     type Item = Result<Row, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
