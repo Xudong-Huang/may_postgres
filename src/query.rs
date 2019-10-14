@@ -143,14 +143,16 @@ impl Iterator for RowStream {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            return match o_try!(self.responses.next()) {
-                Message::DataRow(body) => Some(Ok(o_try!(Row::new(self.statement.clone(), body)))),
+            match o_try!(self.responses.next()) {
+                Message::DataRow(body) => {
+                    return Some(Ok(o_try!(Row::new(self.statement.clone(), body))))
+                }
                 Message::EmptyQueryResponse
                 | Message::CommandComplete(_)
-                | Message::PortalSuspended => None,
-                Message::ErrorResponse(body) => Some(Err(Error::db(body))),
-                Message::BindComplete => continue,
-                _ => Some(Err(Error::unexpected_message())),
+                | Message::PortalSuspended => return None,
+                Message::ErrorResponse(body) => return Some(Err(Error::db(body))),
+                Message::BindComplete => {}
+                _ => return Some(Err(Error::unexpected_message())),
             };
         }
     }

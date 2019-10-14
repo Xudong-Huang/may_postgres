@@ -6,20 +6,15 @@ use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use log::error;
 use may::coroutine::JoinHandle;
+use may::go;
 use may::net::TcpStream;
 use may::sync::{mpsc, RwLock, RwLockReadGuard};
-use may::{coroutine_local, go};
 use may_queue::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-
-coroutine_local! {
-    static READER_LOCK: RefCell<Option<RwLockReadGuard<'static, ()>>> = RefCell::new(None)
-}
 
 pub enum RequestMessages {
     Single(FrontendMessage),
@@ -211,16 +206,12 @@ impl Connection {
 
     /// send a request to the connection
     pub fn send(&self, req: Request) -> io::Result<()> {
-        let ret = self
-            .req_tx
+        self.req_tx
             .send(req)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "send req failed"));
-        READER_LOCK.with(|l| l.borrow_mut().take());
-        ret
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "send req failed"))
     }
 
-    pub fn read_lock(&self) {
-        let lock = unsafe { std::mem::transmute(self.rw_lock.read().unwrap()) };
-        READER_LOCK.with(|l| l.borrow_mut().replace(lock));
+    pub fn read_lock(&self) -> RwLockReadGuard<'_, ()> {
+        self.rw_lock.read().unwrap()
     }
 }

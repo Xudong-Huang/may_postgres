@@ -55,9 +55,11 @@ ORDER BY attnum
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn prepare(client: &Arc<InnerClient>, query: &str, types: &[Type]) -> Result<Statement, Error> {
+    let _g = client.sender.read_lock();
     let name = format!("s{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
     let buf = encode(client, &name, query, types)?;
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+    drop(_g);
 
     match responses.next()? {
         Message::ParseComplete => {}
