@@ -1,8 +1,10 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use fallible_iterator::FallibleIterator;
+use may::sync::{RwLock, RwLockReadGuard};
 use postgres_protocol::message::backend;
 use postgres_protocol::message::frontend::CopyData;
 use std::io::{self, Read};
+use std::sync::Arc;
 
 pub enum FrontendMessage {
     Raw(Bytes),
@@ -97,19 +99,31 @@ pub struct Framed<S> {
     r_stream: S,
     read_buf: BytesMut,
     codec: PostgresCodec,
+    rw_lock: Arc<RwLock<()>>,
+    lock: Option<RwLockReadGuard<'static, ()>>,
 }
 
 impl<S: Read> Framed<S> {
     pub fn new(s: S) -> Self {
+        let rw_lock = Arc::new(RwLock::new(()));
+        let lock = unsafe { std::mem::transmute(rw_lock.read().unwrap()) };
         Framed {
             r_stream: s,
             read_buf: BytesMut::with_capacity(4096 * 8),
             codec: PostgresCodec,
+            rw_lock,
+            lock: Some(lock),
         }
     }
 
     pub fn inner_mut(&mut self) -> &mut S {
         &mut self.r_stream
+    }
+}
+
+impl<S> Framed<S> {
+    pub fn get_rw_lock(&self) -> Arc<RwLock<()>> {
+        self.rw_lock.clone()
     }
 }
 
@@ -131,7 +145,11 @@ impl<S: Read> Iterator for Framed<S> {
 
             let n = {
                 let read_buf = unsafe { self.read_buf.bytes_mut() };
-                match self.r_stream.read(read_buf) {
+                drop(self.lock.take());
+                let ret = self.r_stream.read(read_buf);
+                let lock = unsafe { std::mem::transmute(self.rw_lock.read().unwrap()) };
+                self.lock = Some(lock);
+                match ret {
                     Ok(n) => n,
                     Err(e) => return Some(Err(e)),
                 }
