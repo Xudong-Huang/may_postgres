@@ -20,9 +20,8 @@ pub struct StartupStream {
 
 impl StartupStream {
     fn send(&mut self, msg: FrontendMessage) -> io::Result<()> {
-        let mut encoder = PostgresCodec;
         let mut data = BytesMut::with_capacity(512);
-        encoder.encode(msg, &mut data)?;
+        PostgresCodec::encode(msg, &mut data)?;
         self.inner.inner_mut().write_all(&data)
     }
 }

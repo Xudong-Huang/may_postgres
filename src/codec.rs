@@ -1,10 +1,10 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may::sync::{RwLock, RwLockReadGuard};
+// use may::sync::{RwLock, RwLockReadGuard};
 use postgres_protocol::message::backend;
 use postgres_protocol::message::frontend::CopyData;
 use std::io::{self, Read};
-use std::sync::Arc;
+// use std::sync::Arc;
 
 pub enum FrontendMessage {
     Raw(Bytes),
@@ -38,9 +38,9 @@ impl FallibleIterator for BackendMessages {
 
 pub struct PostgresCodec;
 
-// impl Encoder
 impl PostgresCodec {
-    pub fn encode(&mut self, item: FrontendMessage, dst: &mut BytesMut) -> io::Result<()> {
+    // impl Encoder
+    pub fn encode(item: FrontendMessage, dst: &mut BytesMut) -> io::Result<()> {
         match item {
             FrontendMessage::Raw(buf) => dst.extend_from_slice(&buf),
             FrontendMessage::CopyData(data) => data.write(dst),
@@ -48,11 +48,9 @@ impl PostgresCodec {
 
         Ok(())
     }
-}
 
-// impl Decoder
-impl PostgresCodec {
-    pub fn decode(&mut self, src: &mut BytesMut) -> Result<Option<BackendMessage>, io::Error> {
+    // impl Decoder
+    pub fn decode(src: &mut BytesMut) -> Result<Option<BackendMessage>, io::Error> {
         let mut idx = 0;
         let mut request_complete = false;
 
@@ -98,41 +96,43 @@ impl PostgresCodec {
 pub struct Framed<S> {
     r_stream: S,
     read_buf: BytesMut,
-    codec: PostgresCodec,
-    rw_lock: Arc<RwLock<()>>,
-    lock: Option<RwLockReadGuard<'static, ()>>,
+    // rw_lock: Arc<RwLock<()>>,
+    // lock: Option<RwLockReadGuard<'static, ()>>,
 }
 
 impl<S: Read> Framed<S> {
     pub fn new(s: S) -> Self {
-        let rw_lock = Arc::new(RwLock::new(()));
-        let lock = unsafe { std::mem::transmute(rw_lock.read().unwrap()) };
+        // let rw_lock = Arc::new(RwLock::new(()));
+        // let lock = unsafe { std::mem::transmute(rw_lock.read().unwrap()) };
         Framed {
             r_stream: s,
             read_buf: BytesMut::with_capacity(4096 * 8),
-            codec: PostgresCodec,
-            rw_lock,
-            lock: Some(lock),
+            // rw_lock,
+            // lock: Some(lock),
         }
     }
 
     pub fn inner_mut(&mut self) -> &mut S {
         &mut self.r_stream
     }
+
+    // pub fn into_parts(self) -> (S, BytesMut) {
+    //     (self.r_stream, self.read_buf)
+    // }
 }
 
-impl<S> Framed<S> {
-    pub fn get_rw_lock(&self) -> Arc<RwLock<()>> {
-        self.rw_lock.clone()
-    }
-}
+// impl<S> Framed<S> {
+//     pub fn get_rw_lock(&self) -> Arc<RwLock<()>> {
+//         self.rw_lock.clone()
+//     }
+// }
 
 impl<S: Read> Iterator for Framed<S> {
     type Item = io::Result<BackendMessage>;
 
     fn next(&mut self) -> Option<io::Result<BackendMessage>> {
         loop {
-            let msg = self.codec.decode(&mut self.read_buf).transpose();
+            let msg = PostgresCodec::decode(&mut self.read_buf).transpose();
             if msg.is_some() {
                 return msg;
             }
@@ -145,10 +145,10 @@ impl<S: Read> Iterator for Framed<S> {
 
             let n = {
                 let read_buf = unsafe { self.read_buf.bytes_mut() };
-                drop(self.lock.take());
+                // drop(self.lock.take());
                 let ret = self.r_stream.read(read_buf);
-                let lock = unsafe { std::mem::transmute(self.rw_lock.read().unwrap()) };
-                self.lock = Some(lock);
+                // let lock = unsafe { std::mem::transmute(self.rw_lock.read().unwrap()) };
+                // self.lock = Some(lock);
                 match ret {
                     Ok(n) => n,
                     Err(e) => return Some(Err(e)),

@@ -247,7 +247,7 @@ impl Client {
         I::IntoIter: ExactSizeIterator,
     {
         let statement = statement.__convert().into_statement(self)?;
-        let _g = self.inner.sender.read_lock();
+        // let _g = self.inner.sender.read_lock();
         query::query(&self.inner, statement, params)
     }
 
@@ -358,7 +358,7 @@ impl Client {
     }
 
     pub(crate) fn simple_query_raw(&self, query: &str) -> Result<SimpleQueryStream, Error> {
-        let _g = self.inner.sender.read_lock();
+        // let _g = self.inner.sender.read_lock();
         simple_query::simple_query(self.inner(), query)
     }
 
