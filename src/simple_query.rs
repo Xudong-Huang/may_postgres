@@ -37,7 +37,7 @@ pub fn batch_execute(client: &InnerClient, query: &str) -> Result<(), Error> {
 fn encode(client: &InnerClient, query: &str) -> Result<Bytes, Error> {
     client.with_buf(|buf| {
         frontend::query(query, buf).map_err(Error::encode)?;
-        Ok(buf.take().freeze())
+        Ok(buf.split().freeze())
     })
 }
 

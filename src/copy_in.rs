@@ -1,9 +1,10 @@
 use crate::client::InnerClient;
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
+use crate::into_buf::IntoBuf;
 use crate::types::ToSql;
 use crate::{query, Error, Statement};
-use bytes::{Buf, BufMut, BytesMut, IntoBuf};
+use bytes::{buf::ext::BufExt, Buf, BufMut, BytesMut};
 use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -122,13 +123,13 @@ where
             if bytes.is_empty() {
                 Box::new(buf)
             } else {
-                Box::new(bytes.take().freeze().into_buf().chain(buf))
+                Box::new(bytes.split().freeze().chain(buf))
             }
         } else {
             bytes.reserve(buf.remaining());
             bytes.put(buf);
             if bytes.len() > 4096 {
-                Box::new(bytes.take().freeze().into_buf())
+                Box::new(bytes.split().freeze())
             } else {
                 continue;
             }
@@ -141,7 +142,7 @@ where
     }
 
     if !bytes.is_empty() {
-        let data: Box<dyn Buf + Send> = Box::new(bytes.freeze().into_buf());
+        let data: Box<dyn Buf + Send> = Box::new(bytes.freeze());
         let data = CopyData::new(data).map_err(Error::encode)?;
         sender
             .send(CopyInMessage::Message(FrontendMessage::CopyData(data)))

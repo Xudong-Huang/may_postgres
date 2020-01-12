@@ -95,6 +95,7 @@ mod connection;
 mod copy_in;
 mod copy_out;
 pub mod error;
+pub mod into_buf;
 mod portal;
 mod prepare;
 mod query;

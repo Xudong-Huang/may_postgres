@@ -23,23 +23,23 @@ default = []
 "with-chrono-0_4" = ["postgres-types/with-chrono-0_4"]
 "with-eui48-0_4" = ["postgres-types/with-eui48-0_4"]
 "with-geo-types-0_4" = ["postgres-types/with-geo-types-0_4"]
-with-serde_json-1 = ["postgres-types/with-serde_json-1"]
-"with-uuid-0_7" = ["postgres-types/with-uuid-0_7"]
+"with-serde_json-1" = ["postgres-types/with-serde_json-1"]
+"with-uuid-0_8" = ["postgres-types/with-uuid-0_8"]
 
 [dependencies]
-bytes = "0.4"
+bytes = "0.5"
 crossbeam = "0.7"
 fallible-iterator = "0.2"
 may = "0.3"
 may_queue = "0.1"
 log = "0.4"
 percent-encoding = "2"
-phf = "0.7.23"
+phf = "0.8"
 postgres-protocol = "0.5.0-alpha.1"
 postgres-types = "0.1.0-alpha.1 "
 
 [dev-dependencies]
-env_logger = "0.5"
+env_logger = "0.7"
 
 bit-vec-06 = { version = "0.6", package = "bit-vec" }
 chrono-04 = { version = "0.4", package = "chrono" }
@@ -47,4 +47,4 @@ eui48-04 = { version = "0.4", package = "eui48" }
 geo-types-04 = { version = "0.4", package = "geo-types" }
 serde-1 = { version = "1.0", package = "serde" }
 serde_json-1 = { version = "1.0", package = "serde_json" }
-uuid-07 = { version = "0.7", package = "uuid" }
+uuid-08 = { version = "0.8", package = "uuid" }

@@ -144,7 +144,7 @@ impl<S: Read> Iterator for Framed<S> {
             }
 
             let n = {
-                let read_buf = unsafe { self.read_buf.bytes_mut() };
+                let read_buf = unsafe { &mut *(self.read_buf.bytes_mut() as *mut _ as *mut [u8]) };
                 // drop(self.lock.take());
                 let ret = self.r_stream.read(read_buf);
                 // let lock = unsafe { std::mem::transmute(self.rw_lock.read().unwrap()) };

@@ -1,12 +1,12 @@
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::copy_out::CopyStream;
+use crate::into_buf::IntoBuf;
 use crate::query::RowStream;
 use crate::types::{ToSql, Type};
 use crate::{
     bind, query, slice_iter, Client, Error, Portal, Row, SimpleQueryMessage, Statement, ToStatement,
 };
-use bytes::IntoBuf;
 use may::net::TcpStream;
 use postgres_protocol::message::frontend;
 
@@ -33,7 +33,7 @@ impl<'a> Drop for Transaction<'a> {
         };
         let buf = self.client.inner().with_buf(|buf| {
             frontend::query(&query, buf).unwrap();
-            buf.take().freeze()
+            buf.split().freeze()
         });
         let _ = self
             .client
