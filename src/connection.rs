@@ -8,8 +8,7 @@ use log::error;
 use may::coroutine::JoinHandle;
 use may::go;
 use may::net::TcpStream;
-// use may::sync::{mpsc, RwLock, RwLockReadGuard};
-use may::sync::mpsc;
+use may::sync::{mpsc, RwLock, RwLockReadGuard};
 use may_queue::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -36,7 +35,7 @@ pub(crate) struct Connection {
     rx_handle: JoinHandle<()>,
     tx_handle: JoinHandle<()>,
     req_tx: mpsc::Sender<Request>,
-    // rw_lock: Arc<RwLock<()>>,
+    rw_lock: Arc<RwLock<()>>,
 }
 
 impl Drop for Connection {
@@ -59,7 +58,7 @@ impl Connection {
             .inner_mut()
             .try_clone()
             .expect("failed to clone stream for wirter");
-        // let rw_lock = stream.get_rw_lock();
+        let rw_lock = stream.get_rw_lock();
         let rsp_queue = Arc::new(spsc::Queue::new());
         let (req_tx, req_rx) = mpsc::channel();
         let rx_handle = {
@@ -119,7 +118,7 @@ impl Connection {
             })
         };
 
-        // // let rw_lock_1 = rw_lock.clone();
+        let rw_lock_1 = rw_lock.clone();
 
         let tx_handle = go!(move || {
             let mut writer = VecBufs::new(writer);
@@ -170,15 +169,15 @@ impl Connection {
                             request = req_rx.try_recv();
                         }
                         Err(TryRecvError::Empty) => {
-                            // let _g = rw_lock_1.write().unwrap();
-                            // may::coroutine::yield_now();
-                            // request = req_rx.try_recv();
-                            // match &request {
-                            //     Err(TryRecvError::Empty) => {}
-                            //     _ => continue,
-                            // }
+                            let _g = rw_lock_1.write().unwrap();
+                            may::coroutine::yield_now();
+                            request = req_rx.try_recv();
+                            match &request {
+                                Err(TryRecvError::Empty) => {}
+                                _ => continue,
+                            }
 
-                            // drop(_g);
+                            drop(_g);
                             writer.flush()?;
 
                             request = req_rx.recv().map_err(|_| TryRecvError::Empty);
@@ -204,7 +203,7 @@ impl Connection {
             rx_handle,
             tx_handle,
             req_tx,
-            // rw_lock,
+            rw_lock,
         }
     }
 
@@ -215,7 +214,7 @@ impl Connection {
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "send req failed"))
     }
 
-    // pub fn read_lock(&self) -> RwLockReadGuard<'_, ()> {
-    //     self.rw_lock.read().unwrap()
-    // }
+    pub fn read_lock(&self) -> RwLockReadGuard<'_, ()> {
+        self.rw_lock.read().unwrap()
+    }
 }
