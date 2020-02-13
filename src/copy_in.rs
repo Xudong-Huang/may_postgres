@@ -92,7 +92,7 @@ where
     S: Iterator<Item = Result<T, E>>,
     T: IntoBuf,
     <T as IntoBuf>::Buf: 'static + Send,
-    E: Into<Box<dyn error::Error + Sync + Send>>,
+    E: Into<Box<dyn error::Error + Sync + Send>> + std::fmt::Debug,
 {
     let buf = query::encode(client, &statement, params)?;
 
@@ -116,7 +116,7 @@ where
 
     let mut bytes = BytesMut::new();
 
-    while let Some(buf) = stream.next().transpose().map_err(Error::copy_in_stream)? {
+    while let Some(buf) = stream.next().transpose().unwrap() {
         let buf = buf.into_buf();
 
         let data: Box<dyn Buf + Send> = if buf.remaining() > 4096 {

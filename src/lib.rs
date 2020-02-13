@@ -9,14 +9,12 @@
 //!     // Connect to the database.
 //!     let client= may_postgres::connect("host=localhost user=postgres")?;
 //!
-//!     // Now we can prepare a simple statement that just returns its parameter.
-//!     let stmt = client.prepare("SELECT $1::TEXT")?;
 //!
 //!     // And then execute it, returning a Stream of Rows which we collect into a Vec.
-//!     let rows: Vec<Row> = client
-//!         .query(&stmt, &[&"hello world"])?;
+//!     let rows = client
+//!         .query("SELECT $1::TEXT", &[&"hello world"])?;
 //!
-//!     // Now we can check that we got back the same string we sent over.
+//!     // And then check that we got back the same string we sent over.
 //!     let value: &str = rows[0].get(0);
 //!     assert_eq!(value, "hello world");
 //!
@@ -74,14 +72,18 @@ pub use crate::client::Client;
 pub use crate::config::Config;
 use crate::error::DbError;
 pub use crate::error::Error;
+pub use crate::generic_client::GenericClient;
 pub use crate::portal::Portal;
 pub use crate::query::RowStream;
 pub use crate::row::{Row, SimpleQueryRow};
+pub use crate::simple_query::SimpleQueryStream;
+pub use crate::statement::{Column, Statement};
 pub use crate::to_statement::ToStatement;
 pub use crate::transaction::Transaction;
-pub use crate::types::ToSql;
-pub use statement::{Column, Statement};
+pub use crate::transaction_builder::{IsolationLevel, TransactionBuilder};
+use crate::types::ToSql;
 
+// pub mod binary_copy;
 mod bind;
 mod cancel_query;
 mod cancel_query_raw;
@@ -95,6 +97,7 @@ mod connection;
 mod copy_in;
 mod copy_out;
 pub mod error;
+mod generic_client;
 pub mod into_buf;
 mod portal;
 mod prepare;
@@ -104,6 +107,7 @@ mod simple_query;
 mod statement;
 mod to_statement;
 mod transaction;
+mod transaction_builder;
 pub mod types;
 mod vec_buf;
 
@@ -146,6 +150,7 @@ impl Notification {
 
 /// An asynchronous message from the server.
 #[allow(clippy::large_enum_variant)]
+#[non_exhaustive]
 pub enum AsyncMessage {
     /// A notice.
     ///
@@ -155,11 +160,10 @@ pub enum AsyncMessage {
     ///
     /// Connections can subscribe to notifications with the `LISTEN` command.
     Notification(Notification),
-    #[doc(hidden)]
-    __NonExhaustive,
 }
 
 /// Message returned by the `SimpleQuery` stream.
+#[non_exhaustive]
 pub enum SimpleQueryMessage {
     /// A row of data.
     Row(SimpleQueryRow),
@@ -167,8 +171,6 @@ pub enum SimpleQueryMessage {
     ///
     /// The number of rows modified or selected is returned.
     CommandComplete(u64),
-    #[doc(hidden)]
-    __NonExhaustive,
 }
 
 fn slice_iter<'a>(

@@ -41,6 +41,7 @@ fn encode(client: &InnerClient, query: &str) -> Result<Bytes, Error> {
     })
 }
 
+/// A stream of simple query results.
 pub struct SimpleQueryStream {
     responses: Responses,
     columns: Option<Arc<[String]>>,

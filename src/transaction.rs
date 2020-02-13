@@ -76,13 +76,13 @@ impl<'a> Transaction<'a> {
     }
 
     /// Like `Client::prepare`.
-    pub fn prepare(&mut self, query: &str) -> Result<Statement, Error> {
+    pub fn prepare(&self, query: &str) -> Result<Statement, Error> {
         self.client.prepare(query)
     }
 
     /// Like `Client::prepare_typed`.
     pub fn prepare_typed(
-        &mut self,
+        &self,
         query: &str,
         parameter_types: &[Type],
     ) -> Result<Statement, Error> {
@@ -105,6 +105,18 @@ impl<'a> Transaction<'a> {
         self.client.query_one(statement, params)
     }
 
+    /// Like `Client::query_opt`.
+    pub fn query_opt<T>(
+        &self,
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<Row>, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        self.client.query_opt(statement, params)
+    }
+
     /// Like `Client::query_raw`.
     pub fn query_raw<'b, T, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
     where
@@ -124,7 +136,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Like `Client::execute_iter`.
-    pub fn execute_raw<'b, I, T>(&self, statement: &Statement, params: I) -> Result<u64, Error>
+    pub fn execute_raw<'b, I, T>(&self, statement: &T, params: I) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement,
         I: IntoIterator<Item = &'b dyn ToSql>,
@@ -145,13 +157,13 @@ impl<'a> Transaction<'a> {
     where
         T: ?Sized + ToStatement,
     {
-        self.bind_iter(statement, slice_iter(params))
+        self.bind_raw(statement, slice_iter(params))
     }
 
-    /// Like [`bind`], but takes an iterator of parameters rather than a slice.
+    /// A maximally flexible version of [`bind`].
     ///
     /// [`bind`]: #method.bind
-    pub fn bind_iter<'b, T, I>(&self, statement: &T, params: I) -> Result<Portal, Error>
+    pub fn bind_raw<'b, T, I>(&self, statement: &T, params: I) -> Result<Portal, Error>
     where
         T: ?Sized + ToStatement,
         I: IntoIterator<Item = &'b dyn ToSql>,
@@ -169,7 +181,9 @@ impl<'a> Transaction<'a> {
         self.query_portal_raw(portal, max_rows)?.collect()
     }
 
-    /// The maximally flexible version of `query_portal`.
+    /// The maximally flexible version of [`query_portal`].
+    ///
+    /// [`query_portal`]: #method.query_portal
     pub fn query_portal_raw(&self, portal: &Portal, max_rows: i32) -> Result<RowStream, Error> {
         query::query_portal(self.client.inner(), portal, max_rows)
     }
@@ -186,7 +200,7 @@ impl<'a> Transaction<'a> {
         S: Iterator<Item = Result<T, E>>,
         T: IntoBuf,
         <T as IntoBuf>::Buf: 'static + Send,
-        E: Into<Box<dyn std::error::Error + Sync + Send>>,
+        E: Into<Box<dyn std::error::Error + Sync + Send>> + std::fmt::Debug,
     {
         self.client.copy_in(statement, params, stream)
     }

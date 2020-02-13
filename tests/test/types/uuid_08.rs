@@ -1,4 +1,4 @@
-use uuid_07::Uuid;
+use uuid_08::Uuid;
 
 use crate::types::test_type;
 

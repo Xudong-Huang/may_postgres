@@ -6,13 +6,11 @@ use crate::copy_out::CopyStream;
 use crate::into_buf::IntoBuf;
 use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
-use crate::slice_iter;
-use crate::to_statement::ToStatement;
 use crate::types::{Oid, ToSql, Type};
-use crate::{cancel_query_raw, copy_in, copy_out, query, Transaction};
-use crate::{prepare, SimpleQueryMessage};
-use crate::{simple_query, Row};
-use crate::{Error, Statement};
+use crate::{
+    copy_in, copy_out, prepare, query, simple_query, slice_iter, Error, Row, SimpleQueryMessage,
+    Statement, ToStatement, Transaction, TransactionBuilder,
+};
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use may::net::TcpStream;
@@ -197,14 +195,14 @@ impl Client {
 
     /// Executes a statement which returns a single row, returning it.
     ///
+    /// Returns an error if the query does not return exactly one row.
+    ///
     /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
     /// provided, 1-indexed.
     ///
     /// The `statement` argument can either be a `Statement`, or a raw query string. If the same statement will be
     /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
     /// with the `prepare` method.
-    ///
-    /// Returns an error if the query does not return exactly one row.
     ///
     /// # Panics
     ///
@@ -225,6 +223,42 @@ impl Client {
         }
 
         Ok(row)
+    }
+
+    /// Executes a statements which returns zero or one rows, returning it.
+    ///
+    /// Returns an error if the query returns more than one row.
+    ///
+    /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
+    /// provided, 1-indexed.
+    ///
+    /// The `statement` argument can either be a `Statement`, or a raw query string. If the same statement will be
+    /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
+    /// with the `prepare` method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of parameters provided does not match the number expected.
+    pub fn query_opt<T>(
+        &self,
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<Row>, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        let mut stream = self.query_raw(statement, slice_iter(params))?;
+
+        let row = match stream.next().transpose()? {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+
+        if stream.next().transpose()?.is_some() {
+            return Err(Error::row_count());
+        }
+
+        Ok(Some(row))
     }
 
     /// The maximally flexible version of [`query`].
@@ -316,7 +350,7 @@ impl Client {
         S: Iterator<Item = Result<T, E>>,
         T: IntoBuf,
         <T as IntoBuf>::Buf: 'static + Send,
-        E: Into<Box<dyn error::Error + Sync + Send>>,
+        E: Into<Box<dyn error::Error + Sync + Send>> + std::fmt::Debug,
     {
         let statement = statement.__convert().into_statement(self)?;
         let params = slice_iter(params);
@@ -345,8 +379,8 @@ impl Client {
     ///
     /// Statements should be separated by semicolons. If an error occurs, execution of the sequence will stop at that
     /// point. The simple query protocol returns the values in rows as strings rather than in their binary encodings,
-    /// so the associated row type doesn't work with the `FromSql` trait. Rather than simply returning a stream over the
-    /// rows, this method returns a stream over an enum which indicates either the completion of one of the commands,
+    /// so the associated row type doesn't work with the `FromSql` trait. Rather than simply returning a list of the
+    /// rows, this method returns a list of an enum which indicates either the completion of one of the commands,
     /// or a row of data. This preserves the framing between the separate statements in the request.
     ///
     /// # Warning
@@ -385,6 +419,14 @@ impl Client {
         Ok(Transaction::new(self))
     }
 
+    /// Returns a builder for a transaction with custom settings.
+    ///
+    /// Unlike the `transaction` method, the builder can be used to control the transaction's isolation level and other
+    /// attributes.
+    pub fn build_transaction(&mut self) -> TransactionBuilder<'_> {
+        TransactionBuilder::new(self)
+    }
+
     /// Attempts to cancel an in-progress query.
     ///
     /// The server provides no information about whether a cancellation attempt was successful or not. An error will
@@ -397,7 +439,7 @@ impl Client {
     /// Like `cancel_query`, but uses a stream which is already connected to the server rather than opening a new
     /// connection itself.
     pub fn cancel_query_raw(&self, stream: TcpStream) -> Result<(), Error> {
-        cancel_query_raw::cancel_query_raw(stream, self.process_id, self.secret_key)
+        crate::cancel_query_raw::cancel_query_raw(stream, self.process_id, self.secret_key)
     }
 
     /// Determines if the connection to the server has already closed.

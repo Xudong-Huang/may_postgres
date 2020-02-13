@@ -1,4 +1,3 @@
-use may_postgres::types::{FromSql, FromSqlOwned, IsNull, Kind, ToSql, Type, WrongType};
 use postgres_types::to_sql_checked;
 use std::collections::HashMap;
 use std::error::Error;
@@ -8,6 +7,8 @@ use std::fmt;
 use std::net::IpAddr;
 use std::result;
 use std::time::{Duration, UNIX_EPOCH};
+
+use may_postgres::types::{FromSql, FromSqlOwned, IsNull, Kind, ToSql, Type, WrongType};
 
 use crate::connect;
 use bytes::BytesMut;
@@ -22,8 +23,8 @@ mod eui48_04;
 mod geo_010;
 #[cfg(feature = "with-serde_json-1")]
 mod serde_json_1;
-#[cfg(feature = "with-uuid-0_7")]
-mod uuid_07;
+#[cfg(feature = "with-uuid-0_8")]
+mod uuid_08;
 
 fn test_type<T, S>(sql_type: &str, checks: &[(T, S)])
 where

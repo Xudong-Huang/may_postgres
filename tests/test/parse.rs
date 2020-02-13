@@ -1,5 +1,6 @@
-use may_postgres::config::{Config, TargetSessionAttrs};
 use std::time::Duration;
+
+use may_postgres::config::{Config, TargetSessionAttrs};
 
 fn check(s: &str, config: &Config) {
     assert_eq!(s.parse::<Config>().expect(s), *config, "`{}`", s);
