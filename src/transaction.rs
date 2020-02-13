@@ -5,9 +5,9 @@ use crate::into_buf::IntoBuf;
 use crate::query::RowStream;
 use crate::types::{ToSql, Type};
 use crate::{
-    bind, query, slice_iter, Client, Error, Portal, Row, SimpleQueryMessage, Statement, ToStatement,
+    bind, query, slice_iter, CancelToken, Client, Error, Portal, Row, SimpleQueryMessage,
+    Statement, ToStatement,
 };
-use may::net::TcpStream;
 use postgres_protocol::message::frontend;
 
 /// A representation of a PostgreSQL database transaction.
@@ -81,11 +81,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Like `Client::prepare_typed`.
-    pub fn prepare_typed(
-        &self,
-        query: &str,
-        parameter_types: &[Type],
-    ) -> Result<Statement, Error> {
+    pub fn prepare_typed(&self, query: &str, parameter_types: &[Type]) -> Result<Statement, Error> {
         self.client.prepare_typed(query, parameter_types)
     }
 
@@ -227,14 +223,14 @@ impl<'a> Transaction<'a> {
         self.client.batch_execute(query)
     }
 
+    /// Like `Client::cancel_token`.
+    pub fn cancel_token(&self) -> CancelToken {
+        self.client.cancel_token()
+    }
+
     /// Like `Client::cancel_query`.
     pub fn cancel_query(&self) -> Result<(), Error> {
         self.client.cancel_query()
-    }
-
-    /// Like `Client::cancel_query_raw`.
-    pub fn cancel_query_raw<S, T>(&self, stream: TcpStream) -> Result<(), Error> {
-        self.client.cancel_query_raw(stream)
     }
 
     /// Like `Client::transaction`.

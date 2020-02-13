@@ -8,12 +8,11 @@ use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
 use crate::types::{Oid, ToSql, Type};
 use crate::{
-    copy_in, copy_out, prepare, query, simple_query, slice_iter, Error, Row, SimpleQueryMessage,
-    Statement, ToStatement, Transaction, TransactionBuilder,
+    copy_in, copy_out, prepare, query, simple_query, slice_iter, CancelToken, Error, Row,
+    SimpleQueryMessage, Statement, ToStatement, Transaction, TransactionBuilder,
 };
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
-use may::net::TcpStream;
 use may::sync::{mpsc, Mutex};
 use postgres_protocol::message::backend::Message;
 use std::collections::HashMap;
@@ -427,6 +426,17 @@ impl Client {
         TransactionBuilder::new(self)
     }
 
+    /// Constructs a cancellation token that can later be used to request
+    /// cancellation of a query running on the connection associated with
+    /// this client.
+    pub fn cancel_token(&self) -> CancelToken {
+        CancelToken {
+            socket_config: self.socket_config.clone(),
+            process_id: self.process_id,
+            secret_key: self.secret_key,
+        }
+    }
+
     /// Attempts to cancel an in-progress query.
     ///
     /// The server provides no information about whether a cancellation attempt was successful or not. An error will
@@ -434,12 +444,6 @@ impl Client {
     ///
     pub fn cancel_query(&self) -> Result<(), Error> {
         cancel_query::cancel_query(self.socket_config.clone(), self.process_id, self.secret_key)
-    }
-
-    /// Like `cancel_query`, but uses a stream which is already connected to the server rather than opening a new
-    /// connection itself.
-    pub fn cancel_query_raw(&self, stream: TcpStream) -> Result<(), Error> {
-        crate::cancel_query_raw::cancel_query_raw(stream, self.process_id, self.secret_key)
     }
 
     /// Determines if the connection to the server has already closed.

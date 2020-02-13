@@ -68,6 +68,7 @@ macro_rules! o_try {
     };
 }
 
+pub use crate::cancel_token::CancelToken;
 pub use crate::client::Client;
 pub use crate::config::Config;
 use crate::error::DbError;
@@ -87,6 +88,7 @@ use crate::types::ToSql;
 mod bind;
 mod cancel_query;
 mod cancel_query_raw;
+mod cancel_token;
 mod client;
 mod codec;
 pub mod config;

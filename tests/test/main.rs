@@ -2,7 +2,7 @@ use may::net::TcpStream;
 use may::{go, join};
 use may_postgres::error::SqlState;
 use may_postgres::types::{Kind, Type};
-use may_postgres::{Client, Config, Error, SimpleQueryMessage};
+use may_postgres::{Client, Config, Error, IsolationLevel, SimpleQueryMessage};
 use std::fmt::Write;
 use std::time::Duration;
 
@@ -288,7 +288,8 @@ fn cancel_query_raw() {
         {
             let socket = TcpStream::connect("127.0.0.1:5433").unwrap();
             may::coroutine::sleep(Duration::from_millis(100));
-            let ret = client.cancel_query_raw(socket);
+        let cancel_token = client.cancel_token();
+            let ret = cancel_token.cancel_query_raw(socket);
             assert!(ret.is_ok());
         }
     }
@@ -368,6 +369,38 @@ fn transaction_rollback_drop() {
     let rows = client.query(&stmt, &[]).unwrap();
 
     assert_eq!(rows.len(), 0);
+}
+
+#[test]
+fn transaction_builder() {
+    let mut client = connect("user=postgres");
+
+    client
+        .batch_execute(
+            "CREATE TEMPORARY TABLE foo(
+                id SERIAL,
+                name TEXT
+            )",
+        )
+        .unwrap();
+
+    let transaction = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::Serializable)
+        .read_only(true)
+        .deferrable(true)
+        .start()
+        .unwrap();
+    transaction
+        .batch_execute("INSERT INTO foo (name) VALUES ('steven')")
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let stmt = client.prepare("SELECT name FROM foo").unwrap();
+    let rows = client.query(&stmt, &[]).unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>(0), "steven");
 }
 
 #[test]
@@ -483,6 +516,40 @@ fn copy_out() {
 }
 
 // #[test]
+// fn notices() {
+//     let long_name = "x".repeat(65);
+//     let client = connect_raw(&format!("user=postgres application_name={}", long_name,)).unwrap();
+
+//     let (tx, rx) = mpsc::unbounded();
+//     let stream = stream::poll_fn(move |cx| connection.poll_message(cx)).map_err(|e| panic!(e));
+//     let connection = stream.forward(tx).map(|r| r.unwrap());
+//     tokio::spawn(connection);
+
+//     client
+//         .batch_execute("DROP DATABASE IF EXISTS noexistdb")
+//         .unwrap();
+
+//     drop(client);
+
+//     let notices = rx
+//         .filter_map(|m| match m {
+//             AsyncMessage::Notice(n) => future::ready(Some(n)),
+//             _ => future::ready(None),
+//         })
+//         .collect::<Vec<_>>();
+//     assert_eq!(notices.len(), 2);
+//     assert_eq!(
+//         notices[0].message(),
+//         "identifier \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\" \
+//          will be truncated to \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+//     );
+//     assert_eq!(
+//         notices[1].message(),
+//         "database \"noexistdb\" does not exist, skipping"
+//     );
+// }
+
+// #[test]
 // fn notifications() {
 //     let (mut client, mut connection) = connect_raw("user=postgres").unwrap();
 
@@ -554,6 +621,39 @@ fn query_portal() {
 }
 
 #[test]
+fn check_send() {
+    fn is_send<T: Send>(_: &T) {}
+
+    let f = connect("user=postgres");
+    is_send(&f);
+    let mut client = f;
+
+    let f = client.prepare("SELECT $1::TEXT");
+    is_send(&f);
+    let stmt = f.unwrap();
+
+    let f = client.query(&stmt, &[&"hello"]);
+    is_send(&f);
+    drop(f);
+
+    let f = client.execute(&stmt, &[&"hello"]);
+    is_send(&f);
+    drop(f);
+
+    let f = client.transaction();
+    is_send(&f);
+    let trans = f.unwrap();
+
+    let f = trans.query(&stmt, &[&"hello"]);
+    is_send(&f);
+    drop(f);
+
+    let f = trans.execute(&stmt, &[&"hello"]);
+    is_send(&f);
+    drop(f);
+}
+
+#[test]
 fn query_one() {
     let client = connect("user=postgres");
 
@@ -574,6 +674,32 @@ fn query_one() {
         .unwrap();
     client
         .query_one("SELECT * FROM foo WHERE name = 'alice'", &[])
+        .unwrap();
+    client.query_one("SELECT * FROM foo", &[]).err().unwrap();
+}
+
+#[test]
+fn query_opt() {
+    let client = connect("user=postgres");
+
+    client
+        .batch_execute(
+            "
+                CREATE TEMPORARY TABLE foo (
+                    name TEXT
+                );
+                INSERT INTO foo (name) VALUES ('alice'), ('bob'), ('carol');
+            ",
+        )
+        .unwrap();
+
+    assert!(client
+        .query_opt("SELECT * FROM foo WHERE name = 'dave'", &[])
+        .unwrap()
+        .is_none());
+    client
+        .query_opt("SELECT * FROM foo WHERE name = 'alice'", &[])
+        .unwrap()
         .unwrap();
     client.query_one("SELECT * FROM foo", &[]).err().unwrap();
 }
