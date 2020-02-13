@@ -1,13 +1,13 @@
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
-use crate::copy_out::CopyStream;
-use crate::into_buf::IntoBuf;
+use crate::copy_out::CopyOutStream;
 use crate::query::RowStream;
 use crate::types::{ToSql, Type};
 use crate::{
-    bind, query, slice_iter, CancelToken, Client, Error, Portal, Row, SimpleQueryMessage,
-    Statement, ToStatement,
+    bind, query, slice_iter, CancelToken, Client, CopyInSink, Error, Portal, Row,
+    SimpleQueryMessage, Statement, ToStatement,
 };
+use bytes::Buf;
 use postgres_protocol::message::frontend;
 
 /// A representation of a PostgreSQL database transaction.
@@ -185,32 +185,20 @@ impl<'a> Transaction<'a> {
     }
 
     /// Like `Client::copy_in`.
-    pub fn copy_in<T, E, S, M>(
-        &self,
-        statement: &M,
-        params: &[&(dyn ToSql + Sync)],
-        stream: S,
-    ) -> Result<u64, Error>
+    pub fn copy_in<T, U>(&self, statement: &T) -> Result<CopyInSink<U>, Error>
     where
-        M: ?Sized + ToStatement,
-        S: Iterator<Item = Result<T, E>>,
-        T: IntoBuf,
-        <T as IntoBuf>::Buf: 'static + Send,
-        E: Into<Box<dyn std::error::Error + Sync + Send>> + std::fmt::Debug,
+        T: ?Sized + ToStatement,
+        U: Buf + 'static + Send,
     {
-        self.client.copy_in(statement, params, stream)
+        self.client.copy_in(statement)
     }
 
     /// Like `Client::copy_out`.
-    pub fn copy_out<T>(
-        &self,
-        statement: &T,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<CopyStream, Error>
+    pub fn copy_out<T>(&self, statement: &T) -> Result<CopyOutStream, Error>
     where
         T: ?Sized + ToStatement,
     {
-        self.client.copy_out(statement, params)
+        self.client.copy_out(statement)
     }
 
     /// Like `Client::simple_query`.

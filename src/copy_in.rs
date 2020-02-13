@@ -1,15 +1,13 @@
-use crate::client::InnerClient;
+use crate::client::{InnerClient, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
-use crate::into_buf::IntoBuf;
-use crate::types::ToSql;
-use crate::{query, Error, Statement};
+use crate::{query, slice_iter, Error, Statement};
 use bytes::{buf::ext::BufExt, Buf, BufMut, BytesMut};
 use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use postgres_protocol::message::frontend::CopyData;
-use std::error;
+use std::marker::PhantomData;
 
 enum CopyInMessage {
     Message(FrontendMessage),
@@ -80,21 +78,97 @@ impl CopyInReceiver {
     }
 }
 
-pub fn copy_in<'a, T, E, I, S>(
-    client: &InnerClient,
-    statement: Statement,
-    params: I,
-    mut stream: S,
-) -> Result<u64, Error>
+/// A sink for `COPY ... FROM STDIN` query data.
+///
+/// The copy *must* be explicitly completed via the `Sink::close` or `finish` methods. If it is
+/// not, the copy will be aborted.
+pub struct CopyInSink<T> {
+    sender: mpsc::Sender<CopyInMessage>,
+    responses: Responses,
+    buf: BytesMut,
+    _p: PhantomData<T>,
+}
+
+impl<T> CopyInSink<T>
 where
-    I: IntoIterator<Item = &'a dyn ToSql>,
-    I::IntoIter: ExactSizeIterator,
-    S: Iterator<Item = Result<T, E>>,
-    T: IntoBuf,
-    <T as IntoBuf>::Buf: 'static + Send,
-    E: Into<Box<dyn error::Error + Sync + Send>> + std::fmt::Debug,
+    T: Buf + 'static + Send,
 {
-    let buf = query::encode(client, &statement, params)?;
+    /// send a buf
+    pub fn send(&mut self, item: T) -> Result<(), Error> {
+        let data: Box<dyn Buf + Send> = if item.remaining() > 4096 {
+            if self.buf.is_empty() {
+                Box::new(item)
+            } else {
+                Box::new(self.buf.split().freeze().chain(item))
+            }
+        } else {
+            self.buf.put(item);
+            if self.buf.len() > 4096 {
+                Box::new(self.buf.split().freeze())
+            } else {
+                return Ok(());
+            }
+        };
+
+        let data = CopyData::new(data).map_err(Error::encode)?;
+        self.sender
+            .send(CopyInMessage::Message(FrontendMessage::CopyData(data)))
+            .map_err(|_| Error::closed())
+    }
+
+    /// send iterator of bufs
+    pub fn send_all<S>(&mut self, items: &mut S) -> Result<(), Error>
+    where
+        S: Iterator<Item = Result<T, Error>>,
+    {
+        for item in items {
+            self.send(item?)?;
+        }
+        Ok(())
+    }
+
+    /// Completes the copy, returning the number of rows inserted.
+    ///
+    /// The `Sink::close` method is equivalent to `finish`, except that it does not return the
+    /// number of rows.
+    pub fn finish(&mut self) -> Result<u64, Error> {
+        // flush the remaining data
+        let data: Box<dyn Buf + Send> = Box::new(self.buf.split().freeze());
+        if data.remaining() > 0 {
+            let data = CopyData::new(data).map_err(Error::encode)?;
+            self.sender
+                .send(CopyInMessage::Message(FrontendMessage::CopyData(data)))
+                .map_err(|_| Error::closed())?;
+        }
+
+        self.sender
+            .send(CopyInMessage::Done)
+            .map_err(|_| Error::closed())?;
+
+        match self.responses.next()? {
+            Message::CommandComplete(body) => {
+                let rows = body
+                    .tag()
+                    .map_err(Error::parse)?
+                    .rsplit(' ')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap_or(0);
+                Ok(rows)
+            }
+            _ => Err(Error::unexpected_message()),
+        }
+    }
+}
+
+pub fn copy_in<T>(client: &InnerClient, statement: Statement) -> Result<CopyInSink<T>, Error>
+where
+    T: Buf + 'static + Send,
+{
+    // debug!("executing copy in statement {}", statement.name());
+
+    let buf = query::encode(client, &statement, slice_iter(&[]))?;
 
     let (sender, receiver) = mpsc::channel();
     let receiver = CopyInReceiver::new(receiver);
@@ -114,57 +188,10 @@ where
         _ => return Err(Error::unexpected_message()),
     }
 
-    let mut bytes = BytesMut::new();
-
-    while let Some(buf) = stream.next().transpose().unwrap() {
-        let buf = buf.into_buf();
-
-        let data: Box<dyn Buf + Send> = if buf.remaining() > 4096 {
-            if bytes.is_empty() {
-                Box::new(buf)
-            } else {
-                Box::new(bytes.split().freeze().chain(buf))
-            }
-        } else {
-            bytes.reserve(buf.remaining());
-            bytes.put(buf);
-            if bytes.len() > 4096 {
-                Box::new(bytes.split().freeze())
-            } else {
-                continue;
-            }
-        };
-
-        let data = CopyData::new(data).map_err(Error::encode)?;
-        sender
-            .send(CopyInMessage::Message(FrontendMessage::CopyData(data)))
-            .map_err(|_| Error::closed())?;
-    }
-
-    if !bytes.is_empty() {
-        let data: Box<dyn Buf + Send> = Box::new(bytes.freeze());
-        let data = CopyData::new(data).map_err(Error::encode)?;
-        sender
-            .send(CopyInMessage::Message(FrontendMessage::CopyData(data)))
-            .map_err(|_| Error::closed())?;
-    }
-
-    sender
-        .send(CopyInMessage::Done)
-        .map_err(|_| Error::closed())?;
-
-    match responses.next()? {
-        Message::CommandComplete(body) => {
-            let rows = body
-                .tag()
-                .map_err(Error::parse)?
-                .rsplit(' ')
-                .next()
-                .unwrap()
-                .parse()
-                .unwrap_or(0);
-            Ok(rows)
-        }
-        _ => Err(Error::unexpected_message()),
-    }
+    Ok(CopyInSink {
+        sender,
+        responses,
+        buf: BytesMut::new(),
+        _p: PhantomData,
+    })
 }

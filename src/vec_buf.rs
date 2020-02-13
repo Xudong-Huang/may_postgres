@@ -18,7 +18,10 @@ impl<W: Write> VecBufs<W> {
             block: 0,
             pos: 0,
             bufs: Vec::with_capacity(MAX_VEC_BUF),
-            io_slice: unsafe { MaybeUninit::zeroed().assume_init() },
+            io_slice: unsafe {
+                #[allow(clippy::uninit_assumed_init)]
+                MaybeUninit::uninit().assume_init()
+            },
             writer,
         }
     }

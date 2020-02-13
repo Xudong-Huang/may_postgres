@@ -71,6 +71,8 @@ macro_rules! o_try {
 pub use crate::cancel_token::CancelToken;
 pub use crate::client::Client;
 pub use crate::config::Config;
+pub use crate::copy_in::CopyInSink;
+pub use crate::copy_out::CopyOutStream;
 use crate::error::DbError;
 pub use crate::error::Error;
 pub use crate::generic_client::GenericClient;
@@ -84,7 +86,7 @@ pub use crate::transaction::Transaction;
 pub use crate::transaction_builder::{IsolationLevel, TransactionBuilder};
 use crate::types::ToSql;
 
-// pub mod binary_copy;
+pub mod binary_copy;
 mod bind;
 mod cancel_query;
 mod cancel_query_raw;
@@ -100,7 +102,6 @@ mod copy_in;
 mod copy_out;
 pub mod error;
 mod generic_client;
-pub mod into_buf;
 mod portal;
 mod prepare;
 mod query;

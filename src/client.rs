@@ -2,21 +2,19 @@ use crate::cancel_query;
 use crate::codec::BackendMessages;
 use crate::config::Host;
 use crate::connection::{Connection, Request, RequestMessages};
-use crate::copy_out::CopyStream;
-use crate::into_buf::IntoBuf;
+use crate::copy_out::CopyOutStream;
 use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
 use crate::types::{Oid, ToSql, Type};
 use crate::{
-    copy_in, copy_out, prepare, query, simple_query, slice_iter, CancelToken, Error, Row,
-    SimpleQueryMessage, Statement, ToStatement, Transaction, TransactionBuilder,
+    copy_in, copy_out, prepare, query, simple_query, slice_iter, CancelToken, CopyInSink, Error,
+    Row, SimpleQueryMessage, Statement, ToStatement, Transaction, TransactionBuilder,
 };
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
 use may::sync::{mpsc, Mutex};
 use postgres_protocol::message::backend::Message;
 use std::collections::HashMap;
-use std::error;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -330,48 +328,36 @@ impl Client {
         query::execute(self.inner(), statement, params)
     }
 
-    /// Executes a `COPY FROM STDIN` statement, returning the number of rows created.
+    /// Executes a `COPY FROM STDIN` statement, returning a sink used to write the copy data.
     ///
-    /// The data in the provided stream is passed along to the server verbatim; it is the caller's responsibility to
-    /// ensure it uses the proper format.
+    /// PostgreSQL does not support parameters in `COPY` statements, so this method does not take any. The copy *must*
+    /// be explicitly completed via the `Sink::close` or `finish` methods. If it is not, the copy will be aborted.
     ///
     /// # Panics
     ///
-    /// Panics if the number of parameters provided does not match the number expected.
-    pub fn copy_in<T, E, S, M>(
-        &self,
-        statement: &M,
-        params: &[&(dyn ToSql + Sync)],
-        stream: S,
-    ) -> Result<u64, Error>
+    /// Panics if the statement contains parameters.
+    pub fn copy_in<T, U>(&self, statement: &T) -> Result<CopyInSink<U>, Error>
     where
-        M: ?Sized + ToStatement,
-        S: Iterator<Item = Result<T, E>>,
-        T: IntoBuf,
-        <T as IntoBuf>::Buf: 'static + Send,
-        E: Into<Box<dyn error::Error + Sync + Send>> + std::fmt::Debug,
+        T: ?Sized + ToStatement,
+        U: Buf + 'static + Send,
     {
         let statement = statement.__convert().into_statement(self)?;
-        let params = slice_iter(params);
-        copy_in::copy_in(self.inner(), statement, params, stream)
+        copy_in::copy_in(self.inner(), statement)
     }
 
     /// Executes a `COPY TO STDOUT` statement, returning a stream of the resulting data.
     ///
+    /// PostgreSQL does not support parameters in `COPY` statements, so this method does not take any.
+    ///
     /// # Panics
     ///
-    /// Panics if the number of parameters provided does not match the number expected.
-    pub fn copy_out<T>(
-        &self,
-        statement: &T,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<CopyStream, Error>
+    /// Panics if the statement contains parameters.
+    pub fn copy_out<T>(&self, statement: &T) -> Result<CopyOutStream, Error>
     where
         T: ?Sized + ToStatement,
     {
         let statement = statement.__convert().into_statement(self)?;
-        let params = slice_iter(params);
-        copy_out::copy_out(self.inner(), statement, params)
+        copy_out::copy_out(self.inner(), statement)
     }
 
     /// Executes a sequence of SQL statements using the simple query protocol, returning the resulting rows.

@@ -1,32 +1,25 @@
 //! Utilities for working with the PostgreSQL binary copy format.
 
 use crate::types::{FromSql, IsNull, ToSql, Type, WrongType};
-use crate::{slice_iter, Error};
+use crate::{slice_iter, CopyInSink, CopyOutStream, Error};
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::{ready, SinkExt, Stream};
-use pin_project_lite::pin_project;
 use std::convert::TryFrom;
 use std::io;
 use std::io::Cursor;
 use std::ops::Range;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 const MAGIC: &[u8] = b"PGCOPY\n\xff\r\n\0";
 const HEADER_LEN: usize = MAGIC.len() + 4 + 4;
 
-pin_project! {
-    /// A type which serializes rows into the PostgreSQL binary copy format.
-    ///
-    /// The copy *must* be explicitly completed via the `finish` method. If it is not, the copy will be aborted.
-    pub struct BinaryCopyInWriter {
-        #[pin]
-        sink: CopyInSink<Bytes>,
-        types: Vec<Type>,
-        buf: BytesMut,
-    }
+/// A type which serializes rows into the PostgreSQL binary copy format.
+///
+/// The copy *must* be explicitly completed via the `finish` method. If it is not, the copy will be aborted.
+pub struct BinaryCopyInWriter {
+    sink: CopyInSink<Bytes>,
+    types: Vec<Type>,
+    buf: BytesMut,
 }
 
 impl BinaryCopyInWriter {
@@ -49,8 +42,8 @@ impl BinaryCopyInWriter {
     /// # Panics
     ///
     /// Panics if the number of values provided does not match the number expected.
-    pub async fn write(self: Pin<&mut Self>, values: &[&(dyn ToSql + Sync)]) -> Result<(), Error> {
-        self.write_raw(slice_iter(values)).await
+    pub fn write(&mut self, values: &[&(dyn ToSql + Sync)]) -> Result<(), Error> {
+        self.write_raw(slice_iter(values))
     }
 
     /// A maximally-flexible version of `write`.
@@ -58,39 +51,37 @@ impl BinaryCopyInWriter {
     /// # Panics
     ///
     /// Panics if the number of values provided does not match the number expected.
-    pub async fn write_raw<'a, I>(self: Pin<&mut Self>, values: I) -> Result<(), Error>
+    pub fn write_raw<'a, I>(&mut self, values: I) -> Result<(), Error>
     where
         I: IntoIterator<Item = &'a dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
     {
-        let mut this = self.project();
-
         let values = values.into_iter();
         assert!(
-            values.len() == this.types.len(),
+            values.len() == self.types.len(),
             "expected {} values but got {}",
-            this.types.len(),
+            self.types.len(),
             values.len(),
         );
 
-        this.buf.put_i16(this.types.len() as i16);
+        self.buf.put_i16(self.types.len() as i16);
 
-        for (i, (value, type_)) in values.zip(this.types).enumerate() {
-            let idx = this.buf.len();
-            this.buf.put_i32(0);
+        for (i, (value, type_)) in values.zip(&self.types).enumerate() {
+            let idx = self.buf.len();
+            self.buf.put_i32(0);
             let len = match value
-                .to_sql_checked(type_, this.buf)
+                .to_sql_checked(type_, &mut self.buf)
                 .map_err(|e| Error::to_sql(e, i))?
             {
                 IsNull::Yes => -1,
-                IsNull::No => i32::try_from(this.buf.len() - idx - 4)
+                IsNull::No => i32::try_from(self.buf.len() - idx - 4)
                     .map_err(|e| Error::encode(io::Error::new(io::ErrorKind::InvalidInput, e)))?,
             };
-            BigEndian::write_i32(&mut this.buf[idx..], len);
+            BigEndian::write_i32(&mut self.buf[idx..], len);
         }
 
-        if this.buf.len() > 4096 {
-            this.sink.send(this.buf.split().freeze()).await?;
+        if self.buf.len() > 4096 {
+            self.sink.send(self.buf.split().freeze())?;
         }
 
         Ok(())
@@ -99,12 +90,10 @@ impl BinaryCopyInWriter {
     /// Completes the copy, returning the number of rows added.
     ///
     /// This method *must* be used to complete the copy process. If it is not, the copy will be aborted.
-    pub async fn finish(self: Pin<&mut Self>) -> Result<u64, Error> {
-        let mut this = self.project();
-
-        this.buf.put_i16(-1);
-        this.sink.send(this.buf.split().freeze()).await?;
-        this.sink.finish().await
+    pub fn finish(&mut self) -> Result<u64, Error> {
+        self.buf.put_i16(-1);
+        self.sink.send(self.buf.split().freeze())?;
+        self.sink.finish()
     }
 }
 
@@ -112,14 +101,11 @@ struct Header {
     has_oids: bool,
 }
 
-pin_project! {
-    /// A stream of rows deserialized from the PostgreSQL binary copy format.
-    pub struct BinaryCopyOutStream {
-        #[pin]
-        stream: CopyOutStream,
-        types: Arc<Vec<Type>>,
-        header: Option<Header>,
-    }
+/// A stream of rows deserialized from the PostgreSQL binary copy format.
+pub struct BinaryCopyOutStream {
+    stream: CopyOutStream,
+    types: Arc<Vec<Type>>,
+    header: Option<Header>,
 }
 
 impl BinaryCopyOutStream {
@@ -133,28 +119,26 @@ impl BinaryCopyOutStream {
     }
 }
 
-impl Stream for BinaryCopyOutStream {
+impl Iterator for BinaryCopyOutStream {
     type Item = Result<BinaryCopyOutRow, Error>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-
-        let chunk = match ready!(this.stream.poll_next(cx)) {
+    fn next(&mut self) -> Option<Self::Item> {
+        let chunk = match self.stream.next() {
             Some(Ok(chunk)) => chunk,
-            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-            None => return Poll::Ready(Some(Err(Error::closed()))),
+            Some(Err(e)) => return Some(Err(e)),
+            None => return Some(Err(Error::closed())),
         };
         let mut chunk = Cursor::new(chunk);
 
-        let has_oids = match &this.header {
+        let has_oids = match &self.header {
             Some(header) => header.has_oids,
             None => {
-                check_remaining(&chunk, HEADER_LEN)?;
+                o_try!(check_remaining(&chunk, HEADER_LEN));
                 if &chunk.bytes()[..MAGIC.len()] != MAGIC {
-                    return Poll::Ready(Some(Err(Error::parse(io::Error::new(
+                    return Some(Err(Error::parse(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "invalid magic value",
-                    )))));
+                    ))));
                 }
                 chunk.advance(MAGIC.len());
 
@@ -162,50 +146,50 @@ impl Stream for BinaryCopyOutStream {
                 let has_oids = (flags & (1 << 16)) != 0;
 
                 let header_extension = chunk.get_u32() as usize;
-                check_remaining(&chunk, header_extension)?;
+                o_try!(check_remaining(&chunk, header_extension));
                 chunk.advance(header_extension);
 
-                *this.header = Some(Header { has_oids });
+                self.header = Some(Header { has_oids });
                 has_oids
             }
         };
 
-        check_remaining(&chunk, 2)?;
+        o_try!(check_remaining(&chunk, 2));
         let mut len = chunk.get_i16();
         if len == -1 {
-            return Poll::Ready(None);
+            return None;
         }
 
         if has_oids {
             len += 1;
         }
-        if len as usize != this.types.len() {
-            return Poll::Ready(Some(Err(Error::parse(io::Error::new(
+        if len as usize != self.types.len() {
+            return Some(Err(Error::parse(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("expected {} values but got {}", this.types.len(), len),
-            )))));
+                format!("expected {} values but got {}", self.types.len(), len),
+            ))));
         }
 
         let mut ranges = vec![];
         for _ in 0..len {
-            check_remaining(&chunk, 4)?;
+            o_try!(check_remaining(&chunk, 4));
             let len = chunk.get_i32();
             if len == -1 {
                 ranges.push(None);
             } else {
                 let len = len as usize;
-                check_remaining(&chunk, len)?;
+                o_try!(check_remaining(&chunk, len));
                 let start = chunk.position() as usize;
                 ranges.push(Some(start..start + len));
                 chunk.advance(len);
             }
         }
 
-        Poll::Ready(Some(Ok(BinaryCopyOutRow {
+        Some(Ok(BinaryCopyOutRow {
             buf: chunk.into_inner(),
             ranges,
-            types: this.types.clone(),
-        })))
+            types: self.types.clone(),
+        }))
     }
 }
 

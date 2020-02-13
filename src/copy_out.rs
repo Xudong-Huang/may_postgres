@@ -1,23 +1,14 @@
 use crate::client::{InnerClient, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
-use crate::types::ToSql;
-use crate::{query, Error, Statement};
+use crate::{query, slice_iter, Error, Statement};
 use bytes::Bytes;
 use postgres_protocol::message::backend::Message;
 
-pub fn copy_out<'a, I>(
-    client: &InnerClient,
-    statement: Statement,
-    params: I,
-) -> Result<CopyStream, Error>
-where
-    I: IntoIterator<Item = &'a dyn ToSql>,
-    I::IntoIter: ExactSizeIterator,
-{
-    let buf = query::encode(client, &statement, params)?;
+pub fn copy_out(client: &InnerClient, statement: Statement) -> Result<CopyOutStream, Error> {
+    let buf = query::encode(client, &statement, slice_iter(&[]))?;
     let responses = start(client, buf)?;
-    Ok(CopyStream { responses })
+    Ok(CopyOutStream { responses })
 }
 
 fn start(client: &InnerClient, buf: Bytes) -> Result<Responses, Error> {
@@ -36,11 +27,12 @@ fn start(client: &InnerClient, buf: Bytes) -> Result<Responses, Error> {
     Ok(responses)
 }
 
-pub struct CopyStream {
+/// A stream of `COPY ... TO STDOUT` query data.
+pub struct CopyOutStream {
     responses: Responses,
 }
 
-impl Iterator for CopyStream {
+impl Iterator for CopyOutStream {
     type Item = Result<Bytes, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {

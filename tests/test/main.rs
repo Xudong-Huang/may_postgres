@@ -1,11 +1,14 @@
+use std::fmt::Write;
+use std::time::Duration;
+
+use bytes::{Bytes, BytesMut};
 use may::net::TcpStream;
 use may::{go, join};
 use may_postgres::error::SqlState;
 use may_postgres::types::{Kind, Type};
 use may_postgres::{Client, Config, Error, IsolationLevel, SimpleQueryMessage};
-use std::fmt::Write;
-use std::time::Duration;
 
+mod binary_copy;
 mod parse;
 mod runtime;
 mod types;
@@ -416,17 +419,21 @@ fn copy_in() {
         )
         .unwrap();
 
-    let stmt = client.prepare("COPY foo FROM STDIN").unwrap();
-    let stream = vec![b"1\tjim\n".to_vec(), b"2\tjoe\n".to_vec()]
-        .into_iter()
-        .map(Ok::<_, String>);
-    let rows = client.copy_in(&stmt, &[], stream).unwrap();
+    let mut stream = vec![
+        Bytes::from_static(b"1\tjim\n"),
+        Bytes::from_static(b"2\tjoe\n"),
+    ]
+    .into_iter()
+    .map(Ok::<_, Error>);
+
+    let mut sink = client.copy_in("COPY foo FROM STDIN").unwrap();
+    sink.send_all(&mut stream).unwrap();
+    let rows = sink.finish().unwrap();
     assert_eq!(rows, 2);
 
-    let stmt = client
-        .prepare("SELECT id, name FROM foo ORDER BY id")
+    let rows = client
+        .query("SELECT id, name FROM foo ORDER BY id", &[])
         .unwrap();
-    let rows = client.query(&stmt, &[]).unwrap();
 
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].get::<_, i32>(0), 1);
@@ -448,20 +455,21 @@ fn copy_in_large() {
         )
         .unwrap();
 
-    let stmt = client.prepare("COPY foo FROM STDIN").unwrap();
-
-    let a = "0\tname0\n".to_string();
-    let mut b = String::new();
+    let a = Bytes::from_static(b"0\tname0\n");
+    let mut b = BytesMut::new();
     for i in 1..5_000 {
         writeln!(b, "{0}\tname{0}", i).unwrap();
     }
-    let mut c = String::new();
+    let mut c = BytesMut::new();
     for i in 5_000..10_000 {
         writeln!(c, "{0}\tname{0}", i).unwrap();
     }
-    let stream = vec![a, b, c].into_iter().map(Ok::<_, String>);
-
-    let rows = client.copy_in(&stmt, &[], stream).unwrap();
+    let mut stream = vec![a, b.freeze(), c.freeze()]
+        .into_iter()
+        .map(Ok::<_, Error>);
+    let mut sink = client.copy_in("COPY foo FROM STDIN").unwrap();
+    sink.send_all(&mut stream).unwrap();
+    let rows = sink.finish().unwrap();
     assert_eq!(rows, 10_000);
 }
 
@@ -478,15 +486,14 @@ fn copy_in_error() {
         )
         .unwrap();
 
-    let stmt = client.prepare("COPY foo FROM STDIN").unwrap();
-    let stream = vec![Ok(b"1\tjim\n".to_vec()), Err("asdf")].into_iter();
-    let error = client.copy_in(&stmt, &[], stream).unwrap_err();
-    assert!(error.to_string().contains("asdf"));
+    {
+        let mut sink = client.copy_in("COPY foo FROM STDIN").unwrap();
+        sink.send(Bytes::from_static(b"1\tsteven")).unwrap();
+    }
 
-    let stmt = client
-        .prepare("SELECT id, name FROM foo ORDER BY id")
+    let rows = client
+        .query("SELECT id, name FROM foo ORDER BY id", &[])
         .unwrap();
-    let rows = client.query(&stmt, &[]).unwrap();
     assert_eq!(rows.len(), 0);
 }
 
@@ -507,7 +514,7 @@ fn copy_out() {
 
     let stmt = client.prepare("COPY foo TO STDOUT").unwrap();
     let data = client
-        .copy_out(&stmt, &[])
+        .copy_out(&stmt)
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
