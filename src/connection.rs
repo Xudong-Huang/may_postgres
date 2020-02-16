@@ -66,6 +66,8 @@ impl Connection {
             let req_tx = req_tx.clone();
             go!(move || {
                 let mut main = || -> Result<(), Error> {
+                    const MAX_CACHE_SIZE: usize = 128;
+                    let mut message_cache = Vec::with_capacity(MAX_CACHE_SIZE);
                     #[allow(clippy::while_let_on_iterator)]
                     while let Some(rsp) = stream.next() {
                         match rsp.map_err(Error::io)? {
@@ -92,9 +94,18 @@ impl Connection {
                                     },
                                 };
 
-                                response.tx.send(messages).ok();
+                                message_cache.push(messages);
+
+                                if message_cache.len() >= MAX_CACHE_SIZE {
+                                    for msg in message_cache.drain(..) {
+                                        response.tx.send(msg).ok();
+                                    }
+                                }
 
                                 if request_complete {
+                                    for msg in message_cache.drain(..) {
+                                        response.tx.send(msg).ok();
+                                    }
                                     rsp_queue.pop();
                                 }
                             }
