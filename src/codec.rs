@@ -1,10 +1,11 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may::sync::{RwLock, RwLockReadGuard};
+use may::net::TcpStream;
 use postgres_protocol::message::backend;
 use postgres_protocol::message::frontend::CopyData;
 use std::io::{self, Read};
-use std::sync::Arc;
+
+pub use frame_codec::Framed;
 
 pub enum FrontendMessage {
     Raw(Bytes),
@@ -95,71 +96,116 @@ impl PostgresCodec {
     }
 }
 
-pub struct Framed<S> {
-    r_stream: S,
-    read_buf: BytesMut,
-    codec: PostgresCodec,
-    rw_lock: Arc<RwLock<()>>,
-    lock: Option<RwLockReadGuard<'static, ()>>,
-}
+// #[cfg(not(unix))]
+mod frame_codec {
+    use super::*;
+    use may::sync::{RwLock, RwLockReadGuard};
+    use std::sync::Arc;
 
-impl<S: Read> Framed<S> {
-    pub fn new(s: S) -> Self {
-        let rw_lock = Arc::new(RwLock::new(()));
-        let lock = unsafe { std::mem::transmute(rw_lock.read().unwrap()) };
-        Framed {
-            r_stream: s,
-            read_buf: BytesMut::with_capacity(4096 * 8),
-            codec: PostgresCodec,
-            rw_lock,
-            lock: Some(lock),
+    pub struct Framed {
+        r_stream: TcpStream,
+        read_buf: BytesMut,
+        codec: PostgresCodec,
+        rw_lock: Arc<RwLock<()>>,
+        lock: Option<RwLockReadGuard<'static, ()>>,
+    }
+
+    impl Framed {
+        pub fn new(s: TcpStream) -> Self {
+            let rw_lock = Arc::new(RwLock::new(()));
+            let lock = unsafe { std::mem::transmute(rw_lock.read().unwrap()) };
+            Framed {
+                r_stream: s,
+                read_buf: BytesMut::with_capacity(4096 * 8),
+                codec: PostgresCodec,
+                rw_lock,
+                lock: Some(lock),
+            }
+        }
+
+        pub fn inner_mut(&mut self) -> &mut TcpStream {
+            &mut self.r_stream
+        }
+
+        pub fn get_rw_lock(&self) -> Arc<RwLock<()>> {
+            self.rw_lock.clone()
+        }
+
+        pub fn next_msg(&mut self) -> io::Result<BackendMessage> {
+            loop {
+                if let Some(msg) = self.codec.decode(&mut self.read_buf)? {
+                    return Ok(msg);
+                }
+                // try to read more data from stream
+                // read the socket for reqs
+                if self.read_buf.remaining_mut() < 1024 {
+                    self.read_buf.reserve(4096 * 8);
+                }
+
+                let n = {
+                    let read_buf =
+                        unsafe { &mut *(self.read_buf.bytes_mut() as *mut _ as *mut [u8]) };
+                    drop(self.lock.take());
+                    let ret = self.r_stream.read(read_buf)?;
+                    let lock = unsafe { std::mem::transmute(self.rw_lock.read().unwrap()) };
+                    self.lock = Some(lock);
+                    ret
+                };
+                //connection was closed
+                if n == 0 {
+                    #[cold]
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+                }
+                unsafe { self.read_buf.advance_mut(n) };
+            }
         }
     }
-
-    pub fn inner_mut(&mut self) -> &mut S {
-        &mut self.r_stream
-    }
 }
 
-impl<S> Framed<S> {
-    pub fn get_rw_lock(&self) -> Arc<RwLock<()>> {
-        self.rw_lock.clone()
+#[cfg(unix_asd)]
+mod frame_codec {
+    use super::*;
+
+    pub struct Framed {
+        r_stream: TcpStream,
+        read_buf: BytesMut,
+        codec: PostgresCodec,
     }
-}
 
-impl<S: Read> Iterator for Framed<S> {
-    type Item = io::Result<BackendMessage>;
-
-    fn next(&mut self) -> Option<io::Result<BackendMessage>> {
-        loop {
-            let msg = self.codec.decode(&mut self.read_buf).transpose();
-            if msg.is_some() {
-                return msg;
+    impl Framed {
+        pub fn new(s: TcpStream) -> Self {
+            Framed {
+                r_stream: s,
+                read_buf: BytesMut::with_capacity(4096 * 8),
+                codec: PostgresCodec,
             }
+        }
 
-            // try to read more data from stream
-            // read the socket for reqs
-            if self.read_buf.remaining_mut() < 1024 {
-                self.read_buf.reserve(4096 * 8);
-            }
+        pub fn inner_mut(&mut self) -> &mut TcpStream {
+            &mut self.r_stream
+        }
 
-            let n = {
-                let read_buf = unsafe { &mut *(self.read_buf.bytes_mut() as *mut _ as *mut [u8]) };
-                drop(self.lock.take());
-                let ret = self.r_stream.read(read_buf);
-                let lock = unsafe { std::mem::transmute(self.rw_lock.read().unwrap()) };
-                self.lock = Some(lock);
-                match ret {
-                    Ok(n) => n,
-                    Err(e) => return Some(Err(e)),
+        pub fn next_msg(&mut self) -> io::Result<BackendMessage> {
+            loop {
+                if let Some(msg) = self.codec.decode(&mut self.read_buf)? {
+                    return Ok(msg);
                 }
-            };
-            //connection was closed
-            if n == 0 {
-                #[cold]
-                return None;
+                // try to read more data from stream
+                // read the socket for reqs
+                if self.read_buf.remaining_mut() < 1024 {
+                    self.read_buf.reserve(4096 * 8);
+                }
+
+                let read_buf = unsafe { &mut *(self.read_buf.bytes_mut() as *mut _ as *mut [u8]) };
+
+                let n = self.r_stream.read(read_buf)?;
+                //connection was closed
+                if n == 0 {
+                    #[cold]
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+                }
+                unsafe { self.read_buf.advance_mut(n) };
             }
-            unsafe { self.read_buf.advance_mut(n) };
         }
     }
 }

@@ -7,7 +7,6 @@ use fallible_iterator::FallibleIterator;
 use log::error;
 use may::coroutine::JoinHandle;
 use may::go;
-use may::net::TcpStream;
 use may::sync::{mpsc, RwLock, RwLockReadGuard};
 use may_queue::spsc;
 use postgres_protocol::message::backend::Message;
@@ -50,10 +49,7 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    pub(crate) fn new(
-        mut stream: Framed<TcpStream>,
-        mut parameters: HashMap<String, String>,
-    ) -> Connection {
+    pub(crate) fn new(mut stream: Framed, mut parameters: HashMap<String, String>) -> Connection {
         let writer = stream
             .inner_mut()
             .try_clone()
@@ -68,9 +64,8 @@ impl Connection {
                 let mut main = || -> Result<(), Error> {
                     const MAX_CACHE_SIZE: usize = 128;
                     let mut message_cache = Vec::with_capacity(MAX_CACHE_SIZE);
-                    #[allow(clippy::while_let_on_iterator)]
-                    while let Some(rsp) = stream.next() {
-                        match rsp.map_err(Error::io)? {
+                    loop {
+                        match stream.next_msg().map_err(Error::io)? {
                             BackendMessage::Async(Message::NoticeResponse(_body)) => {}
                             BackendMessage::Async(Message::NotificationResponse(_body)) => {}
                             BackendMessage::Async(Message::ParameterStatus(body)) => {
@@ -111,7 +106,6 @@ impl Connection {
                             }
                         }
                     }
-                    Ok(())
                 };
 
                 if let Err(e) = main() {

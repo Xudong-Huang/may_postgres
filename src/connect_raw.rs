@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 
 pub struct StartupStream {
-    inner: Framed<TcpStream>,
+    inner: Framed,
     buf: BackendMessages,
 }
 
@@ -25,24 +25,16 @@ impl StartupStream {
         encoder.encode(msg, &mut data)?;
         self.inner.inner_mut().write_all(&data)
     }
-}
 
-impl Iterator for StartupStream {
-    type Item = io::Result<Message>;
-
-    fn next(&mut self) -> Option<io::Result<Message>> {
+    fn next_msg(&mut self) -> io::Result<Message> {
         loop {
-            match self.buf.next() {
-                Ok(Some(message)) => return Some(Ok(message)),
-                Ok(None) => {}
-                Err(e) => return Some(Err(e)),
+            if let Some(message) = self.buf.next()? {
+                return Ok(message);
             }
 
-            match self.inner.next() {
-                Some(Ok(BackendMessage::Normal { messages, .. })) => self.buf = messages,
-                Some(Ok(BackendMessage::Async(message))) => return Some(Ok(message)),
-                Some(Err(e)) => return Some(Err(e)),
-                None => return None,
+            match self.inner.next_msg()? {
+                BackendMessage::Normal { messages, .. } => self.buf = messages,
+                BackendMessage::Async(message) => return Ok(message),
             }
         }
     }
@@ -88,9 +80,9 @@ fn startup(stream: &mut StartupStream, config: &Config) -> Result<(), Error> {
 }
 
 fn authenticate(stream: &mut StartupStream, config: &Config) -> Result<(), Error> {
-    match stream.next().transpose().map_err(Error::io)? {
-        Some(Message::AuthenticationOk) => return Ok(()),
-        Some(Message::AuthenticationCleartextPassword) => {
+    match stream.next_msg().map_err(Error::io)? {
+        Message::AuthenticationOk => return Ok(()),
+        Message::AuthenticationCleartextPassword => {
             let pass = config
                 .password
                 .as_ref()
@@ -98,7 +90,7 @@ fn authenticate(stream: &mut StartupStream, config: &Config) -> Result<(), Error
 
             authenticate_password(stream, pass)?;
         }
-        Some(Message::AuthenticationMd5Password(body)) => {
+        Message::AuthenticationMd5Password(body) => {
             let user = config
                 .user
                 .as_ref()
@@ -111,7 +103,7 @@ fn authenticate(stream: &mut StartupStream, config: &Config) -> Result<(), Error
             let output = authentication::md5_hash(user.as_bytes(), pass, body.salt());
             authenticate_password(stream, output.as_bytes())?;
         }
-        Some(Message::AuthenticationSasl(body)) => {
+        Message::AuthenticationSasl(body) => {
             let pass = config
                 .password
                 .as_ref()
@@ -119,24 +111,22 @@ fn authenticate(stream: &mut StartupStream, config: &Config) -> Result<(), Error
 
             authenticate_sasl(stream, body, pass)?;
         }
-        Some(Message::AuthenticationKerberosV5)
-        | Some(Message::AuthenticationScmCredential)
-        | Some(Message::AuthenticationGss)
-        | Some(Message::AuthenticationSspi) => {
+        Message::AuthenticationKerberosV5
+        | Message::AuthenticationScmCredential
+        | Message::AuthenticationGss
+        | Message::AuthenticationSspi => {
             return Err(Error::authentication(
                 "unsupported authentication method".into(),
             ))
         }
-        Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
-        Some(_) => return Err(Error::unexpected_message()),
-        None => return Err(Error::closed()),
+        Message::ErrorResponse(body) => return Err(Error::db(body)),
+        _ => return Err(Error::unexpected_message()),
     }
 
-    match stream.next().transpose().map_err(Error::io)? {
-        Some(Message::AuthenticationOk) => Ok(()),
-        Some(Message::ErrorResponse(body)) => Err(Error::db(body)),
-        Some(_) => Err(Error::unexpected_message()),
-        None => Err(Error::closed()),
+    match stream.next_msg().map_err(Error::io)? {
+        Message::AuthenticationOk => Ok(()),
+        Message::ErrorResponse(body) => Err(Error::db(body)),
+        _ => Err(Error::unexpected_message()),
     }
 }
 
@@ -179,11 +169,10 @@ fn authenticate_sasl(
         .send(FrontendMessage::Raw(buf.freeze()))
         .map_err(Error::io)?;
 
-    let body = match stream.next().transpose().map_err(Error::io)? {
-        Some(Message::AuthenticationSaslContinue(body)) => body,
-        Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
-        Some(_) => return Err(Error::unexpected_message()),
-        None => return Err(Error::closed()),
+    let body = match stream.next_msg().map_err(Error::io)? {
+        Message::AuthenticationSaslContinue(body) => body,
+        Message::ErrorResponse(body) => return Err(Error::db(body)),
+        _ => return Err(Error::unexpected_message()),
     };
 
     scram
@@ -196,11 +185,10 @@ fn authenticate_sasl(
         .send(FrontendMessage::Raw(buf.freeze()))
         .map_err(Error::io)?;
 
-    let body = match stream.next().transpose().map_err(Error::io)? {
-        Some(Message::AuthenticationSaslFinal(body)) => body,
-        Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
-        Some(_) => return Err(Error::unexpected_message()),
-        None => return Err(Error::closed()),
+    let body = match stream.next_msg().map_err(Error::io)? {
+        Message::AuthenticationSaslFinal(body) => body,
+        Message::ErrorResponse(body) => return Err(Error::db(body)),
+        _ => return Err(Error::unexpected_message()),
     };
 
     scram
@@ -216,22 +204,21 @@ fn read_info(stream: &mut StartupStream) -> Result<(i32, i32, HashMap<String, St
     let mut parameters = HashMap::new();
 
     loop {
-        match stream.next().transpose().map_err(Error::io)? {
-            Some(Message::BackendKeyData(body)) => {
+        match stream.next_msg().map_err(Error::io)? {
+            Message::BackendKeyData(body) => {
                 process_id = body.process_id();
                 secret_key = body.secret_key();
             }
-            Some(Message::ParameterStatus(body)) => {
+            Message::ParameterStatus(body) => {
                 parameters.insert(
                     body.name().map_err(Error::parse)?.to_string(),
                     body.value().map_err(Error::parse)?.to_string(),
                 );
             }
-            Some(Message::NoticeResponse(_)) => {}
-            Some(Message::ReadyForQuery(_)) => return Ok((process_id, secret_key, parameters)),
-            Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
-            Some(_) => return Err(Error::unexpected_message()),
-            None => return Err(Error::closed()),
+            Message::NoticeResponse(_) => {}
+            Message::ReadyForQuery(_) => return Ok((process_id, secret_key, parameters)),
+            Message::ErrorResponse(body) => return Err(Error::db(body)),
+            _ => return Err(Error::unexpected_message()),
         }
     }
 }
