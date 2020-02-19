@@ -138,7 +138,7 @@ mod frame_codec {
                 }
                 // try to read more data from stream
                 // read the socket for reqs
-                if self.read_buf.remaining_mut() < 1024 {
+                if self.read_buf.capacity() - self.read.len() < 1024 {
                     self.read_buf.reserve(4096 * 8);
                 }
 
@@ -181,6 +181,10 @@ mod frame_codec {
             }
         }
 
+        pub fn into_parts(self) -> (TcpStream, BytesMut, PostgresCodec) {
+            (self.r_stream, self.read_buf, self.codec)
+        }
+
         pub fn inner_mut(&mut self) -> &mut TcpStream {
             &mut self.r_stream
         }
@@ -192,8 +196,8 @@ mod frame_codec {
                 }
                 // try to read more data from stream
                 // read the socket for reqs
-                if self.read_buf.remaining_mut() < 1024 {
-                    self.read_buf.reserve(4096 * 8);
+                if self.read_buf.capacity() - self.read_buf.len() < 1024 * 1024 {
+                    self.read_buf.reserve(4096 * 8 * 1024);
                 }
 
                 let read_buf = unsafe { &mut *(self.read_buf.bytes_mut() as *mut _ as *mut [u8]) };

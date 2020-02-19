@@ -135,7 +135,7 @@ where
     pub fn finish(&mut self) -> Result<u64, Error> {
         // flush the remaining data
         let data: Box<dyn Buf + Send> = Box::new(self.buf.split().freeze());
-        if data.remaining() > 0 {
+        if !data.bytes().is_empty() {
             let data = CopyData::new(data).map_err(Error::encode)?;
             self.sender
                 .send(CopyInMessage::Message(FrontendMessage::CopyData(data)))

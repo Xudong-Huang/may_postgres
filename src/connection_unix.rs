@@ -2,7 +2,7 @@ use crate::codec::{BackendMessage, BackendMessages, Framed, FrontendMessage};
 use crate::copy_in::CopyInReceiver;
 // use crate::vec_buf::VecBufs;
 use crate::Error;
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
 use log::error;
 use may::coroutine::Coroutine;
@@ -13,7 +13,7 @@ use may_queue::{mpsc_list, spsc};
 use postgres_protocol::message::backend::Message;
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -46,7 +46,7 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    pub(crate) fn new(mut stream: Framed, mut parameters: HashMap<String, String>) -> Connection {
+    pub(crate) fn new(stream: Framed, mut parameters: HashMap<String, String>) -> Connection {
         let rsp_queue = spsc::Queue::<Response>::new();
         let req_queue = Arc::new(mpsc_list::Queue::<Request>::new());
         let is_running = Arc::new(AtomicBool::new(true));
@@ -54,77 +54,20 @@ impl Connection {
         let req_queue_c = req_queue.clone();
         let is_running_c = is_running.clone();
 
+        let (mut stream, mut read_buf, mut codec) = stream.into_parts();
+
         let bg_handle = go!(move || {
             let mut main = || -> Result<(), Error> {
-                // const MAX_CACHE_SIZE: usize = 128;
-                // let mut message_cache = Vec::with_capacity(MAX_CACHE_SIZE);
-                stream
-                    .inner_mut()
-                    .set_nonblocking(true)
-                    .map_err(Error::io)?;
-
+                const MAX_CACHE_SIZE: usize = 128;
+                let mut message_cache = Vec::with_capacity(MAX_CACHE_SIZE);
+                stream.set_nonblocking(true).unwrap();
+                stream.read(&mut []).ok();
                 let mut write_buf = BytesMut::with_capacity(1024 * 32);
                 loop {
                     // finish the running task
                     if !is_running_c.load(Ordering::Relaxed) {
                         #[cold]
                         return Ok(());
-                    }
-
-                    stream.inner_mut().reset_io();
-                    // deal with the read part
-                    loop {
-                        let msg = match stream.next_msg() {
-                            Ok(m) => m,
-                            Err(e) => {
-                                if e.kind() == io::ErrorKind::WouldBlock {
-                                    break;
-                                } else {
-                                    return Err(Error::io(e));
-                                }
-                            }
-                        };
-
-                        match msg {
-                            BackendMessage::Async(Message::NoticeResponse(_body)) => {}
-                            BackendMessage::Async(Message::NotificationResponse(_body)) => {}
-                            BackendMessage::Async(Message::ParameterStatus(body)) => {
-                                parameters.insert(
-                                    body.name().map_err(Error::parse)?.to_string(),
-                                    body.value().map_err(Error::parse)?.to_string(),
-                                );
-                            }
-                            BackendMessage::Async(_) => unreachable!(),
-                            BackendMessage::Normal {
-                                mut messages,
-                                request_complete,
-                            } => {
-                                let response = match unsafe { rsp_queue.peek() } {
-                                    Some(response) => response,
-                                    None => match messages.next().map_err(Error::parse)? {
-                                        Some(Message::ErrorResponse(error)) => {
-                                            return Err(Error::db(error))
-                                        }
-                                        _ => return Err(Error::unexpected_message()),
-                                    },
-                                };
-
-                                // message_cache.push(messages);
-                                // if message_cache.len() >= MAX_CACHE_SIZE {
-                                //    for msg in message_cache.drain(..) {
-                                //        response.tx.send(msg).ok();
-                                //    }
-                                //}
-                                response.tx.send(messages).ok();
-
-                                if request_complete {
-                                    // for msg in message_cache.drain(..) {
-                                    //     response.tx.send(msg).ok();
-                                    // }
-                                    rsp_queue.pop();
-                                }
-                            }
-                        }
                     }
 
                     if write_buf.capacity() - write_buf.len() < 1024 {
@@ -161,12 +104,86 @@ impl Connection {
                             },
                         }
                     }
+
+                    // deal with the read part
+                    loop {
+                        // try to read more data from stream
+                        // read the socket for reqs
+                        if read_buf.capacity() - read_buf.len() < 1024 * 1024 {
+                            read_buf.reserve(4096 * 8 * 1024);
+                        }
+
+                        let n = {
+                            let buf =
+                                unsafe { &mut *(read_buf.bytes_mut() as *mut _ as *mut [u8]) };
+                            match stream.raw_read(buf) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    if e.kind() == io::ErrorKind::WouldBlock {
+                                        break;
+                                    }
+                                    return Err(Error::io(e));
+                                }
+                            }
+                        };
+                        //connection was closed
+                        if n == 0 {
+                            #[cold]
+                            return Err(Error::closed());
+                        }
+                        unsafe { read_buf.advance_mut(n) };
+                    }
+
+                    // decode all the messages
+                    while let Some(msg) = codec.decode(&mut read_buf).map_err(Error::io)? {
+                        match msg {
+                            BackendMessage::Async(Message::NoticeResponse(_body)) => {}
+                            BackendMessage::Async(Message::NotificationResponse(_body)) => {}
+                            BackendMessage::Async(Message::ParameterStatus(body)) => {
+                                parameters.insert(
+                                    body.name().map_err(Error::parse)?.to_string(),
+                                    body.value().map_err(Error::parse)?.to_string(),
+                                );
+                            }
+                            BackendMessage::Async(_) => unreachable!(),
+                            BackendMessage::Normal {
+                                mut messages,
+                                request_complete,
+                            } => {
+                                let response = match unsafe { rsp_queue.peek() } {
+                                    Some(response) => response,
+                                    None => match messages.next().map_err(Error::parse)? {
+                                        Some(Message::ErrorResponse(error)) => {
+                                            return Err(Error::db(error))
+                                        }
+                                        _ => return Err(Error::unexpected_message()),
+                                    },
+                                };
+
+                                message_cache.push(messages);
+                                if message_cache.len() >= MAX_CACHE_SIZE {
+                                    for msg in message_cache.drain(..) {
+                                        response.tx.send(msg).ok();
+                                    }
+                                }
+                                // response.tx.send(messages).ok();
+
+                                if request_complete {
+                                    for msg in message_cache.drain(..) {
+                                        response.tx.send(msg).ok();
+                                    }
+                                    rsp_queue.pop();
+                                }
+                            }
+                        }
+                    }
+
                     // send all the data
                     if !write_buf.is_empty() {
                         let len = write_buf.len();
                         let mut written = 0;
                         while written < len {
-                            match stream.inner_mut().write(&write_buf[written..]) {
+                            match stream.raw_write(&write_buf[written..]) {
                                 Ok(n) => {
                                     if n == 0 {
                                         return Ok(());
@@ -190,14 +207,14 @@ impl Connection {
                         }
                     }
 
-                    stream.inner_mut().wait_io();
+                    stream.wait_io();
                 }
             };
 
             if let Err(e) = main() {
                 error!("back ground client closed. err={}", e);
             }
-            stream.inner_mut().shutdown(std::net::Shutdown::Both).ok();
+            stream.shutdown(std::net::Shutdown::Both).ok();
         });
 
         Connection {
