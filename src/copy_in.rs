@@ -27,6 +27,7 @@ impl CopyInReceiver {
         }
     }
 
+    #[cfg(not(unix))]
     pub fn try_recv(&mut self) -> Result<Option<FrontendMessage>, ()> {
         use std::sync::mpsc::TryRecvError;
         if self.done {

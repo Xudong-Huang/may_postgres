@@ -97,11 +97,11 @@ pub mod config;
 mod connect;
 mod connect_raw;
 mod connect_socket;
-// #[cfg(not(unix))]
+#[cfg(not(unix))]
 mod connection;
-// #[cfg(unix)]
-// #[path = "connection_unix.rs"]
-// mod connection;
+#[cfg(unix)]
+#[path = "connection_unix.rs"]
+mod connection;
 mod copy_in;
 mod copy_out;
 pub mod error;
@@ -116,6 +116,7 @@ mod to_statement;
 mod transaction;
 mod transaction_builder;
 pub mod types;
+#[cfg(not(unix))]
 mod vec_buf;
 
 /// A convenience function which parses a connection string and connects to the database.

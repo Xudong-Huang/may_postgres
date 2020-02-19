@@ -96,7 +96,7 @@ impl PostgresCodec {
     }
 }
 
-// #[cfg(not(unix))]
+#[cfg(not(unix))]
 mod frame_codec {
     use super::*;
     use may::sync::{RwLock, RwLockReadGuard};
@@ -162,7 +162,7 @@ mod frame_codec {
     }
 }
 
-#[cfg(unix_asd)]
+#[cfg(unix)]
 mod frame_codec {
     use super::*;
 
