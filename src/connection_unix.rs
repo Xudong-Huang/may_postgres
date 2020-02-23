@@ -9,7 +9,7 @@ use may::coroutine::Coroutine;
 use may::go;
 use may::io::WaitIo;
 use may::sync::mpsc;
-use may_queue::{mpsc_list, spsc};
+use may_queue::{mpmc_bounded, spsc};
 use postgres_protocol::message::backend::Message;
 
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ pub struct Response {
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
     bg_co: Coroutine,
-    req_queue: Arc<mpsc_list::Queue<Request>>,
+    req_queue: Arc<mpmc_bounded::Queue<Request>>,
     is_running: Arc<AtomicBool>,
 }
 
@@ -48,7 +48,7 @@ impl Drop for Connection {
 impl Connection {
     pub(crate) fn new(stream: Framed, mut parameters: HashMap<String, String>) -> Connection {
         let rsp_queue = spsc::Queue::<Response>::new();
-        let req_queue = Arc::new(mpsc_list::Queue::<Request>::new());
+        let req_queue = Arc::new(mpmc_bounded::Queue::<Request>::with_capacity(10000));
         let is_running = Arc::new(AtomicBool::new(true));
 
         let req_queue_c = req_queue.clone();
@@ -70,8 +70,8 @@ impl Connection {
                         return Ok(());
                     }
 
-                    if write_buf.capacity() - write_buf.len() < 1024 {
-                        write_buf.reserve(1024 * 32);
+                    if write_buf.capacity() - write_buf.len() < 1024 * 1024 {
+                        write_buf.reserve(1024 * 1024 * 32);
                     }
 
                     // collect all the data
@@ -226,7 +226,11 @@ impl Connection {
 
     /// send a request to the connection
     pub fn send(&self, req: Request) -> io::Result<()> {
-        self.req_queue.push(req);
+        let mut r = req;
+        while let Err(req) = self.req_queue.push(r) {
+            r = req;
+            may::coroutine::yield_now();
+        }
         // signal the back ground processing about the data
         unsafe { self.bg_co.cancel() };
         Ok(())
