@@ -219,7 +219,11 @@ impl Connection {
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "send req failed"))
     }
 
-    pub fn read_lock(&self) -> RwLockReadGuard<'_, ()> {
-        self.rw_lock.read().unwrap()
+    // pub fn read_lock(&self) -> RwLockReadGuard<'_, ()> {
+    //     self.rw_lock.read().unwrap()
+    // }
+
+    pub fn read_lock(&self) -> usize {
+        0
     }
 }
