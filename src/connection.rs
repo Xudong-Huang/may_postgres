@@ -7,7 +7,7 @@ use fallible_iterator::FallibleIterator;
 use log::error;
 use may::coroutine::JoinHandle;
 use may::go;
-use may::sync::{mpsc, RwLock, RwLockReadGuard};
+use may::sync::{mpsc, spsc as spsc_channel, RwLock, RwLockReadGuard};
 use may_queue::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -22,11 +22,11 @@ pub enum RequestMessages {
 
 pub struct Request {
     pub messages: RequestMessages,
-    pub sender: mpsc::Sender<BackendMessages>,
+    pub sender: spsc_channel::Sender<BackendMessages>,
 }
 
 pub struct Response {
-    tx: mpsc::Sender<BackendMessages>,
+    tx: spsc_channel::Sender<BackendMessages>,
 }
 
 /// A connection to a PostgreSQL database.
@@ -112,7 +112,7 @@ impl Connection {
                     error!("receiver closed. err={}", e);
                     let mut request = BytesMut::new();
                     frontend::terminate(&mut request);
-                    let (tx, _rx) = mpsc::channel();
+                    let (tx, _rx) = spsc_channel::channel();
                     let req = Request {
                         messages: RequestMessages::Single(FrontendMessage::Raw(request.freeze())),
                         sender: tx,

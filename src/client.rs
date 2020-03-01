@@ -12,14 +12,14 @@ use crate::{
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may::sync::{mpsc, Mutex};
+use may::sync::{spsc, Mutex};
 use postgres_protocol::message::backend::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub struct Responses {
-    receiver: mpsc::Receiver<BackendMessages>,
+    receiver: spsc::Receiver<BackendMessages>,
     cur: BackendMessages,
 }
 
@@ -55,7 +55,7 @@ pub struct InnerClient {
 
 impl InnerClient {
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = spsc::channel();
         let request = Request { messages, sender };
         self.sender.send(request).map_err(|_| Error::closed())?;
 
