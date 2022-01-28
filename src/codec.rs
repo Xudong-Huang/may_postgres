@@ -153,7 +153,6 @@ mod frame_codec {
                 };
                 //connection was closed
                 if n == 0 {
-                    #[cold]
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
                 }
                 unsafe { self.read_buf.advance_mut(n) };

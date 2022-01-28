@@ -165,7 +165,7 @@ impl<'a> Transaction<'a> {
         I: IntoIterator<Item = &'b dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
     {
-        let statement = statement.__convert().into_statement(&self.client)?;
+        let statement = statement.__convert().into_statement(self.client)?;
         bind::bind(self.client.inner(), statement, params)
     }
 

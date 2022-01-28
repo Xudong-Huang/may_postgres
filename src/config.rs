@@ -25,8 +25,6 @@ pub enum TargetSessionAttrs {
     Any,
     /// The session must allow writes.
     ReadWrite,
-    #[doc(hidden)]
-    __NonExhaustive,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -265,19 +263,19 @@ impl Config {
     fn param(&mut self, key: &str, value: &str) -> Result<(), Error> {
         match key {
             "user" => {
-                self.user(&value);
+                self.user(value);
             }
             "password" => {
                 self.password(value);
             }
             "dbname" => {
-                self.dbname(&value);
+                self.dbname(value);
             }
             "options" => {
-                self.options(&value);
+                self.options(value);
             }
             "application_name" => {
-                self.application_name(&value);
+                self.application_name(value);
             }
             "host" => {
                 for host in value.split(',') {
@@ -600,8 +598,8 @@ impl<'a> UrlParser<'a> {
 
     fn remove_url_prefix(s: &str) -> Option<&str> {
         for prefix in &["postgres://", "postgresql://"] {
-            if s.starts_with(prefix) {
-                return Some(&s[prefix.len()..]);
+            if let Some(stripped) = s.strip_prefix(prefix) {
+                return Some(stripped);
             }
         }
 
@@ -620,7 +618,7 @@ impl<'a> UrlParser<'a> {
     }
 
     fn take_all(&mut self) -> &'a str {
-        mem::replace(&mut self.s, "")
+        mem::take(&mut self.s)
     }
 
     fn eat_byte(&mut self) {
@@ -665,8 +663,8 @@ impl<'a> UrlParser<'a> {
 
                 let host = &chunk[1..idx];
                 let remaining = &chunk[idx + 1..];
-                let port = if remaining.starts_with(':') {
-                    Some(&remaining[1..])
+                let port = if let Some(stripped) = remaining.strip_prefix(':') {
+                    Some(stripped)
                 } else if remaining.is_empty() {
                     None
                 } else {
