@@ -116,7 +116,6 @@ mod to_statement;
 mod transaction;
 mod transaction_builder;
 pub mod types;
-mod vec_buf;
 
 /// A convenience function which parses a connection string and connects to the database.
 ///

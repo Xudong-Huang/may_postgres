@@ -1,3 +1,4 @@
+use bytes::Buf;
 use bytes::BufMut;
 use bytes::BytesMut;
 use crossbeam::queue::SegQueue;
@@ -13,10 +14,10 @@ use postgres_protocol::message::frontend;
 
 use crate::codec::{BackendMessage, BackendMessages, FrontendMessage};
 use crate::copy_in::CopyInReceiver;
-use crate::vec_buf::VecBufs;
 use crate::Error;
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::io::{self, Read};
 use std::sync::Arc;
 
@@ -133,24 +134,61 @@ fn decode_messages(
     Ok(())
 }
 
+fn nonblock_write(stream: &mut TcpStream, write_buf: &mut BytesMut) -> io::Result<()> {
+    let len = write_buf.len();
+    let mut written = 0;
+    while written < len {
+        match stream.write(&write_buf[written..]) {
+            Ok(n) => {
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+                } else {
+                    written += n;
+                }
+            }
+            Err(err) => {
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                } else if err.kind() == io::ErrorKind::ConnectionReset
+                    || err.kind() == io::ErrorKind::UnexpectedEof
+                {
+                    // info!("http server read req: connection closed");
+                    return Err(err);
+                }
+                return Err(err);
+            }
+        }
+    }
+    if written == len {
+        unsafe { write_buf.set_len(0) }
+    } else if written > 0 {
+        write_buf.advance(written);
+    }
+
+    Ok(())
+}
+
 fn process_write(
     stream: &mut TcpStream,
     req_queue: &SegQueue<Request>,
     rsp_queue: &SegQueue<Response>,
-    write_buf: &mut VecBufs,
+    write_buf: &mut BytesMut,
 ) -> std::io::Result<()> {
-    let mut request = req_queue.pop();
     loop {
-        match request {
+        let remaining = write_buf.capacity() - write_buf.len();
+        if remaining < 512 {
+            write_buf.reserve(4096 * 8 - remaining);
+        }
+        match req_queue.pop() {
             Some(req) => {
                 rsp_queue.push(Response { tx: req.sender });
                 match req.messages {
                     RequestMessages::Single(msg) => match msg {
-                        FrontendMessage::Raw(buf) => write_buf.write_bytes(buf, stream)?,
+                        FrontendMessage::Raw(buf) => write_buf.extend_from_slice(buf.bytes()),
                         FrontendMessage::CopyData(data) => {
                             let mut buf = BytesMut::new();
                             data.write(&mut buf);
-                            write_buf.write_bytes(buf.freeze(), stream)?;
+                            write_buf.extend_from_slice(buf.freeze().bytes())
                         }
                     },
                     RequestMessages::CopyIn(mut rcv) => {
@@ -160,18 +198,18 @@ fn process_write(
                                 Ok(Some(msg)) => {
                                     match msg {
                                         FrontendMessage::Raw(buf) => {
-                                            write_buf.write_bytes(buf, stream)?
+                                            write_buf.extend_from_slice(buf.bytes())
                                         }
                                         FrontendMessage::CopyData(data) => {
                                             let mut buf = BytesMut::new();
                                             data.write(&mut buf);
-                                            write_buf.write_bytes(buf.freeze(), stream)?;
+                                            write_buf.extend_from_slice(buf.freeze().bytes())
                                         }
                                     }
                                     copy_in_msg = rcv.try_recv();
                                 }
                                 Ok(None) => {
-                                    write_buf.flush(stream)?;
+                                    nonblock_write(stream, write_buf)?;
 
                                     // no data found we just write all the data and wait
                                     copy_in_msg = rcv.recv();
@@ -181,11 +219,19 @@ fn process_write(
                         }
                     }
                 }
-                request = req_queue.pop();
             }
             None => {
-                write_buf.flush(stream)?;
-                break;
+                // wait for enough time before flush the data
+                may::coroutine::yield_now();
+                if !req_queue.is_empty() {
+                    continue;
+                }
+
+                nonblock_write(stream, write_buf)?;
+                // still no new req found
+                if req_queue.is_empty() {
+                    break;
+                }
             }
         }
     }
@@ -206,7 +252,8 @@ impl Connection {
             let mut read_buf = BytesMut::with_capacity(4096 * 8);
             let rsp_queue = SegQueue::new();
             let mut first_rsp = None;
-            let mut write_buf = VecBufs::new();
+            // let mut write_buf = VecBufs::new();
+            let mut write_buf = BytesMut::with_capacity(4096 * 8);
 
             let mut is_error = false;
 
