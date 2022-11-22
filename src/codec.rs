@@ -99,27 +99,19 @@ impl PostgresCodec {
 // #[cfg(not(unix))]
 mod frame_codec {
     use super::*;
-    use may::sync::{RwLock, RwLockReadGuard};
-    use std::sync::Arc;
 
     pub struct Framed {
         r_stream: TcpStream,
         read_buf: BytesMut,
         codec: PostgresCodec,
-        rw_lock: Arc<RwLock<()>>,
-        lock: Option<RwLockReadGuard<'static, ()>>,
     }
 
     impl Framed {
         pub fn new(s: TcpStream) -> Self {
-            let rw_lock = Arc::new(RwLock::new(()));
-            let lock = unsafe { std::mem::transmute(rw_lock.read().unwrap()) };
             Framed {
                 r_stream: s,
                 read_buf: BytesMut::with_capacity(4096 * 8),
                 codec: PostgresCodec,
-                rw_lock,
-                lock: Some(lock),
             }
         }
 
@@ -127,8 +119,8 @@ mod frame_codec {
             &mut self.r_stream
         }
 
-        pub fn get_rw_lock(&self) -> Arc<RwLock<()>> {
-            self.rw_lock.clone()
+        pub fn into_stream(self) -> TcpStream {
+            self.r_stream
         }
 
         pub fn next_msg(&mut self) -> io::Result<BackendMessage> {
@@ -145,11 +137,7 @@ mod frame_codec {
                 let n = {
                     let read_buf =
                         unsafe { &mut *(self.read_buf.bytes_mut() as *mut _ as *mut [u8]) };
-                    drop(self.lock.take());
-                    let ret = self.r_stream.read(read_buf)?;
-                    let lock = unsafe { std::mem::transmute(self.rw_lock.read().unwrap()) };
-                    self.lock = Some(lock);
-                    ret
+                    self.r_stream.read(read_buf)?
                 };
                 //connection was closed
                 if n == 0 {

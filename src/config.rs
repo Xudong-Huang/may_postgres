@@ -316,7 +316,7 @@ impl Config {
                 }
             }
             "target_session_attrs" => {
-                let target_session_attrs = match &*value {
+                let target_session_attrs = match value {
                     "any" => TargetSessionAttrs::Any,
                     "read-write" => TargetSessionAttrs::ReadWrite,
                     _ => {
@@ -738,7 +738,7 @@ impl<'a> UrlParser<'a> {
     #[cfg(unix)]
     fn host_param(&mut self, s: &str) -> Result<(), Error> {
         let decoded = Cow::from(percent_encoding::percent_decode(s.as_bytes()));
-        if decoded.get(0) == Some(&b'/') {
+        if decoded.first() == Some(&b'/') {
             self.config.host_path(OsStr::from_bytes(&decoded));
         } else {
             let decoded = str::from_utf8(&decoded).map_err(|e| Error::config_parse(Box::new(e)))?;

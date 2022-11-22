@@ -19,7 +19,7 @@ pub fn connect(config: &Config) -> Result<Client, Error> {
         let port = *config
             .port
             .get(i)
-            .or_else(|| config.port.get(0))
+            .or_else(|| config.port.first())
             .unwrap_or(&5432);
 
         // let hostname = match host {

@@ -1,18 +1,23 @@
-use crate::codec::{BackendMessage, BackendMessages, Framed, FrontendMessage};
-use crate::copy_in::CopyInReceiver;
-use crate::vec_buf::VecBufs;
-use crate::Error;
+use bytes::BufMut;
 use bytes::BytesMut;
+use crossbeam::queue::SegQueue;
 use fallible_iterator::FallibleIterator;
 use log::error;
 use may::coroutine::JoinHandle;
 use may::go;
-use may::sync::{mpsc, RwLock, RwLockReadGuard};
-use may_queue::spsc;
+use may::io::{WaitIo, WaitIoWaker};
+use may::net::TcpStream;
+use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
+
+use crate::codec::{BackendMessage, BackendMessages, FrontendMessage};
+use crate::copy_in::CopyInReceiver;
+use crate::vec_buf::VecBufs;
+use crate::Error;
+
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read};
 use std::sync::Arc;
 
 pub enum RequestMessages {
@@ -31,84 +36,184 @@ pub struct Response {
 
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
-    rx_handle: JoinHandle<()>,
-    tx_handle: JoinHandle<()>,
-    req_tx: mpsc::Sender<Request>,
-    rw_lock: Arc<RwLock<()>>,
+    io_handle: JoinHandle<()>,
+    req_queue: Arc<SegQueue<Request>>,
+    waker: WaitIoWaker,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let rx = self.rx_handle.coroutine();
-        let tx = self.tx_handle.coroutine();
+        let rx = self.io_handle.coroutine();
         unsafe {
             rx.cancel();
-            tx.cancel();
         }
     }
 }
 
-impl Connection {
-    pub(crate) fn new(mut stream: Framed, mut parameters: HashMap<String, String>) -> Connection {
-        let writer = stream
-            .inner_mut()
-            .try_clone()
-            .expect("failed to clone stream for wirter");
-        let rw_lock = stream.get_rw_lock();
-        let rsp_queue = Arc::new(spsc::Queue::new());
-        let (req_tx, req_rx) = mpsc::channel();
-        let rx_handle = {
-            let rsp_queue: Arc<spsc::Queue<Response>> = rsp_queue.clone();
-            let req_tx = req_tx.clone();
-            go!(move || {
-                let mut main = || -> Result<(), Error> {
-                    const MAX_CACHE_SIZE: usize = 128;
-                    let mut message_cache = Vec::with_capacity(MAX_CACHE_SIZE);
-                    loop {
-                        match stream.next_msg().map_err(Error::io)? {
-                            BackendMessage::Async(Message::NoticeResponse(_body)) => {}
-                            BackendMessage::Async(Message::NotificationResponse(_body)) => {}
-                            BackendMessage::Async(Message::ParameterStatus(body)) => {
-                                parameters.insert(
-                                    body.name().map_err(Error::parse)?.to_string(),
-                                    body.value().map_err(Error::parse)?.to_string(),
-                                );
-                            }
-                            BackendMessage::Async(_) => unreachable!(),
-                            BackendMessage::Normal {
-                                mut messages,
-                                request_complete,
-                            } => {
-                                let response = match unsafe { rsp_queue.peek() } {
-                                    Some(response) => response,
-                                    None => match messages.next().map_err(Error::parse)? {
-                                        Some(Message::ErrorResponse(error)) => {
-                                            return Err(Error::db(error))
+fn process_read(stream: &mut TcpStream, read_buf: &mut BytesMut) -> std::io::Result<()> {
+    // read the socket until no data
+    loop {
+        let remaining = read_buf.capacity() - read_buf.len();
+        if remaining < 512 {
+            read_buf.reserve(4096 * 8 - remaining);
+        }
+
+        let buf = unsafe { &mut *(read_buf.bytes_mut() as *mut _ as *mut [u8]) };
+        match stream.read(buf) {
+            Ok(n) => {
+                if n == 0 {
+                    //connection was closed
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+                } else {
+                    unsafe { read_buf.advance_mut(n) };
+                }
+            }
+            Err(err) => {
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                } else if err.kind() == io::ErrorKind::ConnectionReset
+                    || err.kind() == io::ErrorKind::UnexpectedEof
+                {
+                    // info!("http server read req: connection closed");
+                    return Err(err);
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_messages(
+    read_buf: &mut BytesMut,
+    rsp_queue: &SegQueue<Response>,
+    first_rsp: &mut Option<Response>,
+    parameters: &mut HashMap<String, String>,
+) -> Result<(), Error> {
+    use crate::codec::PostgresCodec;
+
+    // parse the messages
+    while let Some(msg) = PostgresCodec.decode(read_buf).map_err(Error::io)? {
+        match msg {
+            BackendMessage::Async(Message::NoticeResponse(_body)) => {}
+            BackendMessage::Async(Message::NotificationResponse(_body)) => {}
+            BackendMessage::Async(Message::ParameterStatus(body)) => {
+                parameters.insert(
+                    body.name().map_err(Error::parse)?.to_string(),
+                    body.value().map_err(Error::parse)?.to_string(),
+                );
+            }
+            BackendMessage::Async(_) => unreachable!(),
+            BackendMessage::Normal {
+                mut messages,
+                request_complete,
+            } => {
+                let response = match first_rsp {
+                    Some(response) => response,
+                    None => match rsp_queue.pop() {
+                        Some(response) => {
+                            first_rsp.replace(response);
+                            first_rsp.as_mut().unwrap()
+                        }
+                        None => match messages.next().map_err(Error::parse)? {
+                            Some(Message::ErrorResponse(error)) => return Err(Error::db(error)),
+                            _ => return Err(Error::unexpected_message()),
+                        },
+                    },
+                };
+
+                response.tx.send(messages).ok();
+
+                if request_complete {
+                    first_rsp.take();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn process_write(
+    stream: &mut TcpStream,
+    req_queue: &SegQueue<Request>,
+    rsp_queue: &SegQueue<Response>,
+    write_buf: &mut VecBufs,
+) -> std::io::Result<()> {
+    let mut request = req_queue.pop();
+    loop {
+        match request {
+            Some(req) => {
+                rsp_queue.push(Response { tx: req.sender });
+                match req.messages {
+                    RequestMessages::Single(msg) => match msg {
+                        FrontendMessage::Raw(buf) => write_buf.write_bytes(buf, stream)?,
+                        FrontendMessage::CopyData(data) => {
+                            let mut buf = BytesMut::new();
+                            data.write(&mut buf);
+                            write_buf.write_bytes(buf.freeze(), stream)?;
+                        }
+                    },
+                    RequestMessages::CopyIn(mut rcv) => {
+                        let mut copy_in_msg = rcv.try_recv();
+                        loop {
+                            match copy_in_msg {
+                                Ok(Some(msg)) => {
+                                    match msg {
+                                        FrontendMessage::Raw(buf) => {
+                                            write_buf.write_bytes(buf, stream)?
                                         }
-                                        _ => return Err(Error::unexpected_message()),
-                                    },
-                                };
-
-                                message_cache.push(messages);
-
-                                if message_cache.len() >= MAX_CACHE_SIZE {
-                                    for msg in message_cache.drain(..) {
-                                        response.tx.send(msg).ok();
+                                        FrontendMessage::CopyData(data) => {
+                                            let mut buf = BytesMut::new();
+                                            data.write(&mut buf);
+                                            write_buf.write_bytes(buf.freeze(), stream)?;
+                                        }
                                     }
+                                    copy_in_msg = rcv.try_recv();
                                 }
+                                Ok(None) => {
+                                    write_buf.flush(stream)?;
 
-                                if request_complete {
-                                    for msg in message_cache.drain(..) {
-                                        response.tx.send(msg).ok();
-                                    }
-                                    rsp_queue.pop();
+                                    // no data found we just write all the data and wait
+                                    copy_in_msg = rcv.recv();
                                 }
+                                Err(_) => break,
                             }
                         }
                     }
-                };
+                }
+                request = req_queue.pop();
+            }
+            None => {
+                write_buf.flush(stream)?;
+                break;
+            }
+        }
+    }
 
-                if let Err(e) = main() {
+    Ok(())
+}
+
+impl Connection {
+    pub(crate) fn new(
+        mut stream: TcpStream,
+        mut parameters: HashMap<String, String>,
+    ) -> Connection {
+        let waker = stream.waker();
+
+        let req_queue = Arc::new(SegQueue::new());
+        let req_queue_dup = req_queue.clone();
+        let io_handle = go!(move || {
+            let mut read_buf = BytesMut::with_capacity(4096 * 8);
+            let rsp_queue = SegQueue::new();
+            let mut first_rsp = None;
+            let mut write_buf = VecBufs::new();
+
+            let mut is_error = false;
+
+            stream.set_nonblocking(true).unwrap();
+            loop {
+                stream.reset_io();
+                if let Err(e) = process_read(&mut stream, &mut read_buf) {
                     error!("receiver closed. err={}", e);
                     let mut request = BytesMut::new();
                     frontend::terminate(&mut request);
@@ -117,109 +222,51 @@ impl Connection {
                         messages: RequestMessages::Single(FrontendMessage::Raw(request.freeze())),
                         sender: tx,
                     };
-                    req_tx.send(req).ok();
+                    req_queue_dup.push(req);
+                    is_error = true;
                 }
-                stream.inner_mut().shutdown(std::net::Shutdown::Both).ok();
-            })
-        };
 
-        let rw_lock_1 = rw_lock.clone();
-
-        let tx_handle = go!(move || {
-            let mut writer = VecBufs::new(writer);
-            let mut main = || -> Result<(), io::Error> {
-                use std::sync::mpsc::TryRecvError;
-                let mut request = req_rx.try_recv();
-                loop {
-                    match request {
-                        Ok(req) => {
-                            rsp_queue.push(Response { tx: req.sender });
-                            match req.messages {
-                                RequestMessages::Single(msg) => match msg {
-                                    FrontendMessage::Raw(buf) => writer.write_bytes(buf)?,
-                                    FrontendMessage::CopyData(data) => {
-                                        let mut buf = BytesMut::new();
-                                        data.write(&mut buf);
-                                        writer.write_bytes(buf.freeze())?;
-                                    }
-                                },
-                                RequestMessages::CopyIn(mut rcv) => {
-                                    let mut copy_in_msg = rcv.try_recv();
-                                    loop {
-                                        match copy_in_msg {
-                                            Ok(Some(msg)) => {
-                                                match msg {
-                                                    FrontendMessage::Raw(buf) => {
-                                                        writer.write_bytes(buf)?
-                                                    }
-                                                    FrontendMessage::CopyData(data) => {
-                                                        let mut buf = BytesMut::new();
-                                                        data.write(&mut buf);
-                                                        writer.write_bytes(buf.freeze())?;
-                                                    }
-                                                }
-                                                copy_in_msg = rcv.try_recv();
-                                            }
-                                            Ok(None) => {
-                                                writer.flush()?;
-
-                                                // no data found we just write all the data and wait
-                                                copy_in_msg = rcv.recv();
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                }
-                            }
-                            request = req_rx.try_recv();
-                        }
-                        Err(TryRecvError::Empty) => {
-                            let _g = rw_lock_1.write().unwrap();
-                            may::coroutine::yield_now();
-                            request = req_rx.try_recv();
-                            match &request {
-                                Err(TryRecvError::Empty) => {}
-                                _ => continue,
-                            }
-
-                            drop(_g);
-                            writer.flush()?;
-
-                            request = req_rx.recv().map_err(|_| TryRecvError::Empty);
-                            may::coroutine::yield_now();
-                        }
-                        Err(_) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                "request queue closed",
-                            ));
-                        }
-                    }
+                if let Err(e) =
+                    decode_messages(&mut read_buf, &rsp_queue, &mut first_rsp, &mut parameters)
+                {
+                    error!("decode_messages err={}", e);
+                    let mut request = BytesMut::new();
+                    frontend::terminate(&mut request);
+                    let (tx, _rx) = mpsc::channel();
+                    let req = Request {
+                        messages: RequestMessages::Single(FrontendMessage::Raw(request.freeze())),
+                        sender: tx,
+                    };
+                    req_queue_dup.push(req);
+                    is_error = true;
                 }
-            };
 
-            if let Err(e) = main() {
-                error!("writer closed. err={}", e);
+                if let Err(e) =
+                    process_write(&mut stream, &req_queue_dup, &rsp_queue, &mut write_buf)
+                {
+                    error!("writer closed. err={}", e);
+                    break;
+                }
+
+                if is_error {
+                    break;
+                }
+                stream.wait_io();
             }
-            writer.inner_mut().shutdown(std::net::Shutdown::Both).ok();
+
+            stream.shutdown(std::net::Shutdown::Both).ok();
         });
 
         Connection {
-            rx_handle,
-            tx_handle,
-            req_tx,
-            rw_lock,
+            io_handle,
+            req_queue,
+            waker,
         }
     }
 
     /// send a request to the connection
-    pub fn send(&self, req: Request) -> io::Result<()> {
-        self.req_tx
-            .send(req)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "send req failed"))
-    }
-
-    pub fn read_lock(&self) -> RwLockReadGuard<'_, ()> {
-        self.rw_lock.read().unwrap()
+    pub fn send(&self, req: Request) {
+        self.req_queue.push(req);
+        self.waker.wakeup();
     }
 }

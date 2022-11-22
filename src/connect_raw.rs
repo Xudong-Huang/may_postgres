@@ -50,7 +50,7 @@ pub fn connect_raw(stream: TcpStream, config: &Config) -> Result<Client, Error> 
     authenticate(&mut stream, config)?;
     let (process_id, secret_key, parameters) = read_info(&mut stream)?;
 
-    let connection = Connection::new(stream.inner, parameters);
+    let connection = Connection::new(stream.inner.into_stream(), parameters);
     let client = Client::new(connection, process_id, secret_key);
 
     Ok(client)

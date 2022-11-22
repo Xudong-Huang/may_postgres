@@ -57,7 +57,7 @@ impl InnerClient {
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
         let (sender, receiver) = mpsc::channel();
         let request = Request { messages, sender };
-        self.sender.send(request).map_err(|_| Error::closed())?;
+        self.sender.send(request);
 
         Ok(Responses {
             receiver,
@@ -279,7 +279,6 @@ impl Client {
         I::IntoIter: ExactSizeIterator,
     {
         let statement = statement.__convert().into_statement(self)?;
-        let _g = self.inner.sender.read_lock();
         query::query(&self.inner, statement, params)
     }
 
@@ -378,7 +377,6 @@ impl Client {
     }
 
     pub(crate) fn simple_query_raw(&self, query: &str) -> Result<SimpleQueryStream, Error> {
-        let _g = self.inner.sender.read_lock();
         simple_query::simple_query(self.inner(), query)
     }
 

@@ -1,36 +1,26 @@
 use bytes::Bytes;
 use std::io::{IoSlice, Write};
-use std::mem::MaybeUninit;
 
 const MAX_VEC_BUF: usize = 128;
 
-pub struct VecBufs<W> {
+pub struct VecBufs {
     block: usize,
     pos: usize,
     bufs: Vec<Bytes>,
     io_slice: [IoSlice<'static>; MAX_VEC_BUF],
-    writer: W,
 }
 
-impl<W: Write> VecBufs<W> {
-    pub fn new(writer: W) -> Self {
+impl VecBufs {
+    pub fn new() -> Self {
         VecBufs {
             block: 0,
             pos: 0,
             bufs: Vec::with_capacity(MAX_VEC_BUF),
-            io_slice: unsafe {
-                #[allow(clippy::uninit_assumed_init)]
-                MaybeUninit::uninit().assume_init()
-            },
-            writer,
+            io_slice: unsafe { std::mem::zeroed() },
         }
     }
 
-    pub fn inner_mut(&mut self) -> &mut W {
-        &mut self.writer
-    }
-
-    pub fn write_bytes(&mut self, buf: Bytes) -> std::io::Result<()> {
+    pub fn write_bytes<W: Write>(&mut self, buf: Bytes, writer: &mut W) -> std::io::Result<()> {
         let len = self.bufs.len();
         assert!(len < MAX_VEC_BUF);
         self.bufs.push(buf);
@@ -38,7 +28,7 @@ impl<W: Write> VecBufs<W> {
         self.io_slice[len] = slice;
 
         if len + 1 == MAX_VEC_BUF {
-            self.flush()?;
+            self.flush(writer)?;
         }
 
         Ok(())
@@ -62,16 +52,14 @@ impl<W: Write> VecBufs<W> {
     }
 
     // write all data from the vecs to the writer
-    pub fn flush(&mut self) -> std::io::Result<()> {
+    pub fn flush<W: Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
         let len = self.bufs.len();
         if self.block == len {
             return Ok(());
         }
 
         while self.block < len {
-            let n = self
-                .writer
-                .write_vectored(&self.io_slice[self.block..len])?;
+            let n = writer.write_vectored(&self.io_slice[self.block..len])?;
             self.advance(n);
         }
         self.bufs.clear();
