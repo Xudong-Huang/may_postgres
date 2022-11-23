@@ -1,6 +1,4 @@
-use bytes::Buf;
-use bytes::BufMut;
-use bytes::BytesMut;
+use bytes::{Buf, BufMut, BytesMut};
 use crossbeam::queue::SegQueue;
 use fallible_iterator::FallibleIterator;
 use log::error;
@@ -16,9 +14,8 @@ use crate::codec::{BackendMessage, BackendMessages, FrontendMessage};
 use crate::copy_in::CopyInReceiver;
 use crate::Error;
 
-use std::collections::HashMap;
-use std::io::Write;
-use std::io::{self, Read};
+use std::collections::{HashMap, VecDeque};
+use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 pub enum RequestMessages {
@@ -51,32 +48,27 @@ impl Drop for Connection {
     }
 }
 
-fn process_read(stream: &mut TcpStream, read_buf: &mut BytesMut) -> std::io::Result<()> {
-    // read the socket until no data
-    loop {
-        let remaining = read_buf.capacity() - read_buf.len();
-        if remaining < 512 {
-            read_buf.reserve(4096 * 8 - remaining);
-        }
+// read the socket until no data
+fn process_read(stream: &mut TcpStream, read_buf: &mut BytesMut) -> io::Result<()> {
+    let remaining = read_buf.capacity() - read_buf.len();
+    if remaining < 512 {
+        read_buf.reserve(4096 * 32 - remaining);
+    }
 
+    loop {
         let buf = unsafe { &mut *(read_buf.bytes_mut() as *mut _ as *mut [u8]) };
         match stream.read(buf) {
             Ok(n) => {
-                if n == 0 {
+                if n > 0 {
+                    unsafe { read_buf.advance_mut(n) };
+                } else {
                     //connection was closed
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
-                } else {
-                    unsafe { read_buf.advance_mut(n) };
                 }
             }
             Err(err) => {
                 if err.kind() == io::ErrorKind::WouldBlock {
                     break;
-                } else if err.kind() == io::ErrorKind::ConnectionReset
-                    || err.kind() == io::ErrorKind::UnexpectedEof
-                {
-                    // info!("http server read req: connection closed");
-                    return Err(err);
                 }
                 return Err(err);
             }
@@ -87,7 +79,7 @@ fn process_read(stream: &mut TcpStream, read_buf: &mut BytesMut) -> std::io::Res
 
 fn decode_messages(
     read_buf: &mut BytesMut,
-    rsp_queue: &SegQueue<Response>,
+    rsp_queue: &mut VecDeque<Response>,
     first_rsp: &mut Option<Response>,
     parameters: &mut HashMap<String, String>,
 ) -> Result<(), Error> {
@@ -111,7 +103,7 @@ fn decode_messages(
             } => {
                 let response = match first_rsp {
                     Some(response) => response,
-                    None => match rsp_queue.pop() {
+                    None => match rsp_queue.pop_front() {
                         Some(response) => {
                             first_rsp.replace(response);
                             first_rsp.as_mut().unwrap()
@@ -140,20 +132,15 @@ fn nonblock_write(stream: &mut TcpStream, write_buf: &mut BytesMut) -> io::Resul
     while written < len {
         match stream.write(&write_buf[written..]) {
             Ok(n) => {
-                if n == 0 {
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
-                } else {
+                if n > 0 {
                     written += n;
+                } else {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
                 }
             }
             Err(err) => {
                 if err.kind() == io::ErrorKind::WouldBlock {
                     break;
-                } else if err.kind() == io::ErrorKind::ConnectionReset
-                    || err.kind() == io::ErrorKind::UnexpectedEof
-                {
-                    // info!("http server read req: connection closed");
-                    return Err(err);
                 }
                 return Err(err);
             }
@@ -171,17 +158,17 @@ fn nonblock_write(stream: &mut TcpStream, write_buf: &mut BytesMut) -> io::Resul
 fn process_write(
     stream: &mut TcpStream,
     req_queue: &SegQueue<Request>,
-    rsp_queue: &SegQueue<Response>,
+    rsp_queue: &mut VecDeque<Response>,
     write_buf: &mut BytesMut,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
+    let remaining = write_buf.capacity() - write_buf.len();
+    if remaining < 512 {
+        write_buf.reserve(4096 * 8 - remaining);
+    }
     loop {
-        let remaining = write_buf.capacity() - write_buf.len();
-        if remaining < 512 {
-            write_buf.reserve(4096 * 8 - remaining);
-        }
         match req_queue.pop() {
             Some(req) => {
-                rsp_queue.push(Response { tx: req.sender });
+                rsp_queue.push_back(Response { tx: req.sender });
                 match req.messages {
                     RequestMessages::Single(msg) => match msg {
                         FrontendMessage::Raw(buf) => write_buf.extend_from_slice(buf.bytes()),
@@ -250,9 +237,8 @@ impl Connection {
         let req_queue_dup = req_queue.clone();
         let io_handle = go!(move || {
             let mut read_buf = BytesMut::with_capacity(4096 * 8);
-            let rsp_queue = SegQueue::new();
+            let mut rsp_queue = VecDeque::with_capacity(100);
             let mut first_rsp = None;
-            // let mut write_buf = VecBufs::new();
             let mut write_buf = BytesMut::with_capacity(4096 * 8);
 
             let mut is_error = false;
@@ -260,36 +246,45 @@ impl Connection {
             stream.set_nonblocking(true).unwrap();
             loop {
                 stream.reset_io();
-                if let Err(e) = process_read(&mut stream, &mut read_buf) {
-                    error!("receiver closed. err={}", e);
-                    let mut request = BytesMut::new();
-                    frontend::terminate(&mut request);
-                    let (tx, _rx) = mpsc::channel();
-                    let req = Request {
-                        messages: RequestMessages::Single(FrontendMessage::Raw(request.freeze())),
-                        sender: tx,
-                    };
-                    req_queue_dup.push(req);
-                    is_error = true;
+                if !rsp_queue.is_empty() {
+                    if let Err(e) = process_read(&mut stream, &mut read_buf) {
+                        error!("receiver closed. err={}", e);
+                        let mut request = BytesMut::new();
+                        frontend::terminate(&mut request);
+                        let (tx, _rx) = mpsc::channel();
+                        let req = Request {
+                            messages: RequestMessages::Single(FrontendMessage::Raw(
+                                request.freeze(),
+                            )),
+                            sender: tx,
+                        };
+                        req_queue_dup.push(req);
+                        is_error = true;
+                    }
+
+                    if let Err(e) = decode_messages(
+                        &mut read_buf,
+                        &mut rsp_queue,
+                        &mut first_rsp,
+                        &mut parameters,
+                    ) {
+                        error!("decode_messages err={}", e);
+                        let mut request = BytesMut::new();
+                        frontend::terminate(&mut request);
+                        let (tx, _rx) = mpsc::channel();
+                        let req = Request {
+                            messages: RequestMessages::Single(FrontendMessage::Raw(
+                                request.freeze(),
+                            )),
+                            sender: tx,
+                        };
+                        req_queue_dup.push(req);
+                        is_error = true;
+                    }
                 }
 
                 if let Err(e) =
-                    decode_messages(&mut read_buf, &rsp_queue, &mut first_rsp, &mut parameters)
-                {
-                    error!("decode_messages err={}", e);
-                    let mut request = BytesMut::new();
-                    frontend::terminate(&mut request);
-                    let (tx, _rx) = mpsc::channel();
-                    let req = Request {
-                        messages: RequestMessages::Single(FrontendMessage::Raw(request.freeze())),
-                        sender: tx,
-                    };
-                    req_queue_dup.push(req);
-                    is_error = true;
-                }
-
-                if let Err(e) =
-                    process_write(&mut stream, &req_queue_dup, &rsp_queue, &mut write_buf)
+                    process_write(&mut stream, &req_queue_dup, &mut rsp_queue, &mut write_buf)
                 {
                     error!("writer closed. err={}", e);
                     break;
