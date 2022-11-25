@@ -57,6 +57,7 @@ impl Drop for Connection {
 }
 
 // read the socket until no data
+#[inline]
 fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<()> {
     let remaining = read_buf.capacity() - read_buf.len();
     if remaining < 512 {
@@ -89,7 +90,6 @@ fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<(
 fn decode_messages(
     read_buf: &mut BytesMut,
     rsp_queue: &mut VecDeque<Response>,
-    first_rsp: &mut Option<Response>,
     parameters: &mut HashMap<String, String>,
 ) -> Result<(), Error> {
     use crate::codec::PostgresCodec;
@@ -97,10 +97,25 @@ fn decode_messages(
     // parse the messages
     while let Some(msg) = PostgresCodec.decode(read_buf).map_err(Error::io)? {
         match msg {
-            BackendMessage::Async(Message::NoticeResponse(_body)) => {
-                // let error = DbError::parse(&mut body.fields()).map_err(Error::parse)?;
-                // return Ok(Some(AsyncMessage::Notice(error)));
+            BackendMessage::Normal {
+                mut messages,
+                request_complete,
+            } => {
+                let response = match rsp_queue.pop_front() {
+                    Some(response) => response,
+                    None => match messages.next().map_err(Error::parse)? {
+                        Some(Message::ErrorResponse(error)) => return Err(Error::db(error)),
+                        _ => return Err(Error::unexpected_message()),
+                    },
+                };
+
+                response.sender.send(messages).ok();
+
+                if !request_complete {
+                    rsp_queue.push_front(response);
+                }
             }
+            BackendMessage::Async(Message::NoticeResponse(_body)) => {}
             BackendMessage::Async(Message::NotificationResponse(_body)) => {}
             BackendMessage::Async(Message::ParameterStatus(body)) => {
                 parameters.insert(
@@ -109,35 +124,12 @@ fn decode_messages(
                 );
             }
             BackendMessage::Async(_) => unreachable!(),
-            BackendMessage::Normal {
-                mut messages,
-                request_complete,
-            } => {
-                let response = match first_rsp {
-                    Some(response) => response,
-                    None => match rsp_queue.pop_front() {
-                        Some(response) => {
-                            first_rsp.replace(response);
-                            first_rsp.as_mut().unwrap()
-                        }
-                        None => match messages.next().map_err(Error::parse)? {
-                            Some(Message::ErrorResponse(error)) => return Err(Error::db(error)),
-                            _ => return Err(Error::unexpected_message()),
-                        },
-                    },
-                };
-
-                response.sender.send(messages).ok();
-
-                if request_complete {
-                    first_rsp.take();
-                }
-            }
         }
     }
     Ok(())
 }
 
+#[inline]
 fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Result<()> {
     let len = write_buf.len();
     let mut written = 0;
@@ -252,9 +244,8 @@ impl Connection {
         let req_queue = Arc::new(SegQueue::new());
         let req_queue_dup = req_queue.clone();
         let io_handle = go!(move || {
-            let mut read_buf = BytesMut::with_capacity(4096 * 8);
-            let mut rsp_queue = VecDeque::with_capacity(100);
-            let mut first_rsp = None;
+            let mut read_buf = BytesMut::with_capacity(4096 * 32);
+            let mut rsp_queue = VecDeque::with_capacity(1000);
             let mut write_buf = BytesMut::with_capacity(4096 * 8);
 
             let mut is_error = false;
@@ -278,12 +269,8 @@ impl Connection {
                         is_error = true;
                     }
 
-                    if let Err(e) = decode_messages(
-                        &mut read_buf,
-                        &mut rsp_queue,
-                        &mut first_rsp,
-                        &mut parameters,
-                    ) {
+                    if let Err(e) = decode_messages(&mut read_buf, &mut rsp_queue, &mut parameters)
+                    {
                         error!("decode_messages err={}", e);
                         let mut request = BytesMut::new();
                         frontend::terminate(&mut request);

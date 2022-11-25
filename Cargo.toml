@@ -56,7 +56,7 @@ socket2 = "0.4"
 
 [dev-dependencies]
 criterion = "0.4"
-env_logger = "0.9"
+env_logger = "0.10"
 
 bit-vec-06 = { version = "0.6", package = "bit-vec" }
 chrono-04 = { version = "0.4", package = "chrono", default-features = false }
@@ -72,5 +72,8 @@ uuid-1 = { version = "1.0", package = "uuid" }
 # time-02 = { version = "0.2", package = "time" }
 time-03 = { version = "0.3", package = "time", features = ["parsing"] }
 
-[patch.crates-io]
-may = { path = "../may" }
+[profile.release]
+lto = true
+
+# [patch.crates-io]
+# may = { path = "../may" }
