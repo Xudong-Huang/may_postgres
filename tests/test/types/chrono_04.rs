@@ -1,10 +1,13 @@
 use chrono_04::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-use may_postgres::types::{Date, Timestamp};
+use std::fmt;
+use tokio_postgres::types::{Date, FromSqlOwned, Timestamp};
+use tokio_postgres::Client;
 
+use crate::connect;
 use crate::types::test_type;
 
-#[test]
-fn test_naive_date_time_params() {
+#[tokio::test]
+async fn test_naive_date_time_params() {
     fn make_check(time: &str) -> (Option<NaiveDateTime>, &str) {
         (
             Some(NaiveDateTime::parse_from_str(time, "'%Y-%m-%d %H:%M:%S.%f'").unwrap()),
@@ -19,11 +22,12 @@ fn test_naive_date_time_params() {
             make_check("'2010-02-09 23:11:45.120200000'"),
             (None, "NULL"),
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_with_special_naive_date_time_params() {
+#[tokio::test]
+async fn test_with_special_naive_date_time_params() {
     fn make_check(time: &str) -> (Timestamp<NaiveDateTime>, &str) {
         (
             Timestamp::Value(
@@ -41,11 +45,12 @@ fn test_with_special_naive_date_time_params() {
             (Timestamp::PosInfinity, "'infinity'"),
             (Timestamp::NegInfinity, "'-infinity'"),
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_date_time_params() {
+#[tokio::test]
+async fn test_date_time_params() {
     fn make_check(time: &str) -> (Option<DateTime<Utc>>, &str) {
         (
             Some(
@@ -63,11 +68,12 @@ fn test_date_time_params() {
             make_check("'2010-02-09 23:11:45.120200000'"),
             (None, "NULL"),
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_with_special_date_time_params() {
+#[tokio::test]
+async fn test_with_special_date_time_params() {
     fn make_check(time: &str) -> (Timestamp<DateTime<Utc>>, &str) {
         (
             Timestamp::Value(
@@ -86,11 +92,12 @@ fn test_with_special_date_time_params() {
             (Timestamp::PosInfinity, "'infinity'"),
             (Timestamp::NegInfinity, "'-infinity'"),
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_date_params() {
+#[tokio::test]
+async fn test_date_params() {
     fn make_check(time: &str) -> (Option<NaiveDate>, &str) {
         (
             Some(NaiveDate::parse_from_str(time, "'%Y-%m-%d'").unwrap()),
@@ -105,11 +112,12 @@ fn test_date_params() {
             make_check("'2010-02-09'"),
             (None, "NULL"),
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_with_special_date_params() {
+#[tokio::test]
+async fn test_with_special_date_params() {
     fn make_check(date: &str) -> (Date<NaiveDate>, &str) {
         (
             Date::Value(NaiveDate::parse_from_str(date, "'%Y-%m-%d'").unwrap()),
@@ -125,11 +133,12 @@ fn test_with_special_date_params() {
             (Date::PosInfinity, "'infinity'"),
             (Date::NegInfinity, "'-infinity'"),
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_time_params() {
+#[tokio::test]
+async fn test_time_params() {
     fn make_check(time: &str) -> (Option<NaiveTime>, &str) {
         (
             Some(NaiveTime::parse_from_str(time, "'%H:%M:%S.%f'").unwrap()),
@@ -144,5 +153,36 @@ fn test_time_params() {
             make_check("'23:11:45.120200000'"),
             (None, "NULL"),
         ],
-    );
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_special_params_without_wrapper() {
+    async fn assert_overflows<T>(client: &mut Client, val: &str, sql_type: &str)
+    where
+        T: FromSqlOwned + fmt::Debug,
+    {
+        let err = client
+            .query_one(&*format!("SELECT {}::{}", val, sql_type), &[])
+            .await
+            .unwrap()
+            .try_get::<_, T>(0)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "error deserializing column 0: value too large to decode"
+        );
+    }
+
+    let mut client = connect("user=postgres").await;
+
+    assert_overflows::<DateTime<Utc>>(&mut client, "'-infinity'", "timestamptz").await;
+    assert_overflows::<DateTime<Utc>>(&mut client, "'infinity'", "timestamptz").await;
+
+    assert_overflows::<NaiveDateTime>(&mut client, "'-infinity'", "timestamp").await;
+    assert_overflows::<NaiveDateTime>(&mut client, "'infinity'", "timestamp").await;
+
+    assert_overflows::<NaiveDate>(&mut client, "'-infinity'", "date").await;
+    assert_overflows::<NaiveDate>(&mut client, "'infinity'", "date").await;
 }

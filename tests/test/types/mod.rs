@@ -1,3 +1,4 @@
+use may_postgres::types::{FromSql, FromSqlOwned, IsNull, Kind, PgLsn, ToSql, Type, WrongType};
 use postgres_types::to_sql_checked;
 use std::collections::HashMap;
 use std::error::Error;
@@ -6,9 +7,8 @@ use std::f64;
 use std::fmt;
 use std::net::IpAddr;
 use std::result;
+use std::str::FromStr;
 use std::time::{Duration, UNIX_EPOCH};
-
-use may_postgres::types::{FromSql, FromSqlOwned, IsNull, Kind, ToSql, Type, WrongType};
 
 use crate::connect;
 use bytes::BytesMut;
@@ -19,12 +19,24 @@ mod bit_vec_06;
 mod chrono_04;
 #[cfg(feature = "with-eui48-0_4")]
 mod eui48_04;
-#[cfg(feature = "with-geo-0_10")]
-mod geo_010;
+#[cfg(feature = "with-eui48-1")]
+mod eui48_1;
+#[cfg(feature = "with-geo-types-0_6")]
+mod geo_types_06;
+#[cfg(feature = "with-geo-types-0_7")]
+mod geo_types_07;
 #[cfg(feature = "with-serde_json-1")]
 mod serde_json_1;
+#[cfg(feature = "with-smol_str-01")]
+mod smol_str_01;
+#[cfg(feature = "with-time-0_2")]
+mod time_02;
+#[cfg(feature = "with-time-0_3")]
+mod time_03;
 #[cfg(feature = "with-uuid-0_8")]
 mod uuid_08;
+#[cfg(feature = "with-uuid-1")]
+mod uuid_1;
 
 fn test_type<T, S>(sql_type: &str, checks: &[(T, S)])
 where
@@ -122,6 +134,17 @@ fn test_i64_params() {
             (None, "NULL"),
         ],
     );
+}
+
+#[test]
+fn test_lsn_params() {
+    test_type(
+        "PG_LSN",
+        &[
+            (Some(PgLsn::from_str("2B/1757980").unwrap()), "'2B/1757980'"),
+            (None, "NULL"),
+        ],
+    )
 }
 
 #[test]
@@ -306,7 +329,7 @@ fn test_hstore_params() {
 }
 
 #[test]
-fn test_array_params() {
+fn test_array_vec_params() {
     test_type(
         "integer[]",
         &[
@@ -315,6 +338,17 @@ fn test_array_params() {
             (Some(vec![]), "ARRAY[]"),
             (None, "NULL"),
         ],
+    );
+}
+
+#[cfg(feature = "array-impls")]
+#[test]
+fn test_array_array_params() {
+    test_type("integer[]", &[(Some([1i32, 2i32]), "ARRAY[1,2]")]);
+    test_type("text[]", &[(Some(["peter".to_string()]), "ARRAY['peter']")]);
+    test_type(
+        "integer[]",
+        &[(Some([] as [i32; 0]), "ARRAY[]"), (None, "NULL")],
     );
 }
 
@@ -431,11 +465,7 @@ fn domain() {
         }
 
         fn accepts(ty: &Type) -> bool {
-            ty.name() == "session_id"
-                && match *ty.kind() {
-                    Kind::Domain(_) => true,
-                    _ => false,
-                }
+            ty.name() == "session_id" && matches!(ty.kind(), Kind::Domain(_))
         }
 
         to_sql_checked!();
@@ -575,6 +605,87 @@ fn inet() {
                 ),
                 "'2001:4f8:3:ba:2e0:81ff:fe22:d1f1/128'",
             ),
+        ],
+    );
+}
+
+#[test]
+fn ltree() {
+    test_type(
+        "ltree",
+        &[(Some("b.c.d".to_owned()), "'b.c.d'"), (None, "NULL")],
+    );
+}
+
+#[test]
+fn ltree_any() {
+    test_type(
+        "ltree[]",
+        &[
+            (Some(vec![]), "ARRAY[]"),
+            (Some(vec!["a.b.c".to_string()]), "ARRAY['a.b.c']"),
+            (
+                Some(vec!["a.b.c".to_string(), "e.f.g".to_string()]),
+                "ARRAY['a.b.c','e.f.g']",
+            ),
+            (None, "NULL"),
+        ],
+    );
+}
+
+#[test]
+fn lquery() {
+    test_type(
+        "lquery",
+        &[
+            (Some("b.c.d".to_owned()), "'b.c.d'"),
+            (Some("b.c.*".to_owned()), "'b.c.*'"),
+            (Some("b.*{1,2}.d|e".to_owned()), "'b.*{1,2}.d|e'"),
+            (None, "NULL"),
+        ],
+    );
+}
+
+#[test]
+fn lquery_any() {
+    test_type(
+        "lquery[]",
+        &[
+            (Some(vec![]), "ARRAY[]"),
+            (Some(vec!["b.c.*".to_string()]), "ARRAY['b.c.*']"),
+            (
+                Some(vec!["b.c.*".to_string(), "b.*{1,2}.d|e".to_string()]),
+                "ARRAY['b.c.*','b.*{1,2}.d|e']",
+            ),
+            (None, "NULL"),
+        ],
+    );
+}
+
+#[test]
+fn ltxtquery() {
+    test_type(
+        "ltxtquery",
+        &[
+            (Some("b & c & d".to_owned()), "'b & c & d'"),
+            (Some("b@* & !c".to_owned()), "'b@* & !c'"),
+            (None, "NULL"),
+        ],
+    );
+}
+
+#[test]
+fn ltxtquery_any() {
+    test_type(
+        "ltxtquery[]",
+        &[
+            (Some(vec![]), "ARRAY[]"),
+            (Some(vec!["b & c & d".to_string()]), "ARRAY['b & c & d']"),
+            (
+                Some(vec!["b & c & d".to_string(), "b@* & !c".to_string()]),
+                "ARRAY['b & c & d','b@* & !c']",
+            ),
+            (None, "NULL"),
         ],
     );
 }

@@ -1,4 +1,4 @@
-use eui48_04::MacAddress;
+use eui48_1::MacAddress;
 
 use crate::types::test_type;
 

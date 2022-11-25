@@ -5,13 +5,15 @@ use log::error;
 use may::coroutine::JoinHandle;
 use may::go;
 use may::io::{WaitIo, WaitIoWaker};
-use may::net::TcpStream;
 use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
 use crate::codec::{BackendMessage, BackendMessages, FrontendMessage};
 use crate::copy_in::CopyInReceiver;
+use crate::maybe_tls_stream::MaybeTlsStream;
+use crate::socket::SocketExt;
+use crate::tls::TlsStream;
 use crate::Error;
 
 use std::collections::{HashMap, VecDeque};
@@ -29,11 +31,17 @@ pub struct Request {
 }
 
 pub struct Response {
-    tx: mpsc::Sender<BackendMessages>,
+    sender: mpsc::Sender<BackendMessages>,
 }
 
 /// A connection to a PostgreSQL database.
-pub(crate) struct Connection {
+///
+/// This is one half of what is returned when a new connection is established. It performs the actual IO with the
+/// server, and should generally be spawned off onto an executor to run in the background.
+///
+/// `Connection` implements `Future`, and only resolves when the connection is closed, either because a fatal error has
+/// occurred, or because its associated `Client` has dropped and all outstanding work has completed.
+pub struct Connection {
     io_handle: JoinHandle<()>,
     req_queue: Arc<SegQueue<Request>>,
     waker: WaitIoWaker,
@@ -49,14 +57,15 @@ impl Drop for Connection {
 }
 
 // read the socket until no data
-fn process_read(stream: &mut TcpStream, read_buf: &mut BytesMut) -> io::Result<()> {
+fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<()> {
     let remaining = read_buf.capacity() - read_buf.len();
     if remaining < 512 {
         read_buf.reserve(4096 * 32 - remaining);
     }
 
     loop {
-        let buf = unsafe { &mut *(read_buf.bytes_mut() as *mut _ as *mut [u8]) };
+        let buf =
+            unsafe { &mut *(read_buf.chunk_mut().as_uninit_slice_mut() as *mut _ as *mut [u8]) };
         match stream.read(buf) {
             Ok(n) => {
                 if n > 0 {
@@ -88,7 +97,10 @@ fn decode_messages(
     // parse the messages
     while let Some(msg) = PostgresCodec.decode(read_buf).map_err(Error::io)? {
         match msg {
-            BackendMessage::Async(Message::NoticeResponse(_body)) => {}
+            BackendMessage::Async(Message::NoticeResponse(_body)) => {
+                // let error = DbError::parse(&mut body.fields()).map_err(Error::parse)?;
+                // return Ok(Some(AsyncMessage::Notice(error)));
+            }
             BackendMessage::Async(Message::NotificationResponse(_body)) => {}
             BackendMessage::Async(Message::ParameterStatus(body)) => {
                 parameters.insert(
@@ -115,7 +127,7 @@ fn decode_messages(
                     },
                 };
 
-                response.tx.send(messages).ok();
+                response.sender.send(messages).ok();
 
                 if request_complete {
                     first_rsp.take();
@@ -126,7 +138,7 @@ fn decode_messages(
     Ok(())
 }
 
-fn nonblock_write(stream: &mut TcpStream, write_buf: &mut BytesMut) -> io::Result<()> {
+fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Result<()> {
     let len = write_buf.len();
     let mut written = 0;
     while written < len {
@@ -156,7 +168,7 @@ fn nonblock_write(stream: &mut TcpStream, write_buf: &mut BytesMut) -> io::Resul
 }
 
 fn process_write(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     req_queue: &SegQueue<Request>,
     rsp_queue: &mut VecDeque<Response>,
     write_buf: &mut BytesMut,
@@ -168,14 +180,14 @@ fn process_write(
     loop {
         match req_queue.pop() {
             Some(req) => {
-                rsp_queue.push_back(Response { tx: req.sender });
+                rsp_queue.push_back(Response { sender: req.sender });
                 match req.messages {
                     RequestMessages::Single(msg) => match msg {
-                        FrontendMessage::Raw(buf) => write_buf.extend_from_slice(buf.bytes()),
+                        FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
                         FrontendMessage::CopyData(data) => {
                             let mut buf = BytesMut::new();
                             data.write(&mut buf);
-                            write_buf.extend_from_slice(buf.freeze().bytes())
+                            write_buf.extend_from_slice(&buf.freeze())
                         }
                     },
                     RequestMessages::CopyIn(mut rcv) => {
@@ -185,12 +197,12 @@ fn process_write(
                                 Ok(Some(msg)) => {
                                     match msg {
                                         FrontendMessage::Raw(buf) => {
-                                            write_buf.extend_from_slice(buf.bytes())
+                                            write_buf.extend_from_slice(&buf)
                                         }
                                         FrontendMessage::CopyData(data) => {
                                             let mut buf = BytesMut::new();
                                             data.write(&mut buf);
-                                            write_buf.extend_from_slice(buf.freeze().bytes())
+                                            write_buf.extend_from_slice(&buf.freeze())
                                         }
                                     }
                                     copy_in_msg = rcv.try_recv();
@@ -227,10 +239,14 @@ fn process_write(
 }
 
 impl Connection {
-    pub(crate) fn new(
-        mut stream: TcpStream,
+    pub(crate) fn new<S, T>(
+        mut stream: MaybeTlsStream<S, T>,
         mut parameters: HashMap<String, String>,
-    ) -> Connection {
+    ) -> Self
+    where
+        S: Read + Write + SocketExt,
+        T: TlsStream + SocketExt,
+    {
         let waker = stream.waker();
 
         let req_queue = Arc::new(SegQueue::new());
@@ -305,6 +321,11 @@ impl Connection {
             waker,
         }
     }
+
+    // /// Returns the value of a runtime parameter for this connection.
+    // pub fn parameter(&self, name: &str) -> Option<&str> {
+    //     self.parameters.get(name).map(|s| &**s)
+    // }
 
     /// send a request to the connection
     pub fn send(&self, req: Request) {

@@ -1,6 +1,7 @@
 //! Rows.
 
 use crate::row::sealed::{AsName, Sealed};
+use crate::simple_query::SimpleColumn;
 use crate::statement::Column;
 use crate::types::{FromSql, Type, WrongType};
 use crate::{Error, Statement};
@@ -100,6 +101,14 @@ pub struct Row {
     ranges: Vec<Option<Range<usize>>>,
 }
 
+impl fmt::Debug for Row {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Row")
+            .field("columns", &self.columns())
+            .finish()
+    }
+}
+
 impl Row {
     pub(crate) fn new(statement: Statement, body: DataRowBody) -> Result<Row, Error> {
         let ranges = body.ranges().collect().map_err(Error::parse)?;
@@ -170,27 +179,46 @@ impl Row {
             ));
         }
 
-        let buf = self.ranges[idx].clone().map(|r| &self.body.buffer()[r]);
-        FromSql::from_sql_nullable(ty, buf).map_err(|e| Error::from_sql(e, idx))
+        FromSql::from_sql_nullable(ty, self.col_buffer(idx)).map_err(|e| Error::from_sql(e, idx))
+    }
+
+    /// Get the raw bytes for the column at the given index.
+    fn col_buffer(&self, idx: usize) -> Option<&[u8]> {
+        let range = self.ranges[idx].to_owned()?;
+        Some(&self.body.buffer()[range])
+    }
+}
+
+impl AsName for SimpleColumn {
+    fn as_name(&self) -> &str {
+        self.name()
     }
 }
 
 /// A row of data returned from the database by a simple query.
 pub struct SimpleQueryRow {
-    columns: Arc<[String]>,
+    columns: Arc<[SimpleColumn]>,
     body: DataRowBody,
     ranges: Vec<Option<Range<usize>>>,
 }
 
 impl SimpleQueryRow {
     #[allow(clippy::new_ret_no_self)]
-    pub(crate) fn new(columns: Arc<[String]>, body: DataRowBody) -> Result<SimpleQueryRow, Error> {
+    pub(crate) fn new(
+        columns: Arc<[SimpleColumn]>,
+        body: DataRowBody,
+    ) -> Result<SimpleQueryRow, Error> {
         let ranges = body.ranges().collect().map_err(Error::parse)?;
         Ok(SimpleQueryRow {
             columns,
             body,
             ranges,
         })
+    }
+
+    /// Returns information about the columns of data in the row.
+    pub fn columns(&self) -> &[SimpleColumn] {
+        &self.columns
     }
 
     /// Determines if the row contains no values.

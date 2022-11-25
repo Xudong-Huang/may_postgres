@@ -7,6 +7,7 @@ use crate::{query, slice_iter};
 use crate::{Column, Error, Statement};
 use bytes::Bytes;
 use fallible_iterator::FallibleIterator;
+use log::debug;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -96,6 +97,12 @@ pub fn prepare(client: &Arc<InnerClient>, query: &str, types: &[Type]) -> Result
 }
 
 fn encode(client: &InnerClient, name: &str, query: &str, types: &[Type]) -> Result<Bytes, Error> {
+    if types.is_empty() {
+        debug!("preparing query {}: {}", name, query);
+    } else {
+        debug!("preparing query {} with types {:?}: {}", name, types, query);
+    }
+
     client.with_buf(|buf| {
         frontend::parse(name, query, types.iter().map(Type::oid), buf).map_err(Error::encode)?;
         frontend::describe(b'S', name, buf).map_err(Error::encode)?;
@@ -178,7 +185,7 @@ fn get_enum_variants(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<String>,
     let stmt = typeinfo_enum_statement(client)?;
 
     query::query(client, stmt, slice_iter(&[&oid]))?
-        .map(|row| row.and_then(|r| r.try_get(0)))
+        .filter_map(|row| row.map(|r| r.try_get(0)).ok())
         .collect()
 }
 

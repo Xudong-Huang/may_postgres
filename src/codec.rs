@@ -1,9 +1,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may::net::TcpStream;
 use postgres_protocol::message::backend;
 use postgres_protocol::message::frontend::CopyData;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 pub use frame_codec::Framed;
 
@@ -100,27 +99,37 @@ impl PostgresCodec {
 mod frame_codec {
     use super::*;
 
-    pub struct Framed {
-        r_stream: TcpStream,
+    pub struct Framed<S> {
+        stream: S,
         read_buf: BytesMut,
         codec: PostgresCodec,
     }
 
-    impl Framed {
-        pub fn new(s: TcpStream) -> Self {
+    impl<S> Framed<S>
+    where
+        S: Read + Write,
+    {
+        pub fn new(s: S, codec: PostgresCodec) -> Self {
             Framed {
-                r_stream: s,
+                stream: s,
                 read_buf: BytesMut::with_capacity(4096 * 8),
-                codec: PostgresCodec,
+                codec,
             }
         }
 
-        pub fn inner_mut(&mut self) -> &mut TcpStream {
-            &mut self.r_stream
+        pub fn get_ref(&self) -> &S {
+            &self.stream
         }
 
-        pub fn into_stream(self) -> TcpStream {
-            self.r_stream
+        pub fn into_stream(self) -> S {
+            self.stream
+        }
+
+        pub fn send(&mut self, msg: FrontendMessage) -> io::Result<()> {
+            let mut buf = BytesMut::new();
+            self.codec.encode(msg, &mut buf)?;
+            self.stream.write_all(&buf)?;
+            Ok(())
         }
 
         pub fn next_msg(&mut self) -> io::Result<BackendMessage> {
@@ -135,60 +144,14 @@ mod frame_codec {
                 }
 
                 let n = {
-                    let read_buf =
-                        unsafe { &mut *(self.read_buf.bytes_mut() as *mut _ as *mut [u8]) };
-                    self.r_stream.read(read_buf)?
+                    let read_buf = unsafe {
+                        &mut *(self.read_buf.chunk_mut().as_uninit_slice_mut() as *mut _
+                            as *mut [u8])
+                    };
+                    self.stream.read(read_buf)?
                 };
                 //connection was closed
                 if n == 0 {
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
-                }
-                unsafe { self.read_buf.advance_mut(n) };
-            }
-        }
-    }
-}
-
-#[cfg(unix_asd)]
-mod frame_codec {
-    use super::*;
-
-    pub struct Framed {
-        r_stream: TcpStream,
-        read_buf: BytesMut,
-        codec: PostgresCodec,
-    }
-
-    impl Framed {
-        pub fn new(s: TcpStream) -> Self {
-            Framed {
-                r_stream: s,
-                read_buf: BytesMut::with_capacity(4096 * 8),
-                codec: PostgresCodec,
-            }
-        }
-
-        pub fn inner_mut(&mut self) -> &mut TcpStream {
-            &mut self.r_stream
-        }
-
-        pub fn next_msg(&mut self) -> io::Result<BackendMessage> {
-            loop {
-                if let Some(msg) = self.codec.decode(&mut self.read_buf)? {
-                    return Ok(msg);
-                }
-                // try to read more data from stream
-                // read the socket for reqs
-                if self.read_buf.remaining_mut() < 1024 {
-                    self.read_buf.reserve(4096 * 8);
-                }
-
-                let read_buf = unsafe { &mut *(self.read_buf.bytes_mut() as *mut _ as *mut [u8]) };
-
-                let n = self.r_stream.read(read_buf)?;
-                //connection was closed
-                if n == 0 {
-                    #[cold]
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
                 }
                 unsafe { self.read_buf.advance_mut(n) };

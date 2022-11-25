@@ -1,11 +1,17 @@
-use crate::{cancel_query, cancel_query_raw, client::SocketConfig, Error};
-use may::net::TcpStream;
+use crate::config::SslMode;
+use crate::tls::TlsConnect;
+#[cfg(feature = "runtime")]
+use crate::{cancel_query, client::SocketConfig, tls::MakeTlsConnect, Socket};
+use crate::{cancel_query_raw, Error};
+use std::io::{Read, Write};
 
 /// The capability to request cancellation of in-progress queries on a
 /// connection.
 #[derive(Clone)]
 pub struct CancelToken {
+    #[cfg(feature = "runtime")]
     pub(crate) socket_config: Option<SocketConfig>,
+    pub(crate) ssl_mode: SslMode,
     pub(crate) process_id: i32,
     pub(crate) secret_key: i32,
 }
@@ -23,13 +29,33 @@ impl CancelToken {
     /// active.
     ///
     /// Requires the `runtime` Cargo feature (enabled by default).
-    pub fn cancel_query(&self) -> Result<(), Error> {
-        cancel_query::cancel_query(self.socket_config.clone(), self.process_id, self.secret_key)
+    #[cfg(feature = "runtime")]
+    pub fn cancel_query<T>(&self, tls: T) -> Result<(), Error>
+    where
+        T: MakeTlsConnect<Socket>,
+    {
+        cancel_query::cancel_query(
+            self.socket_config.clone(),
+            self.ssl_mode,
+            tls,
+            self.process_id,
+            self.secret_key,
+        )
     }
 
     /// Like `cancel_query`, but uses a stream which is already connected to the server rather than opening a new
     /// connection itself.
-    pub fn cancel_query_raw(&self, stream: TcpStream) -> Result<(), Error> {
-        cancel_query_raw::cancel_query_raw(stream, self.process_id, self.secret_key)
+    pub fn cancel_query_raw<S, T>(&self, stream: S, tls: T) -> Result<(), Error>
+    where
+        S: Read + Write,
+        T: TlsConnect<S>,
+    {
+        cancel_query_raw::cancel_query_raw(
+            stream,
+            self.ssl_mode,
+            tls,
+            self.process_id,
+            self.secret_key,
+        )
     }
 }

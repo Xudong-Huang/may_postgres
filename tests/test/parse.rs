@@ -1,6 +1,5 @@
-use std::time::Duration;
-
 use may_postgres::config::{Config, TargetSessionAttrs};
+use std::time::Duration;
 
 fn check(s: &str, config: &Config) {
     assert_eq!(s.parse::<Config>().expect(s), *config, "`{}`", s);
@@ -34,6 +33,18 @@ fn settings() {
             .keepalives(false)
             .keepalives_idle(Duration::from_secs(30))
             .target_session_attrs(TargetSessionAttrs::ReadWrite),
+    );
+}
+
+#[test]
+fn keepalive_settings() {
+    check(
+        "keepalives=1 keepalives_idle=15 keepalives_interval=5 keepalives_retries=9",
+        Config::new()
+            .keepalives(true)
+            .keepalives_idle(Duration::from_secs(15))
+            .keepalives_interval(Duration::from_secs(5))
+            .keepalives_retries(9),
     );
 }
 
@@ -103,14 +114,14 @@ fn url() {
             .port(5433)
             .dbname("database"),
     );
-    #[cfg(unix_nosupport)]
+    #[cfg(unix)]
     check(
         "postgresql:///dbname?host=/var/lib/postgresql",
         Config::new()
             .dbname("dbname")
             .host_path("/var/lib/postgresql"),
     );
-    #[cfg(unix_nosupport)]
+    #[cfg(unix)]
     check(
         "postgresql://%2Fvar%2Flib%2Fpostgresql/dbname",
         Config::new()

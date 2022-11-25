@@ -5,22 +5,66 @@ use bytes::{Bytes, BytesMut};
 use may::net::TcpStream;
 use may::{go, join};
 use may_postgres::error::SqlState;
+use may_postgres::tls::{NoTls, NoTlsStream};
 use may_postgres::types::{Kind, Type};
 use may_postgres::{Client, Config, Error, IsolationLevel, SimpleQueryMessage};
 
 mod binary_copy;
 mod parse;
+#[cfg(feature = "runtime")]
 mod runtime;
 mod types;
+
+// pin_project! {
+//     /// Polls `F` at most `polls_left` times returning `Some(F::Output)` if
+//     /// [`Future`] returned [`Poll::Ready`] or [`None`] otherwise.
+//     struct Cancellable<F> {
+//         #[pin]
+//         fut: F,
+//         polls_left: usize,
+//     }
+// }
+
+// impl<F: Future> Future for Cancellable<F> {
+//     type Output = Option<F::Output>;
+
+//     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+//         let this = self.project();
+//         match this.fut.poll(ctx) {
+//             Poll::Ready(r) => Poll::Ready(Some(r)),
+//             Poll::Pending => {
+//                 *this.polls_left = this.polls_left.saturating_sub(1);
+//                 if *this.polls_left == 0 {
+//                     Poll::Ready(None)
+//                 } else {
+//                     Poll::Pending
+//                 }
+//             }
+//         }
+//     }
+// }
 
 fn connect_raw(s: &str) -> Result<Client, Error> {
     let socket = TcpStream::connect("127.0.0.1:5433").unwrap();
     let config = s.parse::<Config>().unwrap();
-    config.connect_raw(socket)
+    config.connect_raw(socket, NoTls)
 }
 
 fn connect(s: &str) -> Client {
     connect_raw(s).unwrap()
+}
+
+fn current_transaction_id(client: &Client) -> i64 {
+    client
+        .query("SELECT txid_current()", &[])
+        .unwrap()
+        .pop()
+        .unwrap()
+        .get::<_, i64>("txid_current")
+}
+
+fn in_transaction(client: &Client) -> bool {
+    current_transaction_id(client) == current_transaction_id(client)
 }
 
 #[test]
@@ -257,6 +301,8 @@ fn simple_query() {
     }
     match &messages[2] {
         SimpleQueryMessage::Row(row) => {
+            assert_eq!(row.columns().get(0).map(|c| c.name()), Some("id"));
+            assert_eq!(row.columns().get(1).map(|c| c.name()), Some("name"));
             assert_eq!(row.get(0), Some("1"));
             assert_eq!(row.get(1), Some("steven"));
         }
@@ -264,6 +310,8 @@ fn simple_query() {
     }
     match &messages[3] {
         SimpleQueryMessage::Row(row) => {
+            assert_eq!(row.columns().get(0).map(|c| c.name()), Some("id"));
+            assert_eq!(row.columns().get(1).map(|c| c.name()), Some("name"));
             assert_eq!(row.get(0), Some("2"));
             assert_eq!(row.get(1), Some("joe"));
         }
@@ -276,27 +324,22 @@ fn simple_query() {
     assert_eq!(messages.len(), 5);
 }
 
-#[test]
-fn cancel_query_raw() {
-    let client = connect("user=postgres");
+// #[test]
+// fn cancel_query_raw() {
+//     let client = connect("user=postgres");
 
-    join! {
-        {
-            let ret = client.batch_execute("SELECT pg_sleep(100)");
-            assert!(ret.is_err());
-            let err = ret.err().unwrap();
-            let err = err.code();
-            assert_eq!(err, Some(&SqlState::QUERY_CANCELED));
-        },
-        {
-            let socket = TcpStream::connect("127.0.0.1:5433").unwrap();
-            may::coroutine::sleep(Duration::from_millis(100));
-        let cancel_token = client.cancel_token();
-            let ret = cancel_token.cancel_query_raw(socket);
-            assert!(ret.is_ok());
-        }
-    }
-}
+//     let socket = TcpStream::connect("127.0.0.1:5433").unwrap();
+//     let cancel_token = client.cancel_token();
+//     let cancel = cancel_token.cancel_query_raw(socket, NoTls);
+//     let cancel = std::thread::sleep(Duration::from_millis(100)).then(|()| cancel);
+
+//     let sleep = client.batch_execute("SELECT pg_sleep(100)");
+
+//     match join!(sleep, cancel) {
+//         (Err(ref e), Ok(())) if e.code() == Some(&SqlState::QUERY_CANCELED) => {}
+//         t => panic!("unexpected return: {:?}", t),
+//     }
+// }
 
 #[test]
 fn transaction_commit() {
@@ -348,6 +391,74 @@ fn transaction_rollback() {
 
     assert_eq!(rows.len(), 0);
 }
+
+// #[test]
+// fn transaction_future_cancellation() {
+//     let mut client = connect("user=postgres");
+
+//     for i in 0.. {
+//         let done = {
+//             let txn = client.transaction();
+//             let fut = Cancellable {
+//                 fut: txn,
+//                 polls_left: i,
+//             };
+//             fut.map(|res| res.expect("transaction failed")).is_some()
+//         };
+
+//         assert!(!in_transaction(&client));
+
+//         if done {
+//             break;
+//         }
+//     }
+// }
+
+// #[test]
+// fn transaction_commit_future_cancellation() {
+//     let mut client = connect("user=postgres");
+
+//     for i in 0.. {
+//         let done = {
+//             let txn = client.transaction().unwrap();
+//             let commit = txn.commit();
+//             let fut = Cancellable {
+//                 fut: commit,
+//                 polls_left: i,
+//             };
+//             fut.map(|res| res.expect("transaction failed")).is_some()
+//         };
+
+//         assert!(!in_transaction(&client));
+
+//         if done {
+//             break;
+//         }
+//     }
+// }
+
+// #[test]
+// fn transaction_rollback_future_cancellation() {
+//     let mut client = connect("user=postgres");
+
+//     for i in 0.. {
+//         let done = {
+//             let txn = client.transaction().unwrap();
+//             let rollback = txn.rollback();
+//             let fut = Cancellable {
+//                 fut: rollback,
+//                 polls_left: i,
+//             };
+//             fut.map(|res| res.expect("transaction failed")).is_some()
+//         };
+
+//         assert!(!in_transaction(&client));
+
+//         if done {
+//             break;
+//         }
+//     }
+// }
 
 #[test]
 fn transaction_rollback_drop() {
@@ -525,10 +636,12 @@ fn copy_out() {
 // #[test]
 // fn notices() {
 //     let long_name = "x".repeat(65);
-//     let client = connect_raw(&format!("user=postgres application_name={}", long_name,)).unwrap();
+//     let (client, mut connection) =
+//         connect_raw(&format!("user=postgres application_name={}", long_name,)).unwrap();
 
 //     let (tx, rx) = mpsc::unbounded();
-//     let stream = stream::poll_fn(move |cx| connection.poll_message(cx)).map_err(|e| panic!(e));
+//     let stream =
+//         stream::poll_fn(move |cx| connection.poll_message(cx)).map_err(|e| panic!("{}", e));
 //     let connection = stream.forward(tx).map(|r| r.unwrap());
 //     tokio::spawn(connection);
 
@@ -558,10 +671,11 @@ fn copy_out() {
 
 // #[test]
 // fn notifications() {
-//     let (mut client, mut connection) = connect_raw("user=postgres").unwrap();
+//     let (client, mut connection) = connect_raw("user=postgres").unwrap();
 
 //     let (tx, rx) = mpsc::unbounded();
-//     let stream = stream::poll_fn(move |cx| connection.poll_message(cx)).map_err(|e| panic!(e));
+//     let stream =
+//         stream::poll_fn(move |cx| connection.poll_message(cx)).map_err(|e| panic!("{}", e));
 //     let connection = stream.forward(tx).map(|r| r.unwrap());
 //     tokio::spawn(connection);
 
@@ -625,6 +739,23 @@ fn query_portal() {
     assert_eq!(r2[0].get::<_, &str>(1), "charlie");
 
     assert_eq!(r3.len(), 0);
+}
+
+#[test]
+fn require_channel_binding() {
+    connect_raw("user=postgres channel_binding=require")
+        .err()
+        .unwrap();
+}
+
+#[test]
+fn prefer_channel_binding() {
+    connect("user=postgres channel_binding=prefer");
+}
+
+#[test]
+fn disable_channel_binding() {
+    connect("user=postgres channel_binding=disable");
 }
 
 #[test]
@@ -709,4 +840,25 @@ fn query_opt() {
         .unwrap()
         .unwrap();
     client.query_one("SELECT * FROM foo", &[]).err().unwrap();
+}
+
+#[test]
+fn deferred_constraint() {
+    let client = connect("user=postgres");
+
+    client
+        .batch_execute(
+            "
+            CREATE TEMPORARY TABLE t (
+                i INT,
+                UNIQUE (i) DEFERRABLE INITIALLY DEFERRED
+            );
+        ",
+        )
+        .unwrap();
+
+    client.execute("INSERT INTO t (i) VALUES (1)", &[]).unwrap();
+    client
+        .execute("INSERT INTO t (i) VALUES (1)", &[])
+        .unwrap_err();
 }

@@ -4,11 +4,30 @@ use crate::connection::RequestMessages;
 use crate::{Error, SimpleQueryMessage, SimpleQueryRow};
 use bytes::Bytes;
 use fallible_iterator::FallibleIterator;
+use log::debug;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::sync::Arc;
 
+/// Information about a column of a single query row.
+pub struct SimpleColumn {
+    name: String,
+}
+
+impl SimpleColumn {
+    pub(crate) fn new(name: String) -> SimpleColumn {
+        SimpleColumn { name }
+    }
+
+    /// Returns the name of the column.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 pub fn simple_query(client: &InnerClient, query: &str) -> Result<SimpleQueryStream, Error> {
+    debug!("executing simple query: {}", query);
+
     let buf = encode(client, query)?;
     let responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
@@ -19,6 +38,8 @@ pub fn simple_query(client: &InnerClient, query: &str) -> Result<SimpleQueryStre
 }
 
 pub fn batch_execute(client: &InnerClient, query: &str) -> Result<(), Error> {
+    debug!("executing statement batch: {}", query);
+
     let buf = encode(client, query)?;
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
@@ -44,7 +65,7 @@ fn encode(client: &InnerClient, query: &str) -> Result<Bytes, Error> {
 /// A stream of simple query results.
 pub struct SimpleQueryStream {
     responses: Responses,
-    columns: Option<Arc<[String]>>,
+    columns: Option<Arc<[SimpleColumn]>>,
 }
 
 impl Iterator for SimpleQueryStream {
@@ -69,7 +90,7 @@ impl Iterator for SimpleQueryStream {
                 Message::RowDescription(body) => {
                     let columns = body
                         .fields()
-                        .map(|f| Ok(f.name().to_string()))
+                        .map(|f| Ok(SimpleColumn::new(f.name().to_string())))
                         .collect::<Vec<_>>()
                         .map_err(Error::parse);
                     let columns = o_try!(columns).into();

@@ -309,7 +309,14 @@ impl DbError {
 
 impl fmt::Display for DbError {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(fmt, "{}: {}", self.severity, self.message)
+        write!(fmt, "{}: {}", self.severity, self.message)?;
+        if let Some(detail) = &self.detail {
+            write!(fmt, "\nDETAIL: {}", detail)?;
+        }
+        if let Some(hint) = &self.hint {
+            write!(fmt, "\nHINT: {}", hint)?;
+        }
+        Ok(())
     }
 }
 
@@ -333,7 +340,7 @@ pub enum ErrorPosition {
 enum Kind {
     Io,
     UnexpectedMessage,
-    // Tls,
+    Tls,
     ToSql(usize),
     FromSql(usize),
     Column(String),
@@ -345,7 +352,9 @@ enum Kind {
     ConfigParse,
     Config,
     RowCount,
+    #[cfg(feature = "runtime")]
     Connect,
+    Timeout,
 }
 
 struct ErrorInner {
@@ -370,7 +379,7 @@ impl fmt::Display for Error {
         match &self.0.kind {
             Kind::Io => fmt.write_str("error communicating with the server")?,
             Kind::UnexpectedMessage => fmt.write_str("unexpected message from server")?,
-            // Kind::Tls => fmt.write_str("error performing TLS handshake")?,
+            Kind::Tls => fmt.write_str("error performing TLS handshake")?,
             Kind::ToSql(idx) => write!(fmt, "error serializing parameter {}", idx)?,
             Kind::FromSql(idx) => write!(fmt, "error deserializing column {}", idx)?,
             Kind::Column(column) => write!(fmt, "invalid column `{}`", column)?,
@@ -382,7 +391,9 @@ impl fmt::Display for Error {
             Kind::ConfigParse => fmt.write_str("invalid connection string")?,
             Kind::Config => fmt.write_str("invalid configuration")?,
             Kind::RowCount => fmt.write_str("query returned an unexpected number of rows")?,
+            #[cfg(feature = "runtime")]
             Kind::Connect => fmt.write_str("error connecting to server")?,
+            Kind::Timeout => fmt.write_str("timeout waiting for server")?,
         };
         if let Some(ref cause) = self.0.cause {
             write!(fmt, ": {}", cause)?;
@@ -403,14 +414,23 @@ impl Error {
         self.0.cause
     }
 
+    /// Returns the source of this error if it was a `DbError`.
+    ///
+    /// This is a simple convenience method.
+    pub fn as_db_error(&self) -> Option<&DbError> {
+        self.source().and_then(|e| e.downcast_ref::<DbError>())
+    }
+
+    /// Determines if the error was associated with closed connection.
+    pub fn is_closed(&self) -> bool {
+        self.0.kind == Kind::Closed
+    }
+
     /// Returns the SQLSTATE error code associated with the error.
     ///
-    /// This is a convenience method that downcasts the cause to a `DbError`
-    /// and returns its code.
+    /// This is a convenience method that downcasts the cause to a `DbError` and returns its code.
     pub fn code(&self) -> Option<&SqlState> {
-        self.source()
-            .and_then(|e| e.downcast_ref::<DbError>())
-            .map(DbError::code)
+        self.as_db_error().map(DbError::code)
     }
 
     fn new(kind: Kind, cause: Option<Box<dyn error::Error + Sync + Send>>) -> Error {
@@ -454,9 +474,9 @@ impl Error {
         Error::new(Kind::Column(column), None)
     }
 
-    // pub(crate) fn tls(e: Box<dyn error::Error + Sync + Send>) -> Error {
-    //     Error::new(Kind::Tls, Some(e))
-    // }
+    pub(crate) fn tls(e: Box<dyn error::Error + Sync + Send>) -> Error {
+        Error::new(Kind::Tls, Some(e))
+    }
 
     pub(crate) fn io(e: io::Error) -> Error {
         Error::new(Kind::Io, Some(Box::new(e)))
@@ -478,7 +498,13 @@ impl Error {
         Error::new(Kind::RowCount, None)
     }
 
+    #[cfg(feature = "runtime")]
     pub(crate) fn connect(e: io::Error) -> Error {
         Error::new(Kind::Connect, Some(Box::new(e)))
+    }
+
+    #[doc(hidden)]
+    pub fn __private_api_timeout() -> Error {
+        Error::new(Kind::Timeout, None)
     }
 }
