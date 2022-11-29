@@ -30,6 +30,7 @@ with-uuid-0_8 = ["postgres-types/with-uuid-0_8"]
 log = "0.4"
 may = "0.3"
 phf = "0.8"
+spin = "0.9"
 bytes = "0.5"
 byteorder = "1"
 crossbeam = "0.8"

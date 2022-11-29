@@ -12,8 +12,9 @@ use crate::{
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may::sync::{mpsc, Mutex};
+use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
+use spin::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,7 +46,7 @@ struct State {
     typeinfo_composite: Option<Statement>,
     typeinfo_enum: Option<Statement>,
     types: HashMap<Oid, Type>,
-    buf: BytesMut,
+    // buf: BytesMut,
 }
 
 pub struct InnerClient {
@@ -66,45 +67,53 @@ impl InnerClient {
     }
 
     pub fn typeinfo(&self) -> Option<Statement> {
-        self.state.lock().unwrap().typeinfo.clone()
+        self.state.lock().typeinfo.clone()
     }
 
     pub fn set_typeinfo(&self, statement: &Statement) {
-        self.state.lock().unwrap().typeinfo = Some(statement.clone());
+        self.state.lock().typeinfo = Some(statement.clone());
     }
 
     pub fn typeinfo_composite(&self) -> Option<Statement> {
-        self.state.lock().unwrap().typeinfo_composite.clone()
+        self.state.lock().typeinfo_composite.clone()
     }
 
     pub fn set_typeinfo_composite(&self, statement: &Statement) {
-        self.state.lock().unwrap().typeinfo_composite = Some(statement.clone());
+        self.state.lock().typeinfo_composite = Some(statement.clone());
     }
 
     pub fn typeinfo_enum(&self) -> Option<Statement> {
-        self.state.lock().unwrap().typeinfo_enum.clone()
+        self.state.lock().typeinfo_enum.clone()
     }
 
     pub fn set_typeinfo_enum(&self, statement: &Statement) {
-        self.state.lock().unwrap().typeinfo_enum = Some(statement.clone());
+        self.state.lock().typeinfo_enum = Some(statement.clone());
     }
 
     pub fn type_(&self, oid: Oid) -> Option<Type> {
-        self.state.lock().unwrap().types.get(&oid).cloned()
+        self.state.lock().types.get(&oid).cloned()
     }
 
     pub fn set_type(&self, oid: Oid, type_: &Type) {
-        self.state.lock().unwrap().types.insert(oid, type_.clone());
+        self.state.lock().types.insert(oid, type_.clone());
     }
 
     pub fn with_buf<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut BytesMut) -> R,
     {
-        let mut state = self.state.lock().unwrap();
-        let r = f(&mut state.buf);
-        state.buf.clear();
-        r
+        use std::cell::RefCell;
+        thread_local!(
+            static BUF: RefCell<BytesMut> = RefCell::new(BytesMut::with_capacity(1024 * 64))
+        );
+        // let mut state = self.state.lock().unwrap();
+        BUF.with(|b| {
+            let mut buf = b.borrow_mut();
+            let r = f(&mut buf);
+            buf.clear();
+            r
+        })
+        // state.buf.clear();
     }
 }
 
@@ -138,7 +147,7 @@ impl Client {
                     typeinfo_composite: None,
                     typeinfo_enum: None,
                     types: HashMap::new(),
-                    buf: BytesMut::new(),
+                    // buf: BytesMut::new(),
                 }),
             }),
             socket_config: None,
