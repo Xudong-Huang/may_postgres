@@ -33,6 +33,14 @@ impl FallibleIterator for BackendMessages {
     type Error = io::Error;
 
     fn next(&mut self) -> io::Result<Option<backend::Message>> {
+        if self.0.is_empty() {
+            return Ok(None);
+        } else {
+            let remaining = self.0.remaining();
+            if remaining < 1024 {
+                self.0.reserve(1024 * 8 - remaining);
+            }
+        }
         backend::Message::parse(&mut self.0)
     }
 }

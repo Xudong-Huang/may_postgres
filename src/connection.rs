@@ -203,6 +203,9 @@ fn process_write(
                 }
             }
             None => {
+                if write_buf.is_empty() {
+                    break;
+                }
                 // wait for enough time before flush the data
                 may::coroutine::yield_now();
                 if !req_queue.is_empty() {
