@@ -52,7 +52,7 @@ impl Drop for Connection {
 #[inline]
 fn process_read(stream: &mut TcpStream, read_buf: &mut BytesMut) -> io::Result<()> {
     let remaining = read_buf.capacity() - read_buf.len();
-    if remaining < 512 {
+    if remaining < 1024 {
         read_buf.reserve(4096 * 32 - remaining);
     }
 
@@ -158,10 +158,10 @@ fn process_write(
     rsp_queue: &mut VecDeque<Response>,
     write_buf: &mut BytesMut,
 ) -> io::Result<()> {
-    let remaining = write_buf.capacity() - write_buf.len();
-    if remaining < 512 {
-        write_buf.reserve(4096 * 8 - remaining);
-    }
+    // let remaining = write_buf.capacity() - write_buf.len();
+    // if remaining < 1024 {
+    //     write_buf.reserve(4096 * 8 - remaining);
+    // }
     loop {
         match req_queue.pop() {
             Some(req) => {
