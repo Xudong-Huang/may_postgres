@@ -35,11 +35,6 @@ impl FallibleIterator for BackendMessages {
     fn next(&mut self) -> io::Result<Option<backend::Message>> {
         if self.0.is_empty() {
             return Ok(None);
-        } else {
-            let remaining = self.0.remaining();
-            if remaining < 1024 {
-                self.0.reserve(1024 * 8 - remaining);
-            }
         }
         backend::Message::parse(&mut self.0)
     }
@@ -138,7 +133,7 @@ mod frame_codec {
                 }
                 // try to read more data from stream
                 // read the socket for reqs
-                if self.read_buf.remaining_mut() < 1024 {
+                if self.read_buf.capacity() - self.read_buf.len() < 1024 {
                     self.read_buf.reserve(4096 * 8);
                 }
 
@@ -187,7 +182,7 @@ mod frame_codec {
                 }
                 // try to read more data from stream
                 // read the socket for reqs
-                if self.read_buf.remaining_mut() < 1024 {
+                if self.read_buf.capacity() - self.read_buf.len() < 1024 {
                     self.read_buf.reserve(4096 * 8);
                 }
 

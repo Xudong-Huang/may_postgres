@@ -6,6 +6,7 @@ use crate::types::{FromSql, Type, WrongType};
 use crate::{Error, Statement};
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::message::backend::DataRowBody;
+use smallvec::SmallVec;
 use std::fmt;
 use std::ops::Range;
 use std::str;
@@ -97,12 +98,17 @@ where
 pub struct Row {
     statement: Statement,
     body: DataRowBody,
-    ranges: Vec<Option<Range<usize>>>,
+    ranges: SmallVec<[Option<Range<usize>>; 4]>,
 }
 
 impl Row {
     pub(crate) fn new(statement: Statement, body: DataRowBody) -> Result<Row, Error> {
-        let ranges = body.ranges().collect().map_err(Error::parse)?;
+        // let ranges = body.ranges().map(|r| r).collect().map_err(Error::parse)?;
+        let mut ranges = SmallVec::new();
+        let mut iter = body.ranges();
+        while let Some(range) = iter.next().map_err(Error::parse)? {
+            ranges.push(range);
+        }
         Ok(Row {
             statement,
             body,

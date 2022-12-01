@@ -78,6 +78,7 @@ fn process_read(stream: &mut TcpStream, read_buf: &mut BytesMut) -> io::Result<(
     Ok(())
 }
 
+#[inline]
 fn decode_messages(
     read_buf: &mut BytesMut,
     rsp_queue: &mut VecDeque<Response>,
@@ -92,7 +93,7 @@ fn decode_messages(
                 mut messages,
                 request_complete,
             } => {
-                let response = match rsp_queue.pop_front() {
+                let response = match rsp_queue.front() {
                     Some(response) => response,
                     None => match messages.next().map_err(Error::parse)? {
                         Some(Message::ErrorResponse(error)) => return Err(Error::db(error)),
@@ -102,8 +103,8 @@ fn decode_messages(
 
                 response.tx.send(messages).ok();
 
-                if !request_complete {
-                    rsp_queue.push_front(response);
+                if request_complete {
+                    rsp_queue.pop_front();
                 }
             }
             BackendMessage::Async(Message::NoticeResponse(_body)) => {}
@@ -150,6 +151,7 @@ fn nonblock_write(stream: &mut TcpStream, write_buf: &mut BytesMut) -> io::Resul
     Ok(())
 }
 
+#[inline]
 fn process_write(
     stream: &mut TcpStream,
     req_queue: &SegQueue<Request>,

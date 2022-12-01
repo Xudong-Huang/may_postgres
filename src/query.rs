@@ -3,7 +3,7 @@ use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::types::{IsNull, ToSql};
 use crate::{Error, Portal, Row, Statement};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
@@ -30,7 +30,7 @@ pub fn query_portal(
     max_rows: i32,
 ) -> Result<RowStream, Error> {
     let buf = client.with_buf(|buf| {
-        let remaining = buf.remaining_mut();
+        let remaining = buf.capacity() - buf.len();
         if remaining < 1024 {
             buf.reserve(1024 * 64 - remaining);
         }
@@ -86,7 +86,7 @@ where
     I::IntoIter: ExactSizeIterator,
 {
     client.with_buf(|buf| {
-        let remaining = buf.remaining_mut();
+        let remaining = buf.capacity() - buf.len();
         if remaining < 1024 {
             buf.reserve(1024 * 64 - remaining);
         }
