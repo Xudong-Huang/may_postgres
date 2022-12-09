@@ -61,7 +61,7 @@ fn dns(host: &str, port: u16) -> io::Result<vec::IntoIter<SocketAddr>> {
 
 fn connect_with_timeout(addr: &SocketAddr, timeout: Option<Duration>) -> Result<TcpStream, Error> {
     match timeout {
-        Some(timeout) => TcpStream::connect_timeout(addr, timeout).map_err(Error::connect),
+        Some(_timeout) => unimplemented!(), //TcpStream::connect_timeout(addr, timeout).map_err(Error::connect),
         None => TcpStream::connect(addr).map_err(Error::connect),
     }
 }

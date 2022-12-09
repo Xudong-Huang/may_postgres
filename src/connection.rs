@@ -50,17 +50,20 @@ impl Drop for Connection {
 
 // read the socket until no data
 #[inline]
-fn process_read(stream: &mut TcpStream, read_buf: &mut BytesMut) -> io::Result<()> {
-    let remaining = read_buf.capacity() - read_buf.len();
+fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<usize> {
+    let remaining = read_buf.capacity();
     if remaining < 1024 {
-        read_buf.reserve(4096 * 32 - remaining);
+        read_buf.reserve(4096 * 128 - remaining);
     }
+
+    let mut read_cnt = 0;
 
     loop {
         let buf = unsafe { &mut *(read_buf.bytes_mut() as *mut _ as *mut [u8]) };
         match stream.read(buf) {
             Ok(n) => {
                 if n > 0 {
+                    read_cnt += n;
                     unsafe { read_buf.advance_mut(n) };
                 } else {
                     //connection was closed
@@ -75,7 +78,7 @@ fn process_read(stream: &mut TcpStream, read_buf: &mut BytesMut) -> io::Result<(
             }
         }
     }
-    Ok(())
+    Ok(read_cnt)
 }
 
 #[inline]
@@ -122,7 +125,7 @@ fn decode_messages(
 }
 
 #[inline]
-fn nonblock_write(stream: &mut TcpStream, write_buf: &mut BytesMut) -> io::Result<()> {
+fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Result<usize> {
     let len = write_buf.len();
     let mut written = 0;
     while written < len {
@@ -142,26 +145,22 @@ fn nonblock_write(stream: &mut TcpStream, write_buf: &mut BytesMut) -> io::Resul
             }
         }
     }
-    if written == len {
-        unsafe { write_buf.set_len(0) }
-    } else if written > 0 {
-        write_buf.advance(written);
-    }
+    write_buf.advance(written);
 
-    Ok(())
+    Ok(written)
 }
 
 #[inline]
 fn process_write(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     req_queue: &SegQueue<Request>,
     rsp_queue: &mut VecDeque<Response>,
     write_buf: &mut BytesMut,
 ) -> io::Result<()> {
-    // let remaining = write_buf.capacity() - write_buf.len();
-    // if remaining < 1024 {
-    //     write_buf.reserve(4096 * 8 - remaining);
-    // }
+    let remaining = write_buf.capacity();
+    if remaining < 1024 {
+        write_buf.reserve(4096 * 32 - remaining);
+    }
     loop {
         match req_queue.pop() {
             Some(req) => {
@@ -226,6 +225,17 @@ fn process_write(
     Ok(())
 }
 
+#[inline]
+fn make_terminate_req() -> Request {
+    let mut request = BytesMut::new();
+    frontend::terminate(&mut request);
+    let (tx, _rx) = mpsc::channel();
+    Request {
+        messages: RequestMessages::Single(FrontendMessage::Raw(request.freeze())),
+        sender: tx,
+    }
+}
+
 impl Connection {
     pub(crate) fn new(
         mut stream: TcpStream,
@@ -236,59 +246,45 @@ impl Connection {
         let req_queue = Arc::new(SegQueue::new());
         let req_queue_dup = req_queue.clone();
         let io_handle = go!(move || {
-            let mut read_buf = BytesMut::with_capacity(4096 * 32);
+            let mut read_buf = BytesMut::with_capacity(4096 * 128);
             let mut rsp_queue = VecDeque::with_capacity(1000);
-            let mut write_buf = BytesMut::with_capacity(4096 * 8);
+            let mut write_buf = BytesMut::with_capacity(4096 * 32);
 
-            let mut is_error = false;
+            let mut has_error = false;
 
-            stream.set_nonblocking(true).unwrap();
-            loop {
+            while !has_error {
                 stream.reset_io();
+                let inner_stream = stream.inner_mut();
+
                 if !rsp_queue.is_empty() {
-                    if let Err(e) = process_read(&mut stream, &mut read_buf) {
-                        error!("receiver closed. err={}", e);
-                        let mut request = BytesMut::new();
-                        frontend::terminate(&mut request);
-                        let (tx, _rx) = mpsc::channel();
-                        let req = Request {
-                            messages: RequestMessages::Single(FrontendMessage::Raw(
-                                request.freeze(),
-                            )),
-                            sender: tx,
-                        };
-                        req_queue_dup.push(req);
-                        is_error = true;
-                    }
+                    let read_cnt = match process_read(inner_stream, &mut read_buf) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            error!("process_read err={}", e);
+                            req_queue_dup.push(make_terminate_req());
+                            has_error = true;
+                            0
+                        }
+                    };
 
-                    if let Err(e) = decode_messages(&mut read_buf, &mut rsp_queue, &mut parameters)
-                    {
-                        error!("decode_messages err={}", e);
-                        let mut request = BytesMut::new();
-                        frontend::terminate(&mut request);
-                        let (tx, _rx) = mpsc::channel();
-                        let req = Request {
-                            messages: RequestMessages::Single(FrontendMessage::Raw(
-                                request.freeze(),
-                            )),
-                            sender: tx,
-                        };
-                        req_queue_dup.push(req);
-                        is_error = true;
+                    if read_cnt > 0 {
+                        if let Err(e) =
+                            decode_messages(&mut read_buf, &mut rsp_queue, &mut parameters)
+                        {
+                            error!("decode_messages err={}", e);
+                            req_queue_dup.push(make_terminate_req());
+                            has_error = true;
+                        }
                     }
                 }
 
-                if let Err(e) =
-                    process_write(&mut stream, &req_queue_dup, &mut rsp_queue, &mut write_buf)
-                {
-                    error!("writer closed. err={}", e);
-                    break;
+                match process_write(inner_stream, &req_queue_dup, &mut rsp_queue, &mut write_buf) {
+                    Ok(_) => stream.wait_io(),
+                    Err(e) => {
+                        error!("process_write err={}", e);
+                        has_error = true;
+                    }
                 }
-
-                if is_error {
-                    break;
-                }
-                stream.wait_io();
             }
 
             stream.shutdown(std::net::Shutdown::Both).ok();

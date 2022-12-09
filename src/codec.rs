@@ -133,8 +133,8 @@ mod frame_codec {
                 }
                 // try to read more data from stream
                 // read the socket for reqs
-                if self.read_buf.capacity() - self.read_buf.len() < 1024 {
-                    self.read_buf.reserve(4096 * 8);
+                if self.read_buf.capacity() < 1024 {
+                    self.read_buf.reserve(4096 * 8 - self.read_buf.capacity());
                 }
 
                 let n = {
@@ -182,8 +182,8 @@ mod frame_codec {
                 }
                 // try to read more data from stream
                 // read the socket for reqs
-                if self.read_buf.capacity() - self.read_buf.len() < 1024 {
-                    self.read_buf.reserve(4096 * 8);
+                if self.read_buf.capacity() < 1024 {
+                    self.read_buf.reserve(4096 * 8 - self.read_buf.capacity());
                 }
 
                 let read_buf = unsafe { &mut *(self.read_buf.bytes_mut() as *mut _ as *mut [u8]) };

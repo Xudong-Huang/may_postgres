@@ -104,7 +104,7 @@ impl InnerClient {
     {
         use std::cell::RefCell;
         thread_local!(
-            static BUF: RefCell<BytesMut> = RefCell::new(BytesMut::with_capacity(1024 * 64))
+            static BUF: RefCell<BytesMut> = RefCell::new(BytesMut::with_capacity(4096 * 32))
         );
         // let mut state = self.state.lock().unwrap();
         BUF.with(|b| {
