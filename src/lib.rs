@@ -3,14 +3,14 @@
 //! # Example
 //!
 //! ```no_run
-//! use may_postgres::{Error, Row};
+//! use may_postgres::{NoTls, Error};
 //!
 //! fn main() -> Result<(), Error> {
 //!     // Connect to the database.
-//!     let client= may_postgres::connect("host=localhost user=postgres")?;
+//!     let client= may_postgres::connect("host=localhost user=postgres", NoTls)?;
 //!
 //!
-//!     // And then execute it, returning a Stream of Rows which we collect into a Vec.
+//!     // Now we can execute a simple statement that just returns its parameter.
 //!     let rows = client
 //!         .query("SELECT $1::TEXT", &[&"hello world"])?;
 //!
@@ -56,7 +56,53 @@
 //! Pipelining happens automatically when futures are polled concurrently (for example, by using the futures `join`
 //! combinator):
 //!
-#![doc(html_root_url = "https://docs.rs/may-postgres/0.1.0")]
+//! ```rust
+//! use may_postgres::{Client, Error, Statement};
+//!
+//! fn pipelined_prepare(
+//!     client: &Client,
+//! ) -> Result<(Statement, Statement), Error>
+//! {
+//!     may::join!(
+//!         client.prepare("SELECT * FROM foo"),
+//!         client.prepare("INSERT INTO bar (id, name) VALUES ($1, $2)")
+//!     )
+//! }
+//! ```
+//!
+//! # Runtime
+//!
+//! The client works with arbitrary `AsyncRead + AsyncWrite` streams. Convenience APIs are provided to handle the
+//! connection process, but these are gated by the `runtime` Cargo feature, which is enabled by default. If disabled,
+//! all dependence on the tokio runtime is removed.
+//!
+//! # SSL/TLS support
+//!
+//! TLS support is implemented via external libraries. `Client::connect` and `Config::connect` take a TLS implementation
+//! as an argument. The `NoTls` type in this crate can be used when TLS is not required. Otherwise, the
+//! `postgres-openssl` and `postgres-native-tls` crates provide implementations backed by the `openssl` and `native-tls`
+//! crates, respectively.
+//!
+//! # Features
+//!
+//! The following features can be enabled from `Cargo.toml`:
+//!
+//! | Feature | Description | Extra dependencies | Default |
+//! | ------- | ----------- | ------------------ | ------- |
+//! | `runtime` | Enable convenience API for the connection process based on the `tokio` crate. | [tokio](https://crates.io/crates/tokio) 1.0 with the features `net` and `time` | yes |
+//! | `array-impls` | Enables `ToSql` and `FromSql` trait impls for arrays | - | no |
+//! | `with-bit-vec-0_6` | Enable support for the `bit-vec` crate. | [bit-vec](https://crates.io/crates/bit-vec) 0.6 | no |
+//! | `with-chrono-0_4` | Enable support for the `chrono` crate. | [chrono](https://crates.io/crates/chrono) 0.4 | no |
+//! | `with-eui48-0_4` | Enable support for the 0.4 version of the `eui48` crate. | [eui48](https://crates.io/crates/eui48) 0.4 | no |
+//! | `with-eui48-1` | Enable support for the 1.0 version of the `eui48` crate. | [eui48](https://crates.io/crates/eui48) 1.0 | no |
+//! | `with-geo-types-0_6` | Enable support for the 0.6 version of the `geo-types` crate. | [geo-types](https://crates.io/crates/geo-types/0.6.0) 0.6 | no |
+//! | `with-geo-types-0_7` | Enable support for the 0.7 version of the `geo-types` crate. | [geo-types](https://crates.io/crates/geo-types/0.7.0) 0.7 | no |
+//! | `with-serde_json-1` | Enable support for the `serde_json` crate. | [serde_json](https://crates.io/crates/serde_json) 1.0 | no |
+//! | `with-uuid-0_8` | Enable support for the `uuid` crate. | [uuid](https://crates.io/crates/uuid) 0.8 | no |
+//! | `with-uuid-1` | Enable support for the `uuid` crate. | [uuid](https://crates.io/crates/uuid) 1.0 | no |
+//! | `with-time-0_2` | Enable support for the 0.2 version of the `time` crate. | [time](https://crates.io/crates/time/0.2.0) 0.2 | no |
+//! | `with-time-0_3` | Enable support for the 0.3 version of the `time` crate. | [time](https://crates.io/crates/time/0.3.0) 0.3 | no |
+#![doc(html_root_url = "https://docs.rs/tokio-postgres/0.7")]
 #![warn(rust_2018_idioms, clippy::all, missing_docs)]
 
 macro_rules! o_try {
@@ -71,6 +117,7 @@ macro_rules! o_try {
 pub use crate::cancel_token::CancelToken;
 pub use crate::client::Client;
 pub use crate::config::Config;
+pub use crate::connection::Connection;
 pub use crate::copy_in::CopyInSink;
 pub use crate::copy_out::CopyOutStream;
 use crate::error::DbError;
@@ -80,7 +127,12 @@ pub use crate::portal::Portal;
 pub use crate::query::RowStream;
 pub use crate::row::{Row, SimpleQueryRow};
 pub use crate::simple_query::SimpleQueryStream;
+// #[cfg(feature = "runtime")]
+// pub use crate::socket::Socket;
 pub use crate::statement::{Column, Statement};
+// #[cfg(feature = "runtime")]
+// use crate::tls::MakeTlsConnect;
+// pub use crate::tls::NoTls;
 pub use crate::to_statement::ToStatement;
 pub use crate::transaction::Transaction;
 pub use crate::transaction_builder::{IsolationLevel, TransactionBuilder};
@@ -88,30 +140,35 @@ use crate::types::ToSql;
 
 pub mod binary_copy;
 mod bind;
+#[cfg(feature = "runtime")]
 mod cancel_query;
 mod cancel_query_raw;
 mod cancel_token;
 mod client;
 mod codec;
 pub mod config;
+#[cfg(feature = "runtime")]
 mod connect;
 mod connect_raw;
+#[cfg(feature = "runtime")]
 mod connect_socket;
-// #[cfg(not(unix))]
+// mod connect_tls;
 mod connection;
-// #[cfg(unix)]
-// #[path = "connection_unix.rs"]
-// mod connection;
 mod copy_in;
 mod copy_out;
 pub mod error;
 mod generic_client;
+mod keepalive;
+// mod maybe_tls_stream;
 mod portal;
 mod prepare;
 mod query;
 pub mod row;
 mod simple_query;
+// #[cfg(feature = "runtime")]
+// mod socket;
 mod statement;
+// pub mod tls;
 mod to_statement;
 mod transaction;
 mod transaction_builder;
@@ -124,6 +181,7 @@ pub mod types;
 /// Requires the `runtime` Cargo feature (enabled by default).
 ///
 /// [`Config`]: config/struct.Config.html
+#[cfg(feature = "runtime")]
 pub fn connect(config: &str) -> Result<Client, Error> {
     let config = config.parse::<Config>()?;
     config.connect()
@@ -156,6 +214,7 @@ impl Notification {
 
 /// An asynchronous message from the server.
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum AsyncMessage {
     /// A notice.

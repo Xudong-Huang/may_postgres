@@ -1,22 +1,34 @@
-use crate::cancel_query;
-use crate::codec::BackendMessages;
+use crate::codec::{BackendMessages, FrontendMessage};
+#[cfg(feature = "runtime")]
 use crate::config::Host;
-use crate::connection::{Connection, Request, RequestMessages};
+use crate::config::SslMode;
+use crate::connection::{Request, RequestMessages};
 use crate::copy_out::CopyOutStream;
+#[cfg(feature = "runtime")]
+use crate::keepalive::KeepaliveConfig;
 use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
+// #[cfg(feature = "runtime")]
+// use crate::tls::MakeTlsConnect;
+// use crate::tls::TlsConnect;
 use crate::types::{Oid, ToSql, Type};
+#[cfg(feature = "runtime")]
 use crate::{
-    copy_in, copy_out, prepare, query, simple_query, slice_iter, CancelToken, CopyInSink, Error,
-    Row, SimpleQueryMessage, Statement, ToStatement, Transaction, TransactionBuilder,
+    copy_in, copy_out, prepare, query, simple_query, slice_iter, CancelToken, Connection,
+    CopyInSink, Error, Row, SimpleQueryMessage, Statement, ToStatement, Transaction,
+    TransactionBuilder,
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
 use may::sync::mpsc;
-use postgres_protocol::message::backend::Message;
+use postgres_protocol::message::{backend::Message, frontend};
+use postgres_types::BorrowToSql;
 use spin::Mutex;
 use std::collections::HashMap;
+use std::fmt;
+use std::io::{Read, Write};
 use std::sync::Arc;
+#[cfg(feature = "runtime")]
 use std::time::Duration;
 
 pub struct Responses {
@@ -41,17 +53,30 @@ impl Responses {
     }
 }
 
-struct State {
+/// A cache of type info and prepared statements for fetching type info
+/// (corresponding to the queries in the [prepare](prepare) module).
+#[derive(Default)]
+struct CachedTypeInfo {
+    /// A statement for basic information for a type from its
+    /// OID. Corresponds to [TYPEINFO_QUERY](prepare::TYPEINFO_QUERY) (or its
+    /// fallback).
     typeinfo: Option<Statement>,
+    /// A statement for getting information for a composite type from its OID.
+    /// Corresponds to [TYPEINFO_QUERY](prepare::TYPEINFO_COMPOSITE_QUERY).
     typeinfo_composite: Option<Statement>,
+    /// A statement for getting information for a composite type from its OID.
+    /// Corresponds to [TYPEINFO_QUERY](prepare::TYPEINFO_COMPOSITE_QUERY) (or
+    /// its fallback).
     typeinfo_enum: Option<Statement>,
+
+    /// Cache of types already looked up.
     types: HashMap<Oid, Type>,
     // buf: BytesMut,
 }
 
 pub struct InnerClient {
-    pub(crate) sender: Connection,
-    state: Mutex<State>,
+    sender: Connection,
+    cached_typeinfo: Mutex<CachedTypeInfo>,
 }
 
 impl InnerClient {
@@ -67,37 +92,43 @@ impl InnerClient {
     }
 
     pub fn typeinfo(&self) -> Option<Statement> {
-        self.state.lock().typeinfo.clone()
+        self.cached_typeinfo.lock().typeinfo.clone()
     }
 
     pub fn set_typeinfo(&self, statement: &Statement) {
-        self.state.lock().typeinfo = Some(statement.clone());
+        self.cached_typeinfo.lock().typeinfo = Some(statement.clone());
     }
 
     pub fn typeinfo_composite(&self) -> Option<Statement> {
-        self.state.lock().typeinfo_composite.clone()
+        self.cached_typeinfo.lock().typeinfo_composite.clone()
     }
 
     pub fn set_typeinfo_composite(&self, statement: &Statement) {
-        self.state.lock().typeinfo_composite = Some(statement.clone());
+        self.cached_typeinfo.lock().typeinfo_composite = Some(statement.clone());
     }
 
     pub fn typeinfo_enum(&self) -> Option<Statement> {
-        self.state.lock().typeinfo_enum.clone()
+        self.cached_typeinfo.lock().typeinfo_enum.clone()
     }
 
     pub fn set_typeinfo_enum(&self, statement: &Statement) {
-        self.state.lock().typeinfo_enum = Some(statement.clone());
+        self.cached_typeinfo.lock().typeinfo_enum = Some(statement.clone());
     }
 
     pub fn type_(&self, oid: Oid) -> Option<Type> {
-        self.state.lock().types.get(&oid).cloned()
+        self.cached_typeinfo.lock().types.get(&oid).cloned()
     }
 
     pub fn set_type(&self, oid: Oid, type_: &Type) {
-        self.state.lock().types.insert(oid, type_.clone());
+        self.cached_typeinfo.lock().types.insert(oid, type_.clone());
     }
 
+    pub fn clear_type_cache(&self) {
+        self.cached_typeinfo.lock().types.clear();
+    }
+
+    /// Call the given function with a buffer to be used when writing out
+    /// postgres commands.
     pub fn with_buf<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut BytesMut) -> R,
@@ -117,13 +148,13 @@ impl InnerClient {
     }
 }
 
+#[cfg(feature = "runtime")]
 #[derive(Clone)]
 pub(crate) struct SocketConfig {
     pub host: Host,
     pub port: u16,
     pub connect_timeout: Option<Duration>,
-    pub keepalives: bool,
-    pub keepalives_idle: Duration,
+    pub keepalive: Option<KeepaliveConfig>,
 }
 
 /// An asynchronous PostgreSQL client.
@@ -132,25 +163,28 @@ pub(crate) struct SocketConfig {
 /// through this client object.
 pub struct Client {
     inner: Arc<InnerClient>,
+    #[cfg(feature = "runtime")]
     socket_config: Option<SocketConfig>,
+    ssl_mode: SslMode,
     process_id: i32,
     secret_key: i32,
 }
 
 impl Client {
-    pub(crate) fn new(sender: Connection, process_id: i32, secret_key: i32) -> Client {
+    pub(crate) fn new(
+        sender: Connection,
+        ssl_mode: SslMode,
+        process_id: i32,
+        secret_key: i32,
+    ) -> Client {
         Client {
             inner: Arc::new(InnerClient {
                 sender,
-                state: Mutex::new(State {
-                    typeinfo: None,
-                    typeinfo_composite: None,
-                    typeinfo_enum: None,
-                    types: HashMap::new(),
-                    // buf: BytesMut::new(),
-                }),
+                cached_typeinfo: Default::default(),
             }),
+            #[cfg(feature = "runtime")]
             socket_config: None,
+            ssl_mode,
             process_id,
             secret_key,
         }
@@ -160,6 +194,7 @@ impl Client {
         &self.inner
     }
 
+    #[cfg(feature = "runtime")]
     pub(crate) fn set_socket_config(&mut self, socket_config: SocketConfig) {
         self.socket_config = Some(socket_config);
     }
@@ -281,10 +316,34 @@ impl Client {
     /// Panics if the number of parameters provided does not match the number expected.
     ///
     /// [`query`]: #method.query
-    pub fn query_raw<'a, T, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn _main(client: &may_postgres::Client) -> Result<(), may_postgres::Error> {
+    /// use may_postgres::types::ToSql;
+    ///
+    /// let params: Vec<String> = vec![
+    ///     "first param".into(),
+    ///     "second param".into(),
+    /// ];
+    /// let mut it = client.query_raw(
+    ///     "SELECT foo FROM bar WHERE biz = $1 AND baz = $2",
+    ///     params,
+    /// )?;
+    ///
+    /// while let Some(row) = it.try_next()? {
+    ///     let foo: i32 = row.get("foo");
+    ///     println!("foo: {}", foo);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn query_raw<T, P, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
     where
         T: ?Sized + ToStatement,
-        I: IntoIterator<Item = &'a dyn ToSql>,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
         I::IntoIter: ExactSizeIterator,
     {
         let statement = statement.__convert().into_statement(self)?;
@@ -326,10 +385,11 @@ impl Client {
     /// Panics if the number of parameters provided does not match the number expected.
     ///
     /// [`execute`]: #method.execute
-    pub fn execute_raw<'a, T, I>(&self, statement: &T, params: I) -> Result<u64, Error>
+    pub fn execute_raw<T, P, I>(&self, statement: &T, params: I) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement,
-        I: IntoIterator<Item = &'a dyn ToSql>,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
         I::IntoIter: ExactSizeIterator,
     {
         let statement = statement.__convert().into_statement(self)?;
@@ -407,7 +467,42 @@ impl Client {
     ///
     /// The transaction will roll back by default - use the `commit` method to commit it.
     pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
-        self.batch_execute("BEGIN")?;
+        struct RollbackIfNotDone<'me> {
+            client: &'me Client,
+            done: bool,
+        }
+
+        impl<'a> Drop for RollbackIfNotDone<'a> {
+            fn drop(&mut self) {
+                if self.done {
+                    return;
+                }
+
+                let buf = self.client.inner().with_buf(|buf| {
+                    frontend::query("ROLLBACK", buf).unwrap();
+                    buf.split().freeze()
+                });
+                let _ = self
+                    .client
+                    .inner()
+                    .send(RequestMessages::Single(FrontendMessage::Raw(buf)));
+            }
+        }
+
+        // This is done, as `Future` created by this method can be dropped after
+        // `RequestMessages` is synchronously send to the `Connection` by
+        // `batch_execute()`, but before `Responses` is asynchronously polled to
+        // completion. In that case `Transaction` won't be created and thus
+        // won't be rolled back.
+        {
+            let mut cleaner = RollbackIfNotDone {
+                client: self,
+                done: false,
+            };
+            self.batch_execute("BEGIN")?;
+            cleaner.done = true;
+        }
+
         Ok(Transaction::new(self))
     }
 
@@ -419,12 +514,13 @@ impl Client {
         TransactionBuilder::new(self)
     }
 
-    /// Constructs a cancellation token that can later be used to request
-    /// cancellation of a query running on the connection associated with
-    /// this client.
+    /// Constructs a cancellation token that can later be used to request cancellation of a query running on the
+    /// connection associated with this client.
     pub fn cancel_token(&self) -> CancelToken {
         CancelToken {
+            #[cfg(feature = "runtime")]
             socket_config: self.socket_config.clone(),
+            ssl_mode: self.ssl_mode,
             process_id: self.process_id,
             secret_key: self.secret_key,
         }
@@ -435,15 +531,47 @@ impl Client {
     /// The server provides no information about whether a cancellation attempt was successful or not. An error will
     /// only be returned if the client was unable to connect to the database.
     ///
+    /// Requires the `runtime` Cargo feature (enabled by default).
+    #[deprecated(since = "0.6.0", note = "use Client::cancel_token() instead")]
     pub fn cancel_query(&self) -> Result<(), Error> {
-        cancel_query::cancel_query(self.socket_config.clone(), self.process_id, self.secret_key)
+        self.cancel_token().cancel_query()
+    }
+
+    /// Like `cancel_query`, but uses a stream which is already connected to the server rather than opening a new
+    /// connection itself.
+    #[deprecated(since = "0.6.0", note = "use Client::cancel_token() instead")]
+    pub fn cancel_query_raw<S>(&self, stream: S) -> Result<(), Error>
+    where
+        S: Read + Write,
+    {
+        self.cancel_token().cancel_query_raw(stream)
+    }
+
+    /// Clears the client's type information cache.
+    ///
+    /// When user-defined types are used in a query, the client loads their definitions from the database and caches
+    /// them for the lifetime of the client. If those definitions are changed in the database, this method can be used
+    /// to flush the local cache and allow the new, updated definitions to be loaded.
+    pub fn clear_type_cache(&self) {
+        self.inner().clear_type_cache();
     }
 
     /// Determines if the connection to the server has already closed.
     ///
     /// In that case, all future queries will fail.
-    pub fn _is_closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool {
         // self.inner.sender.is_closed()
-        unimplemented!()
+        false
+    }
+
+    #[doc(hidden)]
+    pub fn __private_api_close(&mut self) {
+        // self.inner.sender.close_channel()
+    }
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client").finish()
     }
 }

@@ -3,9 +3,11 @@ use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::{query, slice_iter, Error, Statement};
 use bytes::Bytes;
+use log::debug;
 use postgres_protocol::message::backend::Message;
 
 pub fn copy_out(client: &InnerClient, statement: Statement) -> Result<CopyOutStream, Error> {
+    debug!("executing copy out statement {}", statement.name());
     let buf = query::encode(client, &statement, slice_iter(&[]))?;
     let responses = start(client, buf)?;
     Ok(CopyOutStream { responses })

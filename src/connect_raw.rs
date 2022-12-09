@@ -1,7 +1,11 @@
-use crate::codec::{BackendMessage, BackendMessages, Framed, FrontendMessage, PostgresCodec};
-use crate::config::Config;
-use crate::connection::Connection;
-use crate::{Client, Error};
+use crate::codec::Framed;
+use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCodec};
+use crate::config::{self, Config};
+// use crate::connect_tls::connect_tls;
+// use crate::maybe_tls_stream::MaybeTlsStream;
+// use crate::socket::SocketExt;
+// use crate::tls::{TlsConnect, TlsStream};
+use crate::{Client, Connection, Error};
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use may::net::TcpStream;
@@ -10,40 +14,52 @@ use postgres_protocol::authentication::sasl;
 use postgres_protocol::authentication::sasl::ScramSha256;
 use postgres_protocol::message::backend::{AuthenticationSaslBody, Message};
 use postgres_protocol::message::frontend;
-use std::collections::HashMap;
-use std::io::{self, Write};
+use std::collections::{HashMap, VecDeque};
+use std::io;
 
 pub struct StartupStream {
     inner: Framed,
     buf: BackendMessages,
+    delayed: VecDeque<BackendMessage>,
 }
 
 impl StartupStream {
-    fn send(&mut self, msg: FrontendMessage) -> io::Result<()> {
-        let mut encoder = PostgresCodec;
-        let mut data = BytesMut::with_capacity(512);
-        encoder.encode(msg, &mut data)?;
-        self.inner.inner_mut().write_all(&data)
+    pub fn send(&mut self, msg: FrontendMessage) -> io::Result<()> {
+        self.inner.send(msg)
     }
 
-    fn next_msg(&mut self) -> io::Result<Message> {
+    pub fn try_next(&mut self) -> io::Result<Option<Message>> {
+        self.next().transpose()
+    }
+}
+
+impl Iterator for StartupStream {
+    type Item = io::Result<Message>;
+
+    fn next(&mut self) -> Option<io::Result<Message>> {
         loop {
-            if let Some(message) = self.buf.next()? {
-                return Ok(message);
+            match self.buf.next() {
+                Ok(Some(message)) => return Some(Ok(message)),
+                Ok(None) => {}
+                Err(e) => return Some(Err(e)),
             }
 
-            match self.inner.next_msg()? {
-                BackendMessage::Normal { messages, .. } => self.buf = messages,
-                BackendMessage::Async(message) => return Ok(message),
+            match self.inner.next_msg() {
+                Ok(BackendMessage::Normal { messages, .. }) => self.buf = messages,
+                Ok(BackendMessage::Async(message)) => return Some(Ok(message)),
+                Err(e) => return Some(Err(e)),
             }
         }
     }
 }
 
 pub fn connect_raw(stream: TcpStream, config: &Config) -> Result<Client, Error> {
+    // let stream = connect_tls(stream, config.ssl_mode, tls)?;
+
     let mut stream = StartupStream {
-        inner: Framed::new(stream),
+        inner: Framed::new(stream, PostgresCodec),
         buf: BackendMessages::empty(),
+        delayed: VecDeque::new(),
     };
 
     startup(&mut stream, config)?;
@@ -51,13 +67,13 @@ pub fn connect_raw(stream: TcpStream, config: &Config) -> Result<Client, Error> 
     let (process_id, secret_key, parameters) = read_info(&mut stream)?;
 
     let connection = Connection::new(stream.inner.into_stream(), parameters);
-    let client = Client::new(connection, process_id, secret_key);
+    let client = Client::new(connection, config.ssl_mode, process_id, secret_key);
 
     Ok(client)
 }
 
 fn startup(stream: &mut StartupStream, config: &Config) -> Result<(), Error> {
-    let mut params = vec![("client_encoding", "UTF8"), ("timezone", "GMT")];
+    let mut params = vec![("client_encoding", "UTF8")];
     if let Some(user) = &config.user {
         params.push(("user", &**user));
     }
@@ -80,9 +96,14 @@ fn startup(stream: &mut StartupStream, config: &Config) -> Result<(), Error> {
 }
 
 fn authenticate(stream: &mut StartupStream, config: &Config) -> Result<(), Error> {
-    match stream.next_msg().map_err(Error::io)? {
-        Message::AuthenticationOk => return Ok(()),
-        Message::AuthenticationCleartextPassword => {
+    match stream.try_next().map_err(Error::io)? {
+        Some(Message::AuthenticationOk) => {
+            can_skip_channel_binding(config)?;
+            return Ok(());
+        }
+        Some(Message::AuthenticationCleartextPassword) => {
+            can_skip_channel_binding(config)?;
+
             let pass = config
                 .password
                 .as_ref()
@@ -90,7 +111,9 @@ fn authenticate(stream: &mut StartupStream, config: &Config) -> Result<(), Error
 
             authenticate_password(stream, pass)?;
         }
-        Message::AuthenticationMd5Password(body) => {
+        Some(Message::AuthenticationMd5Password(body)) => {
+            can_skip_channel_binding(config)?;
+
             let user = config
                 .user
                 .as_ref()
@@ -103,30 +126,36 @@ fn authenticate(stream: &mut StartupStream, config: &Config) -> Result<(), Error
             let output = authentication::md5_hash(user.as_bytes(), pass, body.salt());
             authenticate_password(stream, output.as_bytes())?;
         }
-        Message::AuthenticationSasl(body) => {
-            let pass = config
-                .password
-                .as_ref()
-                .ok_or_else(|| Error::config("password missing".into()))?;
-
-            authenticate_sasl(stream, body, pass)?;
+        Some(Message::AuthenticationSasl(body)) => {
+            authenticate_sasl(stream, body, config)?;
         }
-        Message::AuthenticationKerberosV5
-        | Message::AuthenticationScmCredential
-        | Message::AuthenticationGss
-        | Message::AuthenticationSspi => {
+        Some(Message::AuthenticationKerberosV5)
+        | Some(Message::AuthenticationScmCredential)
+        | Some(Message::AuthenticationGss)
+        | Some(Message::AuthenticationSspi) => {
             return Err(Error::authentication(
                 "unsupported authentication method".into(),
             ))
         }
-        Message::ErrorResponse(body) => return Err(Error::db(body)),
-        _ => return Err(Error::unexpected_message()),
+        Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
+        Some(_) => return Err(Error::unexpected_message()),
+        None => return Err(Error::closed()),
     }
 
-    match stream.next_msg().map_err(Error::io)? {
-        Message::AuthenticationOk => Ok(()),
-        Message::ErrorResponse(body) => Err(Error::db(body)),
-        _ => Err(Error::unexpected_message()),
+    match stream.try_next().map_err(Error::io)? {
+        Some(Message::AuthenticationOk) => Ok(()),
+        Some(Message::ErrorResponse(body)) => Err(Error::db(body)),
+        Some(_) => Err(Error::unexpected_message()),
+        None => Err(Error::closed()),
+    }
+}
+
+fn can_skip_channel_binding(config: &Config) -> Result<(), Error> {
+    match config.channel_binding {
+        config::ChannelBinding::Disable | config::ChannelBinding::Prefer => Ok(()),
+        config::ChannelBinding::Require => Err(Error::authentication(
+            "server did not use channel binding".into(),
+        )),
     }
 }
 
@@ -142,8 +171,13 @@ fn authenticate_password(stream: &mut StartupStream, password: &[u8]) -> Result<
 fn authenticate_sasl(
     stream: &mut StartupStream,
     body: AuthenticationSaslBody,
-    password: &[u8],
+    config: &Config,
 ) -> Result<(), Error> {
+    let password = config
+        .password
+        .as_ref()
+        .ok_or_else(|| Error::config("password missing".into()))?;
+
     let mut has_scram = false;
     let mut has_scram_plus = false;
     let mut mechanisms = body.mechanisms();
@@ -155,11 +189,32 @@ fn authenticate_sasl(
         }
     }
 
-    let (channel_binding, mechanism) = if has_scram_plus || has_scram {
-        (sasl::ChannelBinding::unsupported(), sasl::SCRAM_SHA_256)
+    // let channel_binding = stream
+    //     .inner
+    //     .get_ref()
+    //     .channel_binding()
+    //     .tls_server_end_point
+    //     .filter(|_| config.channel_binding != config::ChannelBinding::Disable)
+    //     .map(sasl::ChannelBinding::tls_server_end_point);
+    let channel_binding = None;
+
+    let (channel_binding, mechanism) = if has_scram_plus {
+        match channel_binding {
+            Some(channel_binding) => (channel_binding, sasl::SCRAM_SHA_256_PLUS),
+            None => (sasl::ChannelBinding::unsupported(), sasl::SCRAM_SHA_256),
+        }
+    } else if has_scram {
+        match channel_binding {
+            Some(_) => (sasl::ChannelBinding::unrequested(), sasl::SCRAM_SHA_256),
+            None => (sasl::ChannelBinding::unsupported(), sasl::SCRAM_SHA_256),
+        }
     } else {
         return Err(Error::authentication("unsupported SASL mechanism".into()));
     };
+
+    if mechanism != sasl::SCRAM_SHA_256_PLUS {
+        can_skip_channel_binding(config)?;
+    }
 
     let mut scram = ScramSha256::new(password, channel_binding);
 
@@ -169,10 +224,11 @@ fn authenticate_sasl(
         .send(FrontendMessage::Raw(buf.freeze()))
         .map_err(Error::io)?;
 
-    let body = match stream.next_msg().map_err(Error::io)? {
-        Message::AuthenticationSaslContinue(body) => body,
-        Message::ErrorResponse(body) => return Err(Error::db(body)),
-        _ => return Err(Error::unexpected_message()),
+    let body = match stream.try_next().map_err(Error::io)? {
+        Some(Message::AuthenticationSaslContinue(body)) => body,
+        Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
+        Some(_) => return Err(Error::unexpected_message()),
+        None => return Err(Error::closed()),
     };
 
     scram
@@ -185,10 +241,11 @@ fn authenticate_sasl(
         .send(FrontendMessage::Raw(buf.freeze()))
         .map_err(Error::io)?;
 
-    let body = match stream.next_msg().map_err(Error::io)? {
-        Message::AuthenticationSaslFinal(body) => body,
-        Message::ErrorResponse(body) => return Err(Error::db(body)),
-        _ => return Err(Error::unexpected_message()),
+    let body = match stream.try_next().map_err(Error::io)? {
+        Some(Message::AuthenticationSaslFinal(body)) => body,
+        Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
+        Some(_) => return Err(Error::unexpected_message()),
+        None => return Err(Error::closed()),
     };
 
     scram
@@ -204,21 +261,24 @@ fn read_info(stream: &mut StartupStream) -> Result<(i32, i32, HashMap<String, St
     let mut parameters = HashMap::new();
 
     loop {
-        match stream.next_msg().map_err(Error::io)? {
-            Message::BackendKeyData(body) => {
+        match stream.try_next().map_err(Error::io)? {
+            Some(Message::BackendKeyData(body)) => {
                 process_id = body.process_id();
                 secret_key = body.secret_key();
             }
-            Message::ParameterStatus(body) => {
+            Some(Message::ParameterStatus(body)) => {
                 parameters.insert(
                     body.name().map_err(Error::parse)?.to_string(),
                     body.value().map_err(Error::parse)?.to_string(),
                 );
             }
-            Message::NoticeResponse(_) => {}
-            Message::ReadyForQuery(_) => return Ok((process_id, secret_key, parameters)),
-            Message::ErrorResponse(body) => return Err(Error::db(body)),
-            _ => return Err(Error::unexpected_message()),
+            Some(msg @ Message::NoticeResponse(_)) => {
+                stream.delayed.push_back(BackendMessage::Async(msg))
+            }
+            Some(Message::ReadyForQuery(_)) => return Ok((process_id, secret_key, parameters)),
+            Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
+            Some(_) => return Err(Error::unexpected_message()),
+            None => return Err(Error::closed()),
         }
     }
 }

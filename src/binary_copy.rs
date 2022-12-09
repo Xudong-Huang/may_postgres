@@ -4,6 +4,7 @@ use crate::types::{FromSql, IsNull, ToSql, Type, WrongType};
 use crate::{slice_iter, CopyInSink, CopyOutStream, Error};
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use postgres_types::BorrowToSql;
 use std::convert::TryFrom;
 use std::io;
 use std::io::Cursor;
@@ -51,9 +52,10 @@ impl BinaryCopyInWriter {
     /// # Panics
     ///
     /// Panics if the number of values provided does not match the number expected.
-    pub fn write_raw<'a, I>(&mut self, values: I) -> Result<(), Error>
+    pub fn write_raw<P, I>(&mut self, values: I) -> Result<(), Error>
     where
-        I: IntoIterator<Item = &'a dyn ToSql>,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
         I::IntoIter: ExactSizeIterator,
     {
         let values = values.into_iter();
@@ -70,6 +72,7 @@ impl BinaryCopyInWriter {
             let idx = self.buf.len();
             self.buf.put_i32(0);
             let len = match value
+                .borrow_to_sql()
                 .to_sql_checked(type_, &mut self.buf)
                 .map_err(|e| Error::to_sql(e, i))?
             {
@@ -134,7 +137,7 @@ impl Iterator for BinaryCopyOutStream {
             Some(header) => header.has_oids,
             None => {
                 o_try!(check_remaining(&chunk, HEADER_LEN));
-                if &chunk.bytes()[..MAGIC.len()] != MAGIC {
+                if !chunk.chunk().starts_with(MAGIC) {
                     return Some(Err(Error::parse(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "invalid magic value",

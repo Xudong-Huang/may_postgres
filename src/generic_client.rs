@@ -1,5 +1,5 @@
 use crate::query::RowStream;
-use crate::types::{ToSql, Type};
+use crate::types::{BorrowToSql, ToSql, Type};
 use crate::{Client, Error, Row, Statement, ToStatement, Transaction};
 
 mod private {
@@ -16,10 +16,11 @@ pub trait GenericClient: private::Sealed {
         T: ?Sized + ToStatement + Sync + Send;
 
     /// Like `Client::execute_raw`.
-    fn execute_raw<'b, I, T>(&self, statement: &T, params: I) -> Result<u64, Error>
+    fn execute_raw<P, I, T>(&self, statement: &T, params: I) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
-        I: IntoIterator<Item = &'b dyn ToSql> + Sync + Send,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P> + Sync + Send,
         I::IntoIter: ExactSizeIterator;
 
     /// Like `Client::query`.
@@ -42,10 +43,11 @@ pub trait GenericClient: private::Sealed {
         T: ?Sized + ToStatement + Sync + Send;
 
     /// Like `Client::query_raw`.
-    fn query_raw<'b, T, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
+    fn query_raw<T, P, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
-        I: IntoIterator<Item = &'b dyn ToSql> + Sync + Send,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P> + Sync + Send,
         I::IntoIter: ExactSizeIterator;
 
     /// Like `Client::prepare`.
@@ -56,6 +58,9 @@ pub trait GenericClient: private::Sealed {
 
     /// Like `Client::transaction`.
     fn transaction(&mut self) -> Result<Transaction<'_>, Error>;
+
+    /// Returns a reference to the underlying `Client`.
+    fn client(&self) -> &Client;
 }
 
 impl private::Sealed for Client {}
@@ -68,10 +73,11 @@ impl GenericClient for Client {
         self.execute(query, params)
     }
 
-    fn execute_raw<'b, I, T>(&self, statement: &T, params: I) -> Result<u64, Error>
+    fn execute_raw<P, I, T>(&self, statement: &T, params: I) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
-        I: IntoIterator<Item = &'b dyn ToSql> + Sync + Send,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P> + Sync + Send,
         I::IntoIter: ExactSizeIterator,
     {
         self.execute_raw(statement, params)
@@ -102,10 +108,11 @@ impl GenericClient for Client {
         self.query_opt(statement, params)
     }
 
-    fn query_raw<'b, T, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
+    fn query_raw<T, P, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
-        I: IntoIterator<Item = &'b dyn ToSql> + Sync + Send,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P> + Sync + Send,
         I::IntoIter: ExactSizeIterator,
     {
         self.query_raw(statement, params)
@@ -122,6 +129,10 @@ impl GenericClient for Client {
     fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         self.transaction()
     }
+
+    fn client(&self) -> &Client {
+        self
+    }
 }
 
 impl private::Sealed for Transaction<'_> {}
@@ -134,10 +145,11 @@ impl GenericClient for Transaction<'_> {
         self.execute(query, params)
     }
 
-    fn execute_raw<'b, I, T>(&self, statement: &T, params: I) -> Result<u64, Error>
+    fn execute_raw<P, I, T>(&self, statement: &T, params: I) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
-        I: IntoIterator<Item = &'b dyn ToSql> + Sync + Send,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P> + Sync + Send,
         I::IntoIter: ExactSizeIterator,
     {
         self.execute_raw(statement, params)
@@ -168,10 +180,11 @@ impl GenericClient for Transaction<'_> {
         self.query_opt(statement, params)
     }
 
-    fn query_raw<'b, T, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
+    fn query_raw<T, P, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
-        I: IntoIterator<Item = &'b dyn ToSql> + Sync + Send,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P> + Sync + Send,
         I::IntoIter: ExactSizeIterator,
     {
         self.query_raw(statement, params)
@@ -188,5 +201,9 @@ impl GenericClient for Transaction<'_> {
     #[allow(clippy::needless_lifetimes)]
     fn transaction<'a>(&'a mut self) -> Result<Transaction<'a>, Error> {
         self.transaction()
+    }
+
+    fn client(&self) -> &Client {
+        self.client()
     }
 }

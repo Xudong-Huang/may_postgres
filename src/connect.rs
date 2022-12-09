@@ -16,15 +16,23 @@ pub fn connect(config: &Config) -> Result<Client, Error> {
 
     let mut error = None;
     for (i, host) in config.host.iter().enumerate() {
-        let port = *config
+        let port = config
             .port
             .get(i)
             .or_else(|| config.port.first())
-            .unwrap_or(&5432);
+            .copied()
+            .unwrap_or(5432);
 
         // let hostname = match host {
-        //     Host::Tcp(host) => &**host,
+        //     Host::Tcp(host) => host.as_str(),
+        //     // postgres doesn't support TLS over unix sockets, so the choice here doesn't matter
+        //     #[cfg(unix)]
+        //     Host::Unix(_) => "",
         // };
+
+        // let tls = tls
+        //     .make_tls_connect(hostname)
+        //     .map_err(|e| Error::tls(e.into()))?;
 
         match connect_once(host, port, config) {
             Ok(client) => return Ok(client),
@@ -40,8 +48,11 @@ fn connect_once(host: &Host, port: u16, config: &Config) -> Result<Client, Error
         host,
         port,
         config.connect_timeout,
-        config.keepalives,
-        config.keepalives_idle,
+        if config.keepalives {
+            Some(&config.keepalive_config)
+        } else {
+            None
+        },
     )?;
 
     let mut client = connect_raw(socket, config)?;
@@ -71,8 +82,11 @@ fn connect_once(host: &Host, port: u16, config: &Config) -> Result<Client, Error
         host: host.clone(),
         port,
         connect_timeout: config.connect_timeout,
-        keepalives: config.keepalives,
-        keepalives_idle: config.keepalives_idle,
+        keepalive: if config.keepalives {
+            Some(config.keepalive_config.clone())
+        } else {
+            None
+        },
     });
 
     Ok(client)

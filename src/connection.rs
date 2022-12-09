@@ -12,6 +12,9 @@ use postgres_protocol::message::frontend;
 
 use crate::codec::{BackendMessage, BackendMessages, FrontendMessage};
 use crate::copy_in::CopyInReceiver;
+// use crate::maybe_tls_stream::MaybeTlsStream;
+// use crate::socket::SocketExt;
+// use crate::tls::TlsStream;
 use crate::Error;
 
 use std::collections::{HashMap, VecDeque};
@@ -33,7 +36,13 @@ pub struct Response {
 }
 
 /// A connection to a PostgreSQL database.
-pub(crate) struct Connection {
+///
+/// This is one half of what is returned when a new connection is established. It performs the actual IO with the
+/// server, and should generally be spawned off onto an executor to run in the background.
+///
+/// `Connection` implements `Future`, and only resolves when the connection is closed, either because a fatal error has
+/// occurred, or because its associated `Client` has dropped and all outstanding work has completed.
+pub struct Connection {
     io_handle: JoinHandle<()>,
     req_queue: Arc<SegQueue<Request>>,
     waker: WaitIoWaker,
@@ -59,7 +68,8 @@ fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<u
     let mut read_cnt = 0;
 
     loop {
-        let buf = unsafe { &mut *(read_buf.bytes_mut() as *mut _ as *mut [u8]) };
+        let buf =
+            unsafe { &mut *(read_buf.chunk_mut().as_uninit_slice_mut() as *mut _ as *mut [u8]) };
         match stream.read(buf) {
             Ok(n) => {
                 if n > 0 {
@@ -237,10 +247,7 @@ fn make_terminate_req() -> Request {
 }
 
 impl Connection {
-    pub(crate) fn new(
-        mut stream: TcpStream,
-        mut parameters: HashMap<String, String>,
-    ) -> Connection {
+    pub(crate) fn new(mut stream: TcpStream, mut parameters: HashMap<String, String>) -> Self {
         let waker = stream.waker();
 
         let req_queue = Arc::new(SegQueue::new());
@@ -296,6 +303,11 @@ impl Connection {
             waker,
         }
     }
+
+    // /// Returns the value of a runtime parameter for this connection.
+    // pub fn parameter(&self, name: &str) -> Option<&str> {
+    //     self.parameters.get(name).map(|s| &**s)
+    // }
 
     /// send a request to the connection
     pub fn send(&self, req: Request) {

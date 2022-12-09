@@ -1,21 +1,48 @@
 use crate::client::{InnerClient, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
-use crate::types::{IsNull, ToSql};
+use crate::types::{BorrowToSql, IsNull};
 use crate::{Error, Portal, Row, Statement};
 use bytes::{Bytes, BytesMut};
+// use log::{debug, log_enabled, Level};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
+use std::fmt;
 
-pub fn query<'a, I>(
+struct BorrowToSqlParamsDebug<'a, T>(&'a [T]);
+
+impl<'a, T> fmt::Debug for BorrowToSqlParamsDebug<'a, T>
+where
+    T: BorrowToSql,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|x| x.borrow_to_sql()))
+            .finish()
+    }
+}
+
+pub fn query<P, I>(
     client: &InnerClient,
     statement: Statement,
     params: I,
 ) -> Result<RowStream, Error>
 where
-    I: IntoIterator<Item = &'a dyn ToSql>,
+    P: BorrowToSql,
+    I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
+    // let buf = if log_enabled!(Level::Debug) {
+    //     let params = params.into_iter().collect::<Vec<_>>();
+    //     debug!(
+    //         "executing statement {} with parameters: {:?}",
+    //         statement.name(),
+    //         BorrowToSqlParamsDebug(params.as_slice()),
+    //     );
+    //     encode(client, &statement, params)?
+    // } else {
+    //     encode(client, &statement, params)?
+    // };
     let buf = encode(client, &statement, params)?;
     let responses = start(client, buf)?;
     Ok(RowStream {
@@ -47,20 +74,32 @@ pub fn query_portal(
     })
 }
 
-pub fn execute<'a, I>(client: &InnerClient, statement: Statement, params: I) -> Result<u64, Error>
+pub fn execute<P, I>(client: &InnerClient, statement: Statement, params: I) -> Result<u64, Error>
 where
-    I: IntoIterator<Item = &'a dyn ToSql>,
+    P: BorrowToSql,
+    I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
+    // let buf = if log_enabled!(Level::Debug) {
+    //     let params = params.into_iter().collect::<Vec<_>>();
+    //     debug!(
+    //         "executing statement {} with parameters: {:?}",
+    //         statement.name(),
+    //         BorrowToSqlParamsDebug(params.as_slice()),
+    //     );
+    //     encode(client, &statement, params)?
+    // } else {
+    //     encode(client, &statement, params)?
+    // };
     let buf = encode(client, &statement, params)?;
     let mut responses = start(client, buf)?;
 
+    let mut rows = 0;
     loop {
         match responses.next()? {
-            Message::BindComplete => continue,
             Message::DataRow(_) => {}
             Message::CommandComplete(body) => {
-                let rows = body
+                rows = body
                     .tag()
                     .map_err(Error::parse)?
                     .rsplit(' ')
@@ -68,21 +107,29 @@ where
                     .unwrap()
                     .parse()
                     .unwrap_or(0);
-                return Ok(rows);
             }
-            Message::EmptyQueryResponse => return Ok(0),
+            Message::EmptyQueryResponse => rows = 0,
+            Message::ReadyForQuery(_) => return Ok(rows),
             _ => return Err(Error::unexpected_message()),
         }
     }
 }
 
 fn start(client: &InnerClient, buf: Bytes) -> Result<Responses, Error> {
-    client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))
+    let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+
+    match responses.next()? {
+        Message::BindComplete => {}
+        _ => return Err(Error::unexpected_message()),
+    }
+
+    Ok(responses)
 }
 
-pub fn encode<'a, I>(client: &InnerClient, statement: &Statement, params: I) -> Result<Bytes, Error>
+pub fn encode<P, I>(client: &InnerClient, statement: &Statement, params: I) -> Result<Bytes, Error>
 where
-    I: IntoIterator<Item = &'a dyn ToSql>,
+    P: BorrowToSql,
+    I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
     client.with_buf(|buf| {
@@ -98,32 +145,41 @@ where
     })
 }
 
-pub fn encode_bind<'a, I>(
+pub fn encode_bind<P, I>(
     statement: &Statement,
     params: I,
     portal: &str,
     buf: &mut BytesMut,
 ) -> Result<(), Error>
 where
-    I: IntoIterator<Item = &'a dyn ToSql>,
+    P: BorrowToSql,
+    I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
+    let param_types = statement.params();
     let params = params.into_iter();
 
     assert!(
-        statement.params().len() == params.len(),
+        param_types.len() == params.len(),
         "expected {} parameters but got {}",
-        statement.params().len(),
+        param_types.len(),
         params.len()
     );
+
+    let (param_formats, params): (Vec<_>, Vec<_>) = params
+        .zip(param_types.iter())
+        .map(|(p, ty)| (p.borrow_to_sql().encode_format(ty) as i16, p))
+        .unzip();
+
+    let params = params.into_iter();
 
     let mut error_idx = 0;
     let r = frontend::bind(
         portal,
         statement.name(),
-        Some(1),
-        params.zip(statement.params()).enumerate(),
-        |(idx, (param, ty)), buf| match param.to_sql_checked(ty, buf) {
+        param_formats,
+        params.zip(param_types).enumerate(),
+        |(idx, (param, ty)), buf| match param.borrow_to_sql().to_sql_checked(ty, buf) {
             Ok(IsNull::No) => Ok(postgres_protocol::IsNull::No),
             Ok(IsNull::Yes) => Ok(postgres_protocol::IsNull::Yes),
             Err(e) => {
@@ -141,7 +197,7 @@ where
     }
 }
 
-/// stream of rows returned by query
+/// A stream of table rows.
 pub struct RowStream {
     statement: Statement,
     responses: Responses,
@@ -158,9 +214,8 @@ impl Iterator for RowStream {
                 }
                 Message::EmptyQueryResponse
                 | Message::CommandComplete(_)
-                | Message::PortalSuspended => return None,
-                Message::ErrorResponse(body) => return Some(Err(Error::db(body))),
-                Message::BindComplete => {}
+                | Message::PortalSuspended => {}
+                Message::ReadyForQuery(_) => return None,
                 _ => return Some(Err(Error::unexpected_message())),
             };
         }
