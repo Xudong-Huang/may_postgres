@@ -254,6 +254,14 @@ impl Connection {
                 stream.reset_io();
                 let inner_stream = stream.inner_mut();
 
+                match process_write(inner_stream, &req_queue_dup, &mut rsp_queue, &mut write_buf) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("process_write err={}", e);
+                        break;
+                    }
+                }
+
                 if !rsp_queue.is_empty() {
                     let read_cnt = match process_read(inner_stream, &mut read_buf) {
                         Ok(n) => n,
@@ -275,13 +283,7 @@ impl Connection {
                     }
                 }
 
-                match process_write(inner_stream, &req_queue_dup, &mut rsp_queue, &mut write_buf) {
-                    Ok(_) => stream.wait_io(),
-                    Err(e) => {
-                        error!("process_write err={}", e);
-                        break;
-                    }
-                }
+                stream.wait_io()
             }
 
             stream.shutdown(std::net::Shutdown::Both).ok();
