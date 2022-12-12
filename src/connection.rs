@@ -250,9 +250,7 @@ impl Connection {
             let mut rsp_queue = VecDeque::with_capacity(1000);
             let mut write_buf = BytesMut::with_capacity(4096 * 32);
 
-            let mut has_error = false;
-
-            while !has_error {
+            loop {
                 stream.reset_io();
                 let inner_stream = stream.inner_mut();
 
@@ -262,8 +260,7 @@ impl Connection {
                         Err(e) => {
                             error!("process_read err={}", e);
                             req_queue_dup.push(make_terminate_req());
-                            has_error = true;
-                            0
+                            break;
                         }
                     };
 
@@ -273,7 +270,7 @@ impl Connection {
                         {
                             error!("decode_messages err={}", e);
                             req_queue_dup.push(make_terminate_req());
-                            has_error = true;
+                            break;
                         }
                     }
                 }
@@ -282,7 +279,7 @@ impl Connection {
                     Ok(_) => stream.wait_io(),
                     Err(e) => {
                         error!("process_write err={}", e);
-                        has_error = true;
+                        break;
                     }
                 }
             }
