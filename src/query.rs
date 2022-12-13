@@ -30,10 +30,6 @@ pub fn query_portal(
     max_rows: i32,
 ) -> Result<RowStream, Error> {
     let buf = client.with_buf(|buf| {
-        let remaining = buf.capacity();
-        if remaining < 1024 {
-            buf.reserve(4096 * 32 - remaining);
-        }
         frontend::execute(portal.name(), max_rows, buf).map_err(Error::encode)?;
         frontend::sync(buf);
         Ok(buf.split().freeze())
@@ -86,11 +82,6 @@ where
     I::IntoIter: ExactSizeIterator,
 {
     client.with_buf(|buf| {
-        let remaining = buf.capacity();
-        if remaining < 1024 {
-            buf.reserve(4096 * 32 - remaining);
-        }
-
         encode_bind(statement, params, "", buf)?;
         frontend::execute("", 0, buf).map_err(Error::encode)?;
         frontend::sync(buf);

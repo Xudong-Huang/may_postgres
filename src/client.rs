@@ -103,12 +103,16 @@ impl InnerClient {
         F: FnOnce(&mut BytesMut) -> R,
     {
         use std::cell::RefCell;
-        thread_local!(
-            static BUF: RefCell<BytesMut> = RefCell::new(BytesMut::with_capacity(4096 * 32))
+        may::coroutine_local!(
+            static BUF: RefCell<BytesMut> = RefCell::new(BytesMut::with_capacity(4096))
         );
         // let mut state = self.state.lock().unwrap();
         BUF.with(|b| {
             let mut buf = b.borrow_mut();
+            let remaining = buf.capacity();
+            if remaining < 512 {
+                buf.reserve(4096 - remaining);
+            }
             let r = f(&mut buf);
             buf.clear();
             r
