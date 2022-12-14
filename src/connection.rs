@@ -51,8 +51,8 @@ impl Drop for Connection {
 #[inline]
 fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<usize> {
     let remaining = read_buf.capacity();
-    if remaining < 1024 {
-        read_buf.reserve(4096 * 128 - remaining);
+    if remaining < 512 {
+        read_buf.reserve(4096 * 32 - remaining);
     }
 
     let mut read_cnt = 0;
@@ -138,8 +138,8 @@ fn process_write(
     write_buf: &mut BytesMut,
 ) -> io::Result<()> {
     let remaining = write_buf.capacity();
-    if remaining < 1024 {
-        write_buf.reserve(4096 * 32 - remaining);
+    if remaining < 512 {
+        write_buf.reserve(4096 * 16 - remaining);
     }
     loop {
         match req_queue.pop() {
@@ -219,9 +219,9 @@ fn connection_loop(
     req_queue: Arc<SegQueue<Request>>,
     mut parameters: HashMap<String, String>,
 ) -> Result<(), Error> {
-    let mut read_buf = BytesMut::with_capacity(4096 * 128);
+    let mut read_buf = BytesMut::with_capacity(4096 * 32);
     let mut rsp_queue = VecDeque::with_capacity(1000);
-    let mut write_buf = BytesMut::with_capacity(4096 * 32);
+    let mut write_buf = BytesMut::with_capacity(4096 * 16);
 
     loop {
         stream.reset_io();
