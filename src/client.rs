@@ -98,6 +98,7 @@ impl InnerClient {
         self.state.lock().types.insert(oid, type_.clone());
     }
 
+    #[inline]
     pub fn with_buf<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut BytesMut) -> R,
@@ -106,18 +107,14 @@ impl InnerClient {
         may::coroutine_local!(
             static BUF: RefCell<BytesMut> = RefCell::new(BytesMut::with_capacity(4096))
         );
-        // let mut state = self.state.lock().unwrap();
         BUF.with(|b| {
             let mut buf = b.borrow_mut();
             let remaining = buf.capacity();
             if remaining < 512 {
                 buf.reserve(4096 - remaining);
             }
-            let r = f(&mut buf);
-            buf.clear();
-            r
+            f(&mut buf)
         })
-        // state.buf.clear();
     }
 }
 

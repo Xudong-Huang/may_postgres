@@ -1,7 +1,6 @@
 use bytes::{Buf, BufMut, BytesMut};
 use crossbeam::queue::SegQueue;
 use fallible_iterator::FallibleIterator;
-use log::error;
 use may::coroutine::JoinHandle;
 use may::go;
 use may::io::{WaitIo, WaitIoWaker};
@@ -57,28 +56,19 @@ fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<u
     }
 
     let mut read_cnt = 0;
-
     loop {
         let buf = unsafe { &mut *(read_buf.bytes_mut() as *mut _ as *mut [u8]) };
+        assert!(!buf.is_empty());
         match stream.read(buf) {
-            Ok(n) => {
-                if n > 0 {
-                    read_cnt += n;
-                    unsafe { read_buf.advance_mut(n) };
-                } else {
-                    //connection was closed
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
-                }
+            Ok(n) if n > 0 => {
+                read_cnt += n;
+                unsafe { read_buf.advance_mut(n) };
             }
-            Err(err) => {
-                if err.kind() == io::ErrorKind::WouldBlock {
-                    break;
-                }
-                return Err(err);
-            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(read_cnt),
+            Ok(_) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
+            Err(err) => return Err(err),
         }
     }
-    Ok(read_cnt)
 }
 
 #[inline]
@@ -130,23 +120,13 @@ fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Resu
     let mut written = 0;
     while written < len {
         match stream.write(&write_buf[written..]) {
-            Ok(n) => {
-                if n > 0 {
-                    written += n;
-                } else {
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
-                }
-            }
-            Err(err) => {
-                if err.kind() == io::ErrorKind::WouldBlock {
-                    break;
-                }
-                return Err(err);
-            }
+            Ok(n) if n > 0 => written += n,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+            Err(err) => return Err(err),
+            Ok(_) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
         }
     }
     write_buf.advance(written);
-
     Ok(written)
 }
 
@@ -226,67 +206,50 @@ fn process_write(
 }
 
 #[inline]
-fn make_terminate_req() -> Request {
+fn terminate_connection(stream: &mut TcpStream) {
     let mut request = BytesMut::new();
     frontend::terminate(&mut request);
-    let (tx, _rx) = mpsc::channel();
-    Request {
-        messages: RequestMessages::Single(FrontendMessage::Raw(request.freeze())),
-        sender: tx,
+    stream.write_all(&request.freeze()).ok();
+    stream.shutdown(std::net::Shutdown::Both).ok();
+}
+
+#[inline]
+fn connection_loop(
+    stream: &mut TcpStream,
+    req_queue: Arc<SegQueue<Request>>,
+    mut parameters: HashMap<String, String>,
+) -> Result<(), Error> {
+    let mut read_buf = BytesMut::with_capacity(4096 * 128);
+    let mut rsp_queue = VecDeque::with_capacity(1000);
+    let mut write_buf = BytesMut::with_capacity(4096 * 32);
+
+    loop {
+        stream.reset_io();
+        let inner_stream = stream.inner_mut();
+        process_write(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf)
+            .map_err(Error::io)?;
+
+        if !rsp_queue.is_empty() {
+            if process_read(inner_stream, &mut read_buf).map_err(Error::io)? > 0 {
+                decode_messages(&mut read_buf, &mut rsp_queue, &mut parameters)?;
+            }
+        }
+
+        stream.wait_io()
     }
 }
 
 impl Connection {
-    pub(crate) fn new(
-        mut stream: TcpStream,
-        mut parameters: HashMap<String, String>,
-    ) -> Connection {
+    pub(crate) fn new(mut stream: TcpStream, parameters: HashMap<String, String>) -> Connection {
         let waker = stream.waker();
 
         let req_queue = Arc::new(SegQueue::new());
         let req_queue_dup = req_queue.clone();
         let io_handle = go!(move || {
-            let mut read_buf = BytesMut::with_capacity(4096 * 128);
-            let mut rsp_queue = VecDeque::with_capacity(1000);
-            let mut write_buf = BytesMut::with_capacity(4096 * 32);
-
-            loop {
-                stream.reset_io();
-                let inner_stream = stream.inner_mut();
-
-                match process_write(inner_stream, &req_queue_dup, &mut rsp_queue, &mut write_buf) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("process_write err={}", e);
-                        break;
-                    }
-                }
-
-                if !rsp_queue.is_empty() {
-                    let read_cnt = match process_read(inner_stream, &mut read_buf) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            error!("process_read err={}", e);
-                            req_queue_dup.push(make_terminate_req());
-                            break;
-                        }
-                    };
-
-                    if read_cnt > 0 {
-                        if let Err(e) =
-                            decode_messages(&mut read_buf, &mut rsp_queue, &mut parameters)
-                        {
-                            error!("decode_messages err={}", e);
-                            req_queue_dup.push(make_terminate_req());
-                            break;
-                        }
-                    }
-                }
-
-                stream.wait_io()
+            if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters) {
+                log::error!("connection error = {:?}", e);
+                terminate_connection(&mut stream);
             }
-
-            stream.shutdown(std::net::Shutdown::Both).ok();
         });
 
         Connection {
