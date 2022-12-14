@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub struct Responses {
-    receiver: mpsc::Receiver<BackendMessages>,
     cur: BackendMessages,
 }
 
@@ -33,7 +32,7 @@ impl Responses {
                 None => {}
             }
 
-            match self.receiver.recv() {
+            match CO_CH.with(|c| c.receiver().recv()) {
                 Ok(messages) => self.cur = messages,
                 Err(_) => return Err(Error::closed()),
             }
@@ -54,14 +53,35 @@ pub struct InnerClient {
     state: Mutex<State>,
 }
 
+struct CoChannel {
+    rx: mpsc::Receiver<BackendMessages>,
+    tx: mpsc::Sender<BackendMessages>,
+}
+
+impl CoChannel {
+    fn sender(&self) -> mpsc::Sender<BackendMessages> {
+        self.tx.clone()
+    }
+
+    fn receiver(&self) -> &mpsc::Receiver<BackendMessages> {
+        &self.rx
+    }
+}
+
+may::coroutine_local! {
+    static CO_CH: CoChannel = {
+        let (tx, rx) = mpsc::channel();
+        CoChannel { rx , tx }
+    }
+}
+
 impl InnerClient {
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
-        let (sender, receiver) = mpsc::channel();
+        let sender = CO_CH.with(|c| c.sender());
         let request = Request { messages, sender };
         self.sender.send(request);
 
         Ok(Responses {
-            receiver,
             cur: BackendMessages::empty(),
         })
     }
