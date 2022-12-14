@@ -15,11 +15,13 @@ use fallible_iterator::FallibleIterator;
 use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
 use spin::Mutex;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub struct Responses {
+    tag: usize,
     cur: BackendMessages,
 }
 
@@ -27,13 +29,18 @@ impl Responses {
     pub fn next(&mut self) -> Result<Message, Error> {
         loop {
             match self.cur.next().map_err(Error::parse)? {
-                Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
-                Some(message) => return Ok(message),
+                Some((_, Message::ErrorResponse(body))) => return Err(Error::db(body)),
+                Some((_, message)) => return Ok(message),
                 None => {}
             }
 
             match CO_CH.with(|c| c.receiver().recv()) {
-                Ok(messages) => self.cur = messages,
+                Ok(messages) => {
+                    if messages.tag != self.tag {
+                        continue;
+                    }
+                    self.cur = messages
+                }
                 Err(_) => return Err(Error::closed()),
             }
         }
@@ -54,6 +61,7 @@ pub struct InnerClient {
 }
 
 struct CoChannel {
+    tag: Cell<usize>,
     rx: mpsc::Receiver<BackendMessages>,
     tx: mpsc::Sender<BackendMessages>,
 }
@@ -61,6 +69,12 @@ struct CoChannel {
 impl CoChannel {
     fn sender(&self) -> mpsc::Sender<BackendMessages> {
         self.tx.clone()
+    }
+
+    fn tag(&self) -> usize {
+        let tag = self.tag.get();
+        self.tag.set(tag + 1);
+        tag
     }
 
     fn receiver(&self) -> &mpsc::Receiver<BackendMessages> {
@@ -71,18 +85,24 @@ impl CoChannel {
 may::coroutine_local! {
     static CO_CH: CoChannel = {
         let (tx, rx) = mpsc::channel();
-        CoChannel { rx , tx }
+        let tag = Cell::new(0);
+        CoChannel {tag, rx , tx }
     }
 }
 
 impl InnerClient {
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
-        let sender = CO_CH.with(|c| c.sender());
-        let request = Request { messages, sender };
+        let (tag, sender) = CO_CH.with(|c| (c.tag(), c.sender()));
+        let request = Request {
+            tag,
+            messages,
+            sender,
+        };
         self.sender.send(request);
 
         Ok(Responses {
-            cur: BackendMessages::empty(),
+            tag,
+            cur: BackendMessages::empty(tag),
         })
     }
 

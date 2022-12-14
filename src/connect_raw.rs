@@ -28,7 +28,7 @@ impl StartupStream {
 
     fn next_msg(&mut self) -> io::Result<Message> {
         loop {
-            if let Some(message) = self.buf.next()? {
+            if let Some((_, message)) = self.buf.next()? {
                 return Ok(message);
             }
 
@@ -43,7 +43,7 @@ impl StartupStream {
 pub fn connect_raw(stream: TcpStream, config: &Config) -> Result<Client, Error> {
     let mut stream = StartupStream {
         inner: Framed::new(stream),
-        buf: BackendMessages::empty(),
+        buf: BackendMessages::empty(0),
     };
 
     startup(&mut stream, config)?;

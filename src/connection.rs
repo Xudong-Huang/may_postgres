@@ -23,11 +23,13 @@ pub enum RequestMessages {
 }
 
 pub struct Request {
+    pub tag: usize,
     pub messages: RequestMessages,
     pub sender: mpsc::Sender<BackendMessages>,
 }
 
 pub struct Response {
+    tag: usize,
     tx: mpsc::Sender<BackendMessages>,
 }
 
@@ -89,11 +91,12 @@ fn decode_messages(
                 let response = match rsp_queue.front() {
                     Some(response) => response,
                     None => match messages.next().map_err(Error::parse)? {
-                        Some(Message::ErrorResponse(error)) => return Err(Error::db(error)),
+                        Some((_, Message::ErrorResponse(error))) => return Err(Error::db(error)),
                         _ => return Err(Error::unexpected_message()),
                     },
                 };
 
+                messages.tag = response.tag;
                 response.tx.send(messages).ok();
 
                 if request_complete {
@@ -144,7 +147,10 @@ fn process_write(
     loop {
         match req_queue.pop() {
             Some(req) => {
-                rsp_queue.push_back(Response { tx: req.sender });
+                rsp_queue.push_back(Response {
+                    tag: req.tag,
+                    tx: req.sender,
+                });
                 match req.messages {
                     RequestMessages::Single(msg) => match msg {
                         FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
