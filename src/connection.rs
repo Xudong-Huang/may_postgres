@@ -235,8 +235,8 @@ fn connection_loop(
         process_write(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf)
             .map_err(Error::io)?;
 
-        if !rsp_queue.is_empty()
-            && process_read(inner_stream, &mut read_buf).map_err(Error::io)? > 0
+        // if !rsp_queue.is_empty() &&
+        if process_read(inner_stream, &mut read_buf).map_err(Error::io)? > 0
         {
             decode_messages(&mut read_buf, &mut rsp_queue, &mut parameters)?;
         }
