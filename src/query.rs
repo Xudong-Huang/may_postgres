@@ -141,6 +141,7 @@ pub struct RowStream {
 impl Iterator for RowStream {
     type Item = Result<Row, Error>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match o_try!(self.responses.next()) {

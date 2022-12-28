@@ -12,7 +12,7 @@ use crate::{
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may::sync::mpsc;
+use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 use spin::Mutex;
 use std::cell::Cell;
@@ -26,6 +26,7 @@ pub struct Responses {
 }
 
 impl Responses {
+    #[inline]
     pub fn next(&mut self) -> Result<Message, Error> {
         loop {
             match self.cur.next().map_err(Error::parse)? {
@@ -62,12 +63,12 @@ pub struct InnerClient {
 
 struct CoChannel {
     tag: Cell<usize>,
-    rx: mpsc::Receiver<BackendMessages>,
-    tx: mpsc::Sender<BackendMessages>,
+    rx: spsc::Receiver<BackendMessages>,
+    tx: spsc::Sender<BackendMessages>,
 }
 
 impl CoChannel {
-    fn sender(&self) -> mpsc::Sender<BackendMessages> {
+    fn sender(&self) -> spsc::Sender<BackendMessages> {
         self.tx.clone()
     }
 
@@ -77,14 +78,14 @@ impl CoChannel {
         tag
     }
 
-    fn receiver(&self) -> &mpsc::Receiver<BackendMessages> {
+    fn receiver(&self) -> &spsc::Receiver<BackendMessages> {
         &self.rx
     }
 }
 
 may::coroutine_local! {
     static CO_CH: CoChannel = {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = spsc::channel();
         let tag = Cell::new(0);
         CoChannel {tag, rx , tx }
     }

@@ -38,6 +38,7 @@ impl FallibleIterator for BackendMessages {
     type Item = (usize, backend::Message);
     type Error = io::Error;
 
+    #[inline]
     fn next(&mut self) -> io::Result<Option<(usize, backend::Message)>> {
         if self.data.is_empty() {
             return Ok(None);

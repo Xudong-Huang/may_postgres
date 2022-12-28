@@ -1,11 +1,11 @@
 use bytes::{Buf, BufMut, BytesMut};
-use crossbeam::queue::SegQueue;
 use fallible_iterator::FallibleIterator;
 use may::coroutine::JoinHandle;
 use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
-use may::sync::mpsc;
+use may::sync::queue::mpsc_seg_queue::SegQueue;
+use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
@@ -25,12 +25,12 @@ pub enum RequestMessages {
 pub struct Request {
     pub tag: usize,
     pub messages: RequestMessages,
-    pub sender: mpsc::Sender<BackendMessages>,
+    pub sender: spsc::Sender<BackendMessages>,
 }
 
 pub struct Response {
     tag: usize,
-    tx: mpsc::Sender<BackendMessages>,
+    tx: spsc::Sender<BackendMessages>,
 }
 
 /// A connection to a PostgreSQL database.
@@ -145,45 +145,47 @@ fn process_write(
         write_buf.reserve(4096 * 16 - remaining);
     }
     loop {
-        match req_queue.pop() {
-            Some(req) => {
-                rsp_queue.push_back(Response {
-                    tag: req.tag,
-                    tx: req.sender,
-                });
-                match req.messages {
-                    RequestMessages::Single(msg) => match msg {
-                        FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
-                        FrontendMessage::CopyData(data) => {
-                            let mut buf = BytesMut::new();
-                            data.write(&mut buf);
-                            write_buf.extend_from_slice(&buf.freeze())
-                        }
-                    },
-                    RequestMessages::CopyIn(mut rcv) => {
-                        let mut copy_in_msg = rcv.try_recv();
-                        loop {
-                            match copy_in_msg {
-                                Ok(Some(msg)) => {
-                                    match msg {
-                                        FrontendMessage::Raw(buf) => {
-                                            write_buf.extend_from_slice(&buf)
+        match req_queue.pop_bulk() {
+            Some(reqs) => {
+                for req in reqs {
+                    rsp_queue.push_back(Response {
+                        tag: req.tag,
+                        tx: req.sender,
+                    });
+                    match req.messages {
+                        RequestMessages::Single(msg) => match msg {
+                            FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
+                            FrontendMessage::CopyData(data) => {
+                                let mut buf = BytesMut::new();
+                                data.write(&mut buf);
+                                write_buf.extend_from_slice(&buf.freeze())
+                            }
+                        },
+                        RequestMessages::CopyIn(mut rcv) => {
+                            let mut copy_in_msg = rcv.try_recv();
+                            loop {
+                                match copy_in_msg {
+                                    Ok(Some(msg)) => {
+                                        match msg {
+                                            FrontendMessage::Raw(buf) => {
+                                                write_buf.extend_from_slice(&buf)
+                                            }
+                                            FrontendMessage::CopyData(data) => {
+                                                let mut buf = BytesMut::new();
+                                                data.write(&mut buf);
+                                                write_buf.extend_from_slice(&buf.freeze())
+                                            }
                                         }
-                                        FrontendMessage::CopyData(data) => {
-                                            let mut buf = BytesMut::new();
-                                            data.write(&mut buf);
-                                            write_buf.extend_from_slice(&buf.freeze())
-                                        }
+                                        copy_in_msg = rcv.try_recv();
                                     }
-                                    copy_in_msg = rcv.try_recv();
-                                }
-                                Ok(None) => {
-                                    nonblock_write(stream, write_buf)?;
+                                    Ok(None) => {
+                                        nonblock_write(stream, write_buf)?;
 
-                                    // no data found we just write all the data and wait
-                                    copy_in_msg = rcv.recv();
+                                        // no data found we just write all the data and wait
+                                        copy_in_msg = rcv.recv();
+                                    }
+                                    Err(_) => break,
                                 }
-                                Err(_) => break,
                             }
                         }
                     }
@@ -193,7 +195,7 @@ fn process_write(
                 if write_buf.is_empty() {
                     break;
                 }
-                // wait for enough time before flush the data
+                // wait enough time before flush the data
                 may::coroutine::yield_now();
                 if !req_queue.is_empty() {
                     continue;
@@ -236,8 +238,7 @@ fn connection_loop(
             .map_err(Error::io)?;
 
         // if !rsp_queue.is_empty() &&
-        if process_read(inner_stream, &mut read_buf).map_err(Error::io)? > 0
-        {
+        if process_read(inner_stream, &mut read_buf).map_err(Error::io)? > 0 {
             decode_messages(&mut read_buf, &mut rsp_queue, &mut parameters)?;
         }
 
