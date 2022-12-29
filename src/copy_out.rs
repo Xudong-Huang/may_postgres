@@ -1,17 +1,17 @@
-use crate::client::{InnerClient, Responses};
+use crate::client::{Client, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::{query, slice_iter, Error, Statement};
 use bytes::Bytes;
 use postgres_protocol::message::backend::Message;
 
-pub fn copy_out(client: &InnerClient, statement: Statement) -> Result<CopyOutStream, Error> {
+pub fn copy_out(client: &Client, statement: Statement) -> Result<CopyOutStream, Error> {
     let buf = query::encode(client, &statement, slice_iter(&[]))?;
     let responses = start(client, buf)?;
     Ok(CopyOutStream { responses })
 }
 
-fn start(client: &InnerClient, buf: Bytes) -> Result<Responses, Error> {
+fn start(client: &Client, buf: Bytes) -> Result<Responses, Error> {
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
     match responses.next()? {

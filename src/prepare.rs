@@ -1,4 +1,4 @@
-use crate::client::InnerClient;
+use crate::client::Client;
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::error::SqlState;
@@ -10,7 +10,6 @@ use fallible_iterator::FallibleIterator;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 const TYPEINFO_QUERY: &str = "\
 SELECT t.typname, t.typtype, t.typelem, r.rngsubtype, t.typbasetype, n.nspname, t.typrelid
@@ -54,7 +53,7 @@ ORDER BY attnum
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
-pub fn prepare(client: &Arc<InnerClient>, query: &str, types: &[Type]) -> Result<Statement, Error> {
+pub fn prepare(client: &Client, query: &str, types: &[Type]) -> Result<Statement, Error> {
     let name = format!("s{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
     let buf = encode(client, &name, query, types)?;
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
@@ -92,10 +91,10 @@ pub fn prepare(client: &Arc<InnerClient>, query: &str, types: &[Type]) -> Result
         }
     }
 
-    Ok(Statement::new(client, name, parameters, columns))
+    Ok(Statement::new(client.inner(), name, parameters, columns))
 }
 
-fn encode(client: &InnerClient, name: &str, query: &str, types: &[Type]) -> Result<Bytes, Error> {
+fn encode(client: &Client, name: &str, query: &str, types: &[Type]) -> Result<Bytes, Error> {
     client.with_buf(|buf| {
         frontend::parse(name, query, types.iter().map(Type::oid), buf).map_err(Error::encode)?;
         frontend::describe(b'S', name, buf).map_err(Error::encode)?;
@@ -104,12 +103,12 @@ fn encode(client: &InnerClient, name: &str, query: &str, types: &[Type]) -> Resu
     })
 }
 
-fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
+fn get_type(client: &Client, oid: Oid) -> Result<Type, Error> {
     if let Some(type_) = Type::from_oid(oid) {
         return Ok(type_);
     }
 
-    if let Some(type_) = client.type_(oid) {
+    if let Some(type_) = client.inner().type_(oid) {
         return Ok(type_);
     }
 
@@ -152,13 +151,13 @@ fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
     };
 
     let type_ = Type::new(name, oid, kind, schema);
-    client.set_type(oid, &type_);
+    client.inner().set_type(oid, &type_);
 
     Ok(type_)
 }
 
-fn typeinfo_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
-    if let Some(stmt) = client.typeinfo() {
+fn typeinfo_statement(client: &Client) -> Result<Statement, Error> {
+    if let Some(stmt) = client.inner().typeinfo() {
         return Ok(stmt);
     }
 
@@ -170,11 +169,11 @@ fn typeinfo_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
         Err(e) => return Err(e),
     };
 
-    client.set_typeinfo(&stmt);
+    client.inner().set_typeinfo(&stmt);
     Ok(stmt)
 }
 
-fn get_enum_variants(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<String>, Error> {
+fn get_enum_variants(client: &Client, oid: Oid) -> Result<Vec<String>, Error> {
     let stmt = typeinfo_enum_statement(client)?;
 
     query::query(client, stmt, slice_iter(&[&oid]))?
@@ -182,8 +181,8 @@ fn get_enum_variants(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<String>,
         .collect()
 }
 
-fn typeinfo_enum_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
-    if let Some(stmt) = client.typeinfo_enum() {
+fn typeinfo_enum_statement(client: &Client) -> Result<Statement, Error> {
+    if let Some(stmt) = client.inner().typeinfo_enum() {
         return Ok(stmt);
     }
 
@@ -195,11 +194,11 @@ fn typeinfo_enum_statement(client: &Arc<InnerClient>) -> Result<Statement, Error
         Err(e) => return Err(e),
     };
 
-    client.set_typeinfo_enum(&stmt);
+    client.inner().set_typeinfo_enum(&stmt);
     Ok(stmt)
 }
 
-fn get_composite_fields(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<Field>, Error> {
+fn get_composite_fields(client: &Client, oid: Oid) -> Result<Vec<Field>, Error> {
     let stmt = typeinfo_composite_statement(client)?;
 
     let rows = query::query(client, stmt, slice_iter(&[&oid]))?.collect::<Result<Vec<_>, _>>()?;
@@ -215,13 +214,13 @@ fn get_composite_fields(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<Field
     Ok(fields)
 }
 
-fn typeinfo_composite_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
-    if let Some(stmt) = client.typeinfo_composite() {
+fn typeinfo_composite_statement(client: &Client) -> Result<Statement, Error> {
+    if let Some(stmt) = client.inner().typeinfo_composite() {
         return Ok(stmt);
     }
 
     let stmt = prepare(client, TYPEINFO_COMPOSITE_QUERY, &[])?;
 
-    client.set_typeinfo_composite(&stmt);
+    client.inner().set_typeinfo_composite(&stmt);
     Ok(stmt)
 }

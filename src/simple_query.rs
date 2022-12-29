@@ -1,4 +1,4 @@
-use crate::client::{InnerClient, Responses};
+use crate::client::{Client, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::{Error, SimpleQueryMessage, SimpleQueryRow};
@@ -8,7 +8,7 @@ use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::sync::Arc;
 
-pub fn simple_query(client: &InnerClient, query: &str) -> Result<SimpleQueryStream, Error> {
+pub fn simple_query(client: &Client, query: &str) -> Result<SimpleQueryStream, Error> {
     let buf = encode(client, query)?;
     let responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
@@ -18,7 +18,7 @@ pub fn simple_query(client: &InnerClient, query: &str) -> Result<SimpleQueryStre
     })
 }
 
-pub fn batch_execute(client: &InnerClient, query: &str) -> Result<(), Error> {
+pub fn batch_execute(client: &Client, query: &str) -> Result<(), Error> {
     let buf = encode(client, query)?;
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
@@ -34,7 +34,7 @@ pub fn batch_execute(client: &InnerClient, query: &str) -> Result<(), Error> {
     }
 }
 
-fn encode(client: &InnerClient, query: &str) -> Result<Bytes, Error> {
+fn encode(client: &Client, query: &str) -> Result<Bytes, Error> {
     client.with_buf(|buf| {
         frontend::query(query, buf).map_err(Error::encode)?;
         Ok(buf.split().freeze())

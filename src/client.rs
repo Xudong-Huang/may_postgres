@@ -15,14 +15,16 @@ use fallible_iterator::FallibleIterator;
 use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 use spin::Mutex;
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub struct Responses {
     tag: usize,
     cur: BackendMessages,
+    rx: Rc<spsc::Receiver<BackendMessages>>,
 }
 
 impl Responses {
@@ -35,7 +37,7 @@ impl Responses {
                 None => {}
             }
 
-            match CO_CH.with(|c| c.receiver().recv()) {
+            match self.rx.recv() {
                 Ok(messages) => {
                     if messages.tag != self.tag {
                         continue;
@@ -63,7 +65,7 @@ pub struct InnerClient {
 
 struct CoChannel {
     tag: Cell<usize>,
-    rx: spsc::Receiver<BackendMessages>,
+    rx: Rc<spsc::Receiver<BackendMessages>>,
     tx: spsc::Sender<BackendMessages>,
 }
 
@@ -78,33 +80,22 @@ impl CoChannel {
         tag
     }
 
-    fn receiver(&self) -> &spsc::Receiver<BackendMessages> {
-        &self.rx
-    }
-}
-
-may::coroutine_local! {
-    static CO_CH: CoChannel = {
-        let (tx, rx) = spsc::channel();
-        let tag = Cell::new(0);
-        CoChannel {tag, rx , tx }
+    fn receiver(&self) -> Rc<spsc::Receiver<BackendMessages>> {
+        self.rx.clone()
     }
 }
 
 impl InnerClient {
-    pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
-        let (tag, sender) = CO_CH.with(|c| (c.tag(), c.sender()));
+    /// ignore the result
+    pub fn raw_send(&self, messages: RequestMessages) -> Result<(), Error> {
+        let (sender, _rx) = spsc::channel();
         let request = Request {
-            tag,
+            tag: 0,
             messages,
             sender,
         };
         self.sender.send(request);
-
-        Ok(Responses {
-            tag,
-            cur: BackendMessages::empty(tag),
-        })
+        Ok(())
     }
 
     pub fn typeinfo(&self) -> Option<Statement> {
@@ -138,25 +129,6 @@ impl InnerClient {
     pub fn set_type(&self, oid: Oid, type_: &Type) {
         self.state.lock().types.insert(oid, type_.clone());
     }
-
-    #[inline]
-    pub fn with_buf<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut BytesMut) -> R,
-    {
-        use std::cell::RefCell;
-        may::coroutine_local!(
-            static BUF: RefCell<BytesMut> = RefCell::new(BytesMut::with_capacity(4096))
-        );
-        BUF.with(|b| {
-            let mut buf = b.borrow_mut();
-            let remaining = buf.capacity();
-            if remaining < 512 {
-                buf.reserve(4096 - remaining);
-            }
-            f(&mut buf)
-        })
-    }
 }
 
 #[derive(Clone)]
@@ -177,10 +149,40 @@ pub struct Client {
     socket_config: Option<SocketConfig>,
     process_id: i32,
     secret_key: i32,
+    buf: UnsafeCell<BytesMut>,
+    co_ch: CoChannel,
+}
+
+// Client is Send but not Sync
+unsafe impl Send for Client {}
+
+impl Clone for Client {
+    fn clone(&self) -> Client {
+        let co_ch = {
+            let (tx, rx) = spsc::channel();
+            let rx = Rc::new(rx);
+            let tag = Cell::new(0);
+            CoChannel { tag, rx, tx }
+        };
+        Client {
+            inner: self.inner.clone(),
+            socket_config: self.socket_config.clone(),
+            process_id: self.process_id,
+            secret_key: self.secret_key,
+            buf: UnsafeCell::new(BytesMut::with_capacity(4096)),
+            co_ch,
+        }
+    }
 }
 
 impl Client {
     pub(crate) fn new(sender: Connection, process_id: i32, secret_key: i32) -> Client {
+        let co_ch = {
+            let (tx, rx) = spsc::channel();
+            let rx = Rc::new(rx);
+            let tag = Cell::new(0);
+            CoChannel { tag, rx, tx }
+        };
         Client {
             inner: Arc::new(InnerClient {
                 sender,
@@ -195,6 +197,8 @@ impl Client {
             socket_config: None,
             process_id,
             secret_key,
+            buf: UnsafeCell::new(BytesMut::with_capacity(4096)),
+            co_ch,
         }
     }
 
@@ -219,7 +223,7 @@ impl Client {
     /// The list of types may be smaller than the number of parameters - the types of the remaining parameters will be
     /// inferred. For example, `client.prepare_typed(query, &[])` is equivalent to `client.prepare(query)`.
     pub fn prepare_typed(&self, query: &str, parameter_types: &[Type]) -> Result<Statement, Error> {
-        prepare::prepare(&self.inner, query, parameter_types)
+        prepare::prepare(self, query, parameter_types)
     }
 
     /// Executes a statement, returning a vector of the resulting rows.
@@ -330,7 +334,7 @@ impl Client {
         I::IntoIter: ExactSizeIterator,
     {
         let statement = statement.__convert().into_statement(self)?;
-        query::query(&self.inner, statement, params)
+        query::query(self, statement, params)
     }
 
     /// Executes a statement, returning the number of rows modified.
@@ -375,7 +379,7 @@ impl Client {
         I::IntoIter: ExactSizeIterator,
     {
         let statement = statement.__convert().into_statement(self)?;
-        query::execute(self.inner(), statement, params)
+        query::execute(self, statement, params)
     }
 
     /// Executes a `COPY FROM STDIN` statement, returning a sink used to write the copy data.
@@ -392,7 +396,7 @@ impl Client {
         U: Buf + 'static + Send,
     {
         let statement = statement.__convert().into_statement(self)?;
-        copy_in::copy_in(self.inner(), statement)
+        copy_in::copy_in(self, statement)
     }
 
     /// Executes a `COPY TO STDOUT` statement, returning a stream of the resulting data.
@@ -407,7 +411,7 @@ impl Client {
         T: ?Sized + ToStatement,
     {
         let statement = statement.__convert().into_statement(self)?;
-        copy_out::copy_out(self.inner(), statement)
+        copy_out::copy_out(self, statement)
     }
 
     /// Executes a sequence of SQL statements using the simple query protocol, returning the resulting rows.
@@ -428,7 +432,7 @@ impl Client {
     }
 
     pub(crate) fn simple_query_raw(&self, query: &str) -> Result<SimpleQueryStream, Error> {
-        simple_query::simple_query(self.inner(), query)
+        simple_query::simple_query(self, query)
     }
 
     /// Executes a sequence of SQL statements using the simple query protocol.
@@ -442,7 +446,7 @@ impl Client {
     /// functionality to safely embed that data in the request. Do not form statements via string concatenation and pass
     /// them to this method!
     pub fn batch_execute(&self, query: &str) -> Result<(), Error> {
-        simple_query::batch_execute(self.inner(), query)
+        simple_query::batch_execute(self, query)
     }
 
     /// Begins a new database transaction.
@@ -487,5 +491,36 @@ impl Client {
     pub fn _is_closed(&self) -> bool {
         // self.inner.sender.is_closed()
         unimplemented!()
+    }
+
+    #[inline]
+    pub(crate) fn with_buf<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut BytesMut) -> R,
+    {
+        let buf = unsafe { &mut *self.buf.get() };
+        let remaining = buf.capacity();
+        if remaining < 512 {
+            buf.reserve(4096 - remaining);
+        }
+        f(buf)
+    }
+
+    #[inline]
+    pub(crate) fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
+        let tag = self.co_ch.tag();
+        let sender = self.co_ch.sender();
+        let request = Request {
+            tag,
+            messages,
+            sender,
+        };
+        self.inner.sender.send(request);
+
+        Ok(Responses {
+            tag,
+            cur: BackendMessages::empty(tag),
+            rx: self.co_ch.receiver(),
+        })
     }
 }

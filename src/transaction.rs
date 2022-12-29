@@ -31,13 +31,12 @@ impl<'a> Drop for Transaction<'a> {
         } else {
             format!("ROLLBACK TO sp{}", self.depth)
         };
-        let buf = self.client.inner().with_buf(|buf| {
+        let buf = self.client.with_buf(|buf| {
             frontend::query(&query, buf).unwrap();
             buf.split().freeze()
         });
         let _ = self
             .client
-            .inner()
             .send(RequestMessages::Single(FrontendMessage::Raw(buf)));
     }
 }
@@ -166,7 +165,7 @@ impl<'a> Transaction<'a> {
         I::IntoIter: ExactSizeIterator,
     {
         let statement = statement.__convert().into_statement(self.client)?;
-        bind::bind(self.client.inner(), statement, params)
+        bind::bind(self.client, statement, params)
     }
 
     /// Continues execution of a portal, returning a stream of the resulting rows.
@@ -181,7 +180,7 @@ impl<'a> Transaction<'a> {
     ///
     /// [`query_portal`]: #method.query_portal
     pub fn query_portal_raw(&self, portal: &Portal, max_rows: i32) -> Result<RowStream, Error> {
-        query::query_portal(self.client.inner(), portal, max_rows)
+        query::query_portal(self.client, portal, max_rows)
     }
 
     /// Like `Client::copy_in`.
