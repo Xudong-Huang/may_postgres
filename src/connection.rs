@@ -195,17 +195,7 @@ fn process_write(
                 if write_buf.is_empty() {
                     break;
                 }
-                // wait enough time before flush the data
-                may::coroutine::yield_now();
-                if !req_queue.is_empty() {
-                    continue;
-                }
-
                 nonblock_write(stream, write_buf)?;
-                // still no new req found
-                if req_queue.is_empty() {
-                    break;
-                }
             }
         }
     }
