@@ -17,6 +17,8 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
+const IO_BUF_SIZE: usize = 4096 * 16;
+
 pub enum RequestMessages {
     Single(FrontendMessage),
     CopyIn(CopyInReceiver),
@@ -54,7 +56,7 @@ impl Drop for Connection {
 fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<usize> {
     let remaining = read_buf.capacity();
     if remaining < 512 {
-        read_buf.reserve(4096 * 32 - remaining);
+        read_buf.reserve(IO_BUF_SIZE - remaining);
     }
 
     let mut read_cnt = 0;
@@ -142,7 +144,7 @@ fn process_write(
 ) -> io::Result<()> {
     let remaining = write_buf.capacity();
     if remaining < 512 {
-        write_buf.reserve(4096 * 16 - remaining);
+        write_buf.reserve(IO_BUF_SIZE - remaining);
     }
     loop {
         match req_queue.pop_bulk() {
@@ -217,9 +219,9 @@ fn connection_loop(
     req_queue: Arc<SegQueue<Request>>,
     mut parameters: HashMap<String, String>,
 ) -> Result<(), Error> {
-    let mut read_buf = BytesMut::with_capacity(4096 * 32);
+    let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
+    let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut rsp_queue = VecDeque::with_capacity(1000);
-    let mut write_buf = BytesMut::with_capacity(4096 * 16);
 
     loop {
         stream.reset_io();
