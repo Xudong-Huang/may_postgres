@@ -146,62 +146,50 @@ fn process_write(
     if remaining < 512 {
         write_buf.reserve(IO_BUF_SIZE - remaining);
     }
-    loop {
-        match req_queue.pop_bulk() {
-            Some(reqs) => {
-                for req in reqs {
-                    rsp_queue.push_back(Response {
-                        tag: req.tag,
-                        tx: req.sender,
-                    });
-                    match req.messages {
-                        RequestMessages::Single(msg) => match msg {
-                            FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
-                            FrontendMessage::CopyData(data) => {
-                                let mut buf = BytesMut::new();
-                                data.write(&mut buf);
-                                write_buf.extend_from_slice(&buf.freeze())
-                            }
-                        },
-                        RequestMessages::CopyIn(mut rcv) => {
-                            let mut copy_in_msg = rcv.try_recv();
-                            loop {
-                                match copy_in_msg {
-                                    Ok(Some(msg)) => {
-                                        match msg {
-                                            FrontendMessage::Raw(buf) => {
-                                                write_buf.extend_from_slice(&buf)
-                                            }
-                                            FrontendMessage::CopyData(data) => {
-                                                let mut buf = BytesMut::new();
-                                                data.write(&mut buf);
-                                                write_buf.extend_from_slice(&buf.freeze())
-                                            }
-                                        }
-                                        copy_in_msg = rcv.try_recv();
+    while let Some(req_vec) = req_queue.pop_bulk() {
+        for req in req_vec {
+            rsp_queue.push_back(Response {
+                tag: req.tag,
+                tx: req.sender,
+            });
+            match req.messages {
+                RequestMessages::Single(msg) => match msg {
+                    FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
+                    FrontendMessage::CopyData(data) => {
+                        let mut buf = BytesMut::new();
+                        data.write(&mut buf);
+                        write_buf.extend_from_slice(&buf.freeze())
+                    }
+                },
+                RequestMessages::CopyIn(mut rcv) => {
+                    let mut copy_in_msg = rcv.try_recv();
+                    loop {
+                        match copy_in_msg {
+                            Ok(Some(msg)) => {
+                                match msg {
+                                    FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
+                                    FrontendMessage::CopyData(data) => {
+                                        let mut buf = BytesMut::new();
+                                        data.write(&mut buf);
+                                        write_buf.extend_from_slice(&buf.freeze())
                                     }
-                                    Ok(None) => {
-                                        nonblock_write(stream, write_buf)?;
-
-                                        // no data found we just write all the data and wait
-                                        copy_in_msg = rcv.recv();
-                                    }
-                                    Err(_) => break,
                                 }
+                                copy_in_msg = rcv.try_recv();
                             }
+                            Ok(None) => {
+                                nonblock_write(stream, write_buf)?;
+
+                                // no data found we just write all the data and wait
+                                copy_in_msg = rcv.recv();
+                            }
+                            Err(_) => break,
                         }
                     }
                 }
             }
-            None => {
-                if write_buf.is_empty() {
-                    break;
-                }
-                nonblock_write(stream, write_buf)?;
-            }
         }
     }
-
+    nonblock_write(stream, write_buf)?;
     Ok(())
 }
 
