@@ -155,11 +155,7 @@ fn process_write(
             match req.messages {
                 RequestMessages::Single(msg) => match msg {
                     FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
-                    FrontendMessage::CopyData(data) => {
-                        let mut buf = BytesMut::new();
-                        data.write(&mut buf);
-                        write_buf.extend_from_slice(&buf.freeze())
-                    }
+                    FrontendMessage::CopyData(data) => data.write(write_buf),
                 },
                 RequestMessages::CopyIn(mut rcv) => {
                     let mut copy_in_msg = rcv.try_recv();
@@ -168,11 +164,7 @@ fn process_write(
                             Ok(Some(msg)) => {
                                 match msg {
                                     FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
-                                    FrontendMessage::CopyData(data) => {
-                                        let mut buf = BytesMut::new();
-                                        data.write(&mut buf);
-                                        write_buf.extend_from_slice(&buf.freeze())
-                                    }
+                                    FrontendMessage::CopyData(data) => data.write(write_buf),
                                 }
                                 copy_in_msg = rcv.try_recv();
                             }
