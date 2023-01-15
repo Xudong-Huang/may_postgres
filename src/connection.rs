@@ -4,7 +4,7 @@ use may::coroutine::JoinHandle;
 use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
-use may::queue::mpsc_seg_queue::SegQueue;
+use may::queue::mpsc::Queue;
 use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -38,7 +38,7 @@ pub struct Response {
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
-    req_queue: Arc<SegQueue<Request>>,
+    req_queue: Arc<Queue<Request>>,
     waker: WaitIoWaker,
 }
 
@@ -138,7 +138,7 @@ fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Resu
 #[inline]
 fn process_write(
     stream: &mut impl Write,
-    req_queue: &SegQueue<Request>,
+    req_queue: &Queue<Request>,
     rsp_queue: &mut VecDeque<Response>,
     write_buf: &mut BytesMut,
 ) -> io::Result<()> {
@@ -146,7 +146,7 @@ fn process_write(
     if remaining < 512 {
         write_buf.reserve(IO_BUF_SIZE - remaining);
     }
-    while let Some(req_vec) = req_queue.pop_bulk() {
+    while let Some(req_vec) = req_queue.bulk_pop() {
         for req in req_vec {
             rsp_queue.push_back(Response {
                 tag: req.tag,
@@ -196,7 +196,7 @@ fn terminate_connection(stream: &mut TcpStream) {
 #[inline]
 fn connection_loop(
     stream: &mut TcpStream,
-    req_queue: Arc<SegQueue<Request>>,
+    req_queue: Arc<Queue<Request>>,
     mut parameters: HashMap<String, String>,
 ) -> Result<(), Error> {
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
@@ -222,7 +222,7 @@ impl Connection {
     pub(crate) fn new(mut stream: TcpStream, parameters: HashMap<String, String>) -> Connection {
         let waker = stream.waker();
 
-        let req_queue = Arc::new(SegQueue::new());
+        let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
         let io_handle = go!(move || {
             if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters) {
