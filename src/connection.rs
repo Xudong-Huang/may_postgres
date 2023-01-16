@@ -146,36 +146,34 @@ fn process_write(
     if remaining < 512 {
         write_buf.reserve(IO_BUF_SIZE - remaining);
     }
-    while let Some(req_vec) = req_queue.bulk_pop() {
-        for req in req_vec {
-            rsp_queue.push_back(Response {
-                tag: req.tag,
-                tx: req.sender,
-            });
-            match req.messages {
-                RequestMessages::Single(msg) => match msg {
-                    FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
-                    FrontendMessage::CopyData(data) => data.write(write_buf),
-                },
-                RequestMessages::CopyIn(mut rcv) => {
-                    let mut copy_in_msg = rcv.try_recv();
-                    loop {
-                        match copy_in_msg {
-                            Ok(Some(msg)) => {
-                                match msg {
-                                    FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
-                                    FrontendMessage::CopyData(data) => data.write(write_buf),
-                                }
-                                copy_in_msg = rcv.try_recv();
+    while let Some(req) = req_queue.pop() {
+        rsp_queue.push_back(Response {
+            tag: req.tag,
+            tx: req.sender,
+        });
+        match req.messages {
+            RequestMessages::Single(msg) => match msg {
+                FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
+                FrontendMessage::CopyData(data) => data.write(write_buf),
+            },
+            RequestMessages::CopyIn(mut rcv) => {
+                let mut copy_in_msg = rcv.try_recv();
+                loop {
+                    match copy_in_msg {
+                        Ok(Some(msg)) => {
+                            match msg {
+                                FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
+                                FrontendMessage::CopyData(data) => data.write(write_buf),
                             }
-                            Ok(None) => {
-                                nonblock_write(stream, write_buf)?;
-
-                                // no data found we just write all the data and wait
-                                copy_in_msg = rcv.recv();
-                            }
-                            Err(_) => break,
+                            copy_in_msg = rcv.try_recv();
                         }
+                        Ok(None) => {
+                            nonblock_write(stream, write_buf)?;
+
+                            // no data found we just write all the data and wait
+                            copy_in_msg = rcv.recv();
+                        }
+                        Err(_) => break,
                     }
                 }
             }
