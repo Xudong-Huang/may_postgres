@@ -2,9 +2,10 @@ use bytes::{Buf, BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
 use may::coroutine::JoinHandle;
 use may::go;
-use may::io::{WaitIo, WaitIoWaker};
+use may::io::{SplitIo, SplitReader, SplitWriter, WaitIo, WaitIoWaker};
 use may::net::TcpStream;
 use may::queue::mpsc::Queue;
+use may::queue::spsc::Queue as SpscQueue;
 use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -13,7 +14,7 @@ use crate::codec::{BackendMessage, BackendMessages, FrontendMessage};
 use crate::copy_in::CopyInReceiver;
 use crate::Error;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
@@ -38,6 +39,7 @@ pub struct Response {
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
+    read_handle: JoinHandle<()>,
     req_queue: Arc<Queue<Request>>,
     waker: WaitIoWaker,
 }
@@ -59,26 +61,31 @@ fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<u
         read_buf.reserve(IO_BUF_SIZE - remaining);
     }
 
-    let mut read_cnt = 0;
-    loop {
-        let buf = unsafe { &mut *(read_buf.bytes_mut() as *mut _ as *mut [u8]) };
-        assert!(!buf.is_empty());
-        match stream.read(buf) {
-            Ok(n) if n > 0 => {
-                read_cnt += n;
-                unsafe { read_buf.advance_mut(n) };
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(read_cnt),
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
-            Err(err) => return Err(err),
-        }
-    }
+    let buf = unsafe { &mut *(read_buf.bytes_mut() as *mut _ as *mut [u8]) };
+    let n = stream.read(buf)?;
+    unsafe { read_buf.advance_mut(n) };
+    Ok(n)
+
+    // let mut read_cnt = 0;
+    // loop {
+    //     let buf = unsafe { &mut *(read_buf.bytes_mut() as *mut _ as *mut [u8]) };
+    //     assert!(!buf.is_empty());
+    //     match stream.read(buf) {
+    //         Ok(n) if n > 0 => {
+    //             read_cnt += n;
+    //             unsafe { read_buf.advance_mut(n) };
+    //         }
+    //         Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(read_cnt),
+    //         Ok(_) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
+    //         Err(err) => return Err(err),
+    //     }
+    // }
 }
 
 #[inline]
 fn decode_messages(
     read_buf: &mut BytesMut,
-    rsp_queue: &mut VecDeque<Response>,
+    rsp_queue: &SpscQueue<Response>,
     parameters: &mut HashMap<String, String>,
 ) -> Result<(), Error> {
     use crate::codec::PostgresCodec;
@@ -90,7 +97,7 @@ fn decode_messages(
                 mut messages,
                 request_complete,
             } => {
-                let response = match rsp_queue.front() {
+                let response = match unsafe { rsp_queue.peek() } {
                     Some(response) => response,
                     None => match messages.next().map_err(Error::parse)? {
                         Some((_, Message::ErrorResponse(error))) => return Err(Error::db(error)),
@@ -102,7 +109,7 @@ fn decode_messages(
                 response.tx.send(messages).ok();
 
                 if request_complete {
-                    rsp_queue.pop_front();
+                    rsp_queue.pop();
                 }
             }
             BackendMessage::Async(Message::NoticeResponse(_body)) => {}
@@ -139,7 +146,7 @@ fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Resu
 fn process_write(
     stream: &mut impl Write,
     req_queue: &Queue<Request>,
-    rsp_queue: &mut VecDeque<Response>,
+    rsp_queue: &SpscQueue<Response>,
     write_buf: &mut BytesMut,
 ) -> io::Result<()> {
     let remaining = write_buf.capacity();
@@ -147,7 +154,7 @@ fn process_write(
         write_buf.reserve(IO_BUF_SIZE - remaining);
     }
     while let Some(req) = req_queue.pop() {
-        rsp_queue.push_back(Response {
+        rsp_queue.push(Response {
             tag: req.tag,
             tx: req.sender,
         });
@@ -184,53 +191,70 @@ fn process_write(
 }
 
 #[inline]
-fn terminate_connection(stream: &mut TcpStream) {
+fn terminate_connection(stream: &mut SplitWriter<TcpStream>) {
     let mut request = BytesMut::new();
     frontend::terminate(&mut request);
     stream.write_all(&request.freeze()).ok();
-    stream.shutdown(std::net::Shutdown::Both).ok();
+    stream.inner().shutdown(std::net::Shutdown::Both).ok();
 }
 
 #[inline]
-fn connection_loop(
-    stream: &mut TcpStream,
+fn write_loop(
+    writer: &mut SplitWriter<TcpStream>,
     req_queue: Arc<Queue<Request>>,
+    rsp_queue: Arc<SpscQueue<Response>>,
+) -> Result<(), Error> {
+    let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
+    loop {
+        writer.reset_io();
+        let inner_stream = writer.inner_mut().inner_mut();
+        process_write(inner_stream, &req_queue, &rsp_queue, &mut write_buf).map_err(Error::io)?;
+
+        writer.wait_io()
+    }
+}
+
+#[inline]
+fn read_loop(
+    mut reader: SplitReader<TcpStream>,
+    rsp_queue: Arc<SpscQueue<Response>>,
     mut parameters: HashMap<String, String>,
 ) -> Result<(), Error> {
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
-    let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
-    let mut rsp_queue = VecDeque::with_capacity(1000);
 
     loop {
-        stream.reset_io();
-        let inner_stream = stream.inner_mut();
-        process_write(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf)
-            .map_err(Error::io)?;
-
-        // if !rsp_queue.is_empty() &&
-        if process_read(inner_stream, &mut read_buf).map_err(Error::io)? > 0 {
-            decode_messages(&mut read_buf, &mut rsp_queue, &mut parameters)?;
+        if process_read(&mut reader, &mut read_buf).map_err(Error::io)? > 0 {
+            decode_messages(&mut read_buf, &rsp_queue, &mut parameters)?;
         }
-
-        stream.wait_io()
     }
 }
 
 impl Connection {
-    pub(crate) fn new(mut stream: TcpStream, parameters: HashMap<String, String>) -> Connection {
-        let waker = stream.waker();
+    pub(crate) fn new(stream: TcpStream, parameters: HashMap<String, String>) -> Connection {
+        let (reader, mut writer) = stream.split().unwrap();
+        let waker = writer.waker();
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
+        let rsp_queue = Arc::new(SpscQueue::new());
+        let rsp_queue_dup = rsp_queue.clone();
+
         let io_handle = go!(move || {
-            if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters) {
-                log::error!("connection error = {:?}", e);
-                terminate_connection(&mut stream);
+            if let Err(e) = write_loop(&mut writer, req_queue_dup, rsp_queue_dup) {
+                log::error!("connection write loop error = {:?}", e);
+                terminate_connection(&mut writer);
+            }
+        });
+
+        let read_handle = go!(move || {
+            if let Err(e) = read_loop(reader, rsp_queue, parameters) {
+                log::error!("connection read loop error = {:?}", e);
             }
         });
 
         Connection {
             io_handle,
+            read_handle,
             req_queue,
             waker,
         }
