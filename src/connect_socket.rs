@@ -29,7 +29,7 @@ pub(crate) fn connect_socket(
             for addr in addrs {
                 let new_error = match connect_with_timeout(&addr, connect_timeout) {
                     Ok(socket) => {
-                        socket.set_nodelay(true).map_err(Error::connect)?;
+                        // socket.set_nodelay(true).map_err(Error::connect)?;
                         // if keepalives {
                         //     socket
                         //         .set_keepalive(Some(keepalives_idle))
