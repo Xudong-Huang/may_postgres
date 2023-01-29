@@ -15,6 +15,7 @@ use crate::Error;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const IO_BUF_SIZE: usize = 4096 * 16;
@@ -40,6 +41,7 @@ pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
     req_queue: Arc<Queue<Request>>,
     waker: WaitIoWaker,
+    send_flag: Arc<AtomicBool>,
 }
 
 impl Drop for Connection {
@@ -195,6 +197,7 @@ fn terminate_connection(stream: &mut TcpStream) {
 fn connection_loop(
     stream: &mut TcpStream,
     req_queue: Arc<Queue<Request>>,
+    send_flag: Arc<AtomicBool>,
     mut parameters: HashMap<String, String>,
 ) -> Result<(), Error> {
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
@@ -204,8 +207,11 @@ fn connection_loop(
     loop {
         stream.reset_io();
         let inner_stream = stream.inner_mut();
-        process_write(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf)
-            .map_err(Error::io)?;
+        if send_flag.load(Ordering::Relaxed) {
+            send_flag.store(false, Ordering::Relaxed);
+            process_write(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf)
+                .map_err(Error::io)?;
+        }
 
         // if !rsp_queue.is_empty() &&
         if process_read(inner_stream, &mut read_buf).map_err(Error::io)? > 0 {
@@ -222,8 +228,10 @@ impl Connection {
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
+        let send_flag = Arc::new(AtomicBool::new(false));
+        let send_flag_dup = send_flag.clone();
         let io_handle = go!(move || {
-            if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters) {
+            if let Err(e) = connection_loop(&mut stream, req_queue_dup, send_flag_dup, parameters) {
                 log::error!("connection error = {:?}", e);
                 terminate_connection(&mut stream);
             }
@@ -233,12 +241,14 @@ impl Connection {
             io_handle,
             req_queue,
             waker,
+            send_flag,
         }
     }
 
     /// send a request to the connection
     pub fn send(&self, req: Request) {
         self.req_queue.push(req);
+        self.send_flag.store(true, Ordering::Relaxed);
         self.waker.wakeup();
     }
 }
