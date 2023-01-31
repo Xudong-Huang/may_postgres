@@ -4,7 +4,7 @@ use may::coroutine::JoinHandle;
 use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
-use may::queue::mpsc::Queue;
+use may::queue::unordered_mpsc::Queue;
 use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -207,7 +207,7 @@ fn connection_loop(
     loop {
         stream.reset_io();
         let inner_stream = stream.inner_mut();
-        if send_flag.load(Ordering::Relaxed) {
+        if send_flag.load(Ordering::Acquire) {
             send_flag.store(false, Ordering::Relaxed);
             process_write(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf)
                 .map_err(Error::io)?;
@@ -248,7 +248,7 @@ impl Connection {
     /// send a request to the connection
     pub fn send(&self, req: Request) {
         self.req_queue.push(req);
-        self.send_flag.store(true, Ordering::Relaxed);
+        self.send_flag.store(true, Ordering::Release);
         self.waker.wakeup();
     }
 }
