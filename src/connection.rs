@@ -216,9 +216,13 @@ fn connection_loop(
         // if !rsp_queue.is_empty() &&
         if process_read(inner_stream, &mut read_buf).map_err(Error::io)? > 0 {
             decode_messages(&mut read_buf, &mut rsp_queue, &mut parameters)?;
+
+            if send_flag.load(Ordering::Relaxed) {
+                continue;
+            }
         }
 
-        stream.wait_io()
+        stream.wait_io();
     }
 }
 
