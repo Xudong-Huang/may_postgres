@@ -97,11 +97,7 @@ pub mod config;
 mod connect;
 mod connect_raw;
 mod connect_socket;
-// #[cfg(not(unix))]
 mod connection;
-// #[cfg(unix)]
-// #[path = "connection_unix.rs"]
-// mod connection;
 mod copy_in;
 mod copy_out;
 pub mod error;
@@ -109,6 +105,7 @@ mod generic_client;
 mod portal;
 mod prepare;
 mod query;
+mod queued_writer;
 pub mod row;
 mod simple_query;
 mod statement;
