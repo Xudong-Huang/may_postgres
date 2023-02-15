@@ -42,6 +42,7 @@ pub(crate) struct Connection {
     req_queue: Arc<Queue<Request>>,
     waker: WaitIoWaker,
     send_flag: Arc<AtomicBool>,
+    id: usize,
 }
 
 impl Drop for Connection {
@@ -228,6 +229,8 @@ fn connection_loop(
 
 impl Connection {
     pub(crate) fn new(mut stream: TcpStream, parameters: HashMap<String, String>) -> Connection {
+        use std::os::fd::AsRawFd;
+        let id = stream.as_raw_fd() as usize;
         let waker = stream.waker();
 
         let req_queue = Arc::new(Queue::new());
@@ -246,6 +249,7 @@ impl Connection {
             req_queue,
             waker,
             send_flag,
+            id,
         }
     }
 
@@ -254,5 +258,10 @@ impl Connection {
         self.req_queue.push(req);
         self.send_flag.store(true, Ordering::Release);
         self.waker.wakeup();
+    }
+
+    #[inline]
+    pub fn id(&self) -> usize {
+        self.id
     }
 }

@@ -523,4 +523,10 @@ impl Client {
             rx: self.co_ch.receiver(),
         })
     }
+
+    /// connection id
+    #[inline]
+    pub fn id(&self) -> usize {
+        self.inner.sender.id()
+    }
 }
