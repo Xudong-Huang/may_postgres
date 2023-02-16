@@ -1,7 +1,7 @@
 use crate::cancel_query;
 use crate::codec::BackendMessages;
 use crate::config::Host;
-use crate::connection::{Connection, Request, RequestMessages};
+use crate::connection::{Connection, RefOrValue, Request, RequestMessages};
 use crate::copy_out::CopyOutStream;
 use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
@@ -15,6 +15,7 @@ use fallible_iterator::FallibleIterator;
 use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 use spin::Mutex;
+
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -70,8 +71,11 @@ struct CoChannel {
 }
 
 impl CoChannel {
-    fn sender(&self) -> spsc::Sender<BackendMessages> {
-        self.tx.clone()
+    fn sender(&self) -> RefOrValue<'static, spsc::Sender<BackendMessages>> {
+        // Safety:
+        // 1. there is only one sender
+        // 2. we will wait until all response come back
+        RefOrValue::Ref(unsafe { std::mem::transmute(&self.tx) })
     }
 
     fn tag(&self) -> usize {
@@ -92,7 +96,7 @@ impl InnerClient {
         let request = Request {
             tag: 0,
             messages,
-            sender,
+            sender: RefOrValue::Value(sender),
         };
         self.sender.send(request);
         Ok(())

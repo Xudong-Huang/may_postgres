@@ -15,10 +15,26 @@ use crate::Error;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const IO_BUF_SIZE: usize = 4096 * 16;
+
+pub enum RefOrValue<'a, T> {
+    Ref(&'a T),
+    Value(T),
+}
+
+impl<'a, T> Deref for RefOrValue<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            RefOrValue::Ref(r) => r,
+            RefOrValue::Value(ref v) => v,
+        }
+    }
+}
 
 pub enum RequestMessages {
     Single(FrontendMessage),
@@ -28,12 +44,12 @@ pub enum RequestMessages {
 pub struct Request {
     pub tag: usize,
     pub messages: RequestMessages,
-    pub sender: spsc::Sender<BackendMessages>,
+    pub sender: RefOrValue<'static, spsc::Sender<BackendMessages>>,
 }
 
 pub struct Response {
     tag: usize,
-    tx: spsc::Sender<BackendMessages>,
+    tx: RefOrValue<'static, spsc::Sender<BackendMessages>>,
 }
 
 /// A connection to a PostgreSQL database.
