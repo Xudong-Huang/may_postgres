@@ -4,8 +4,8 @@ use may::coroutine::JoinHandle;
 use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
-use may::queue::mpsc::Queue;
-use may::sync::spsc;
+use may::queue::spsc::Queue;
+use may::sync::{spsc, Mutex};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
@@ -13,7 +13,7 @@ use crate::codec::{BackendMessage, BackendMessages, FrontendMessage};
 use crate::copy_in::CopyInReceiver;
 use crate::Error;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,10 +52,85 @@ pub struct Response {
     tx: RefOrValue<'static, spsc::Sender<BackendMessages>>,
 }
 
+struct QueueWriterInner {
+    stream: TcpStream,
+    write_buf: BytesMut,
+}
+
+struct QueueWriter {
+    inner: Mutex<QueueWriterInner>,
+}
+
+impl QueueWriter {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            inner: Mutex::new(QueueWriterInner {
+                stream,
+                write_buf: BytesMut::with_capacity(IO_BUF_SIZE),
+            }),
+        }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn as_stream(&self) -> &mut TcpStream {
+        #[allow(clippy::cast_ref_to_mut)]
+        let me = unsafe { &mut *(self as *const _ as *mut Self) };
+        let inner = me.inner.get_mut().unwrap();
+        &mut inner.stream
+    }
+
+    /// return Ok(true) if all data is send out
+    pub fn write_data(&self, data: &[u8]) -> io::Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        // #[allow(clippy::cast_ref_to_mut)]
+        // let me = unsafe { &mut *(self as *const _ as *mut Self) };
+        // let inner = me.inner.get_mut().unwrap();
+        inner.write_data(data)
+    }
+
+    /// flush all the data
+    pub fn write_flush(&self) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        // #[allow(clippy::cast_ref_to_mut)]
+        // let me = unsafe { &mut *(self as *const _ as *mut Self) };
+        // let inner = me.inner.get_mut().unwrap();
+        inner.write_flush()
+    }
+
+    #[inline]
+    pub fn with_stream<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut TcpStream) -> R,
+    {
+        let mut inner = self.inner.lock().unwrap();
+        f(&mut inner.stream)
+    }
+}
+
+impl QueueWriterInner {
+    #[inline]
+    fn write_flush(&mut self) -> io::Result<()> {
+        nonblock_write(self.stream.inner_mut(), &mut self.write_buf)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn write_data(&mut self, data: &[u8]) -> io::Result<bool> {
+        self.write_buf.extend_from_slice(data);
+
+        if self.write_buf.len() > 840 {
+            self.write_flush()?;
+        }
+
+        Ok(self.write_buf.is_empty())
+    }
+}
+
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
-    req_queue: Arc<Queue<Request>>,
+    writer: Arc<QueueWriter>,
+    rsp_queue: Arc<Queue<Response>>,
     waker: WaitIoWaker,
     send_flag: Arc<AtomicBool>,
     id: usize,
@@ -97,7 +172,7 @@ fn process_read(stream: &mut impl Read, req_buf: &mut BytesMut) -> io::Result<us
 #[inline]
 fn decode_messages(
     read_buf: &mut BytesMut,
-    rsp_queue: &mut VecDeque<Response>,
+    rsp_queue: &Queue<Response>,
     parameters: &mut HashMap<String, String>,
 ) -> Result<(), Error> {
     use crate::codec::PostgresCodec;
@@ -109,7 +184,7 @@ fn decode_messages(
                 mut messages,
                 request_complete,
             } => {
-                let response = match rsp_queue.front() {
+                let response = match unsafe { rsp_queue.peek() } {
                     Some(response) => response,
                     None => match messages.next().map_err(Error::parse)? {
                         Some((_, Message::ErrorResponse(error))) => return Err(Error::db(error)),
@@ -121,7 +196,7 @@ fn decode_messages(
                 response.tx.send(messages).ok();
 
                 if request_complete {
-                    rsp_queue.pop_front();
+                    rsp_queue.pop();
                 }
             }
             BackendMessage::Async(Message::NoticeResponse(_body)) => {}
@@ -158,50 +233,6 @@ fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Resu
 }
 
 #[inline]
-fn process_write(
-    stream: &mut impl Write,
-    req_queue: &Queue<Request>,
-    rsp_queue: &mut VecDeque<Response>,
-    write_buf: &mut BytesMut,
-) -> io::Result<()> {
-    while let Some(req) = req_queue.pop() {
-        rsp_queue.push_back(Response {
-            tag: req.tag,
-            tx: req.sender,
-        });
-        match req.messages {
-            RequestMessages::Single(msg) => match msg {
-                FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
-                FrontendMessage::CopyData(data) => data.write(write_buf),
-            },
-            RequestMessages::CopyIn(mut rcv) => {
-                let mut copy_in_msg = rcv.try_recv();
-                loop {
-                    match copy_in_msg {
-                        Ok(Some(msg)) => {
-                            match msg {
-                                FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
-                                FrontendMessage::CopyData(data) => data.write(write_buf),
-                            }
-                            copy_in_msg = rcv.try_recv();
-                        }
-                        Ok(None) => {
-                            nonblock_write(stream, write_buf)?;
-
-                            // no data found we just write all the data and wait
-                            copy_in_msg = rcv.recv();
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-    }
-    nonblock_write(stream, write_buf)?;
-    Ok(())
-}
-
-#[inline]
 fn terminate_connection(stream: &mut TcpStream) {
     let mut request = BytesMut::new();
     frontend::terminate(&mut request);
@@ -211,27 +242,24 @@ fn terminate_connection(stream: &mut TcpStream) {
 
 #[inline]
 fn connection_loop(
-    stream: &mut TcpStream,
-    req_queue: Arc<Queue<Request>>,
+    writer: Arc<QueueWriter>,
+    rsp_queue: Arc<Queue<Response>>,
     send_flag: Arc<AtomicBool>,
     mut parameters: HashMap<String, String>,
 ) -> Result<(), Error> {
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
-    let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
-    let mut rsp_queue = VecDeque::with_capacity(1000);
+    let stream = unsafe { writer.as_stream() };
 
     loop {
         stream.reset_io();
-        let inner_stream = stream.inner_mut();
         if send_flag.load(Ordering::Acquire) {
             send_flag.store(false, Ordering::Relaxed);
-            process_write(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf)
-                .map_err(Error::io)?;
+            writer.write_flush().map_err(Error::io)?;
         }
 
         // if !rsp_queue.is_empty() &&
-        if process_read(inner_stream, &mut read_buf).map_err(Error::io)? > 0 {
-            decode_messages(&mut read_buf, &mut rsp_queue, &mut parameters)?;
+        if process_read(stream.inner_mut(), &mut read_buf).map_err(Error::io)? > 0 {
+            decode_messages(&mut read_buf, &rsp_queue, &mut parameters)?;
         } else {
             stream.wait_io();
         }
@@ -239,36 +267,93 @@ fn connection_loop(
 }
 
 impl Connection {
-    pub(crate) fn new(mut stream: TcpStream, parameters: HashMap<String, String>) -> Connection {
+    pub(crate) fn new(stream: TcpStream, parameters: HashMap<String, String>) -> Connection {
         use std::os::fd::AsRawFd;
         let id = stream.as_raw_fd() as usize;
         let waker = stream.waker();
 
-        let req_queue = Arc::new(Queue::new());
-        let req_queue_dup = req_queue.clone();
+        let writer = Arc::new(QueueWriter::new(stream));
+        let writer_dup = writer.clone();
+        let rsp_queue = Arc::new(Queue::new());
+        let rsp_queue_dup = rsp_queue.clone();
         let send_flag = Arc::new(AtomicBool::new(false));
         let send_flag_dup = send_flag.clone();
         let io_handle = go!(move || {
-            if let Err(e) = connection_loop(&mut stream, req_queue_dup, send_flag_dup, parameters) {
+            let stream = writer_dup.clone();
+            if let Err(e) = connection_loop(writer_dup, rsp_queue_dup, send_flag_dup, parameters) {
                 log::error!("connection error = {:?}", e);
-                terminate_connection(&mut stream);
+                stream.with_stream(terminate_connection);
             }
         });
 
         Connection {
             io_handle,
-            req_queue,
+            writer,
+            rsp_queue,
             waker,
             send_flag,
             id,
         }
     }
 
+    #[inline]
+    fn write_req(&self, req: Request) -> io::Result<usize> {
+        self.rsp_queue.push(Response {
+            tag: req.tag,
+            tx: req.sender,
+        });
+        let write_done = match req.messages {
+            RequestMessages::Single(msg) => match msg {
+                FrontendMessage::Raw(buf) => self.writer.write_data(&buf)?,
+                FrontendMessage::CopyData(data) => {
+                    // TODO: optimize this
+                    let mut tmp = BytesMut::with_capacity(IO_BUF_SIZE);
+                    data.write(&mut tmp);
+                    self.writer.write_data(&tmp)?
+                }
+            },
+            RequestMessages::CopyIn(mut rcv) => {
+                let mut copy_in_msg = rcv.try_recv();
+                loop {
+                    match copy_in_msg {
+                        Ok(Some(msg)) => {
+                            match msg {
+                                FrontendMessage::Raw(buf) => {
+                                    self.writer.write_data(&buf)?;
+                                }
+                                FrontendMessage::CopyData(data) => {
+                                    // TODO: optimize this
+                                    let mut tmp = BytesMut::with_capacity(IO_BUF_SIZE);
+                                    data.write(&mut tmp);
+                                    self.writer.write_data(&tmp)?;
+                                }
+                            }
+                            copy_in_msg = rcv.try_recv();
+                        }
+                        Ok(None) => {
+                            self.writer.write_flush()?;
+
+                            // no data found we just write all the data and wait
+                            copy_in_msg = rcv.recv();
+                        }
+                        Err(_) => break false,
+                    }
+                }
+            }
+        };
+
+        if !write_done {
+            self.send_flag.store(true, Ordering::Release);
+            self.waker.wakeup();
+        }
+        Ok(0)
+    }
+
     /// send a request to the connection
     pub fn send(&self, req: Request) {
-        self.req_queue.push(req);
-        self.send_flag.store(true, Ordering::Release);
-        self.waker.wakeup();
+        if let Err(e) = self.write_req(req) {
+            println!("send error = {e:?}");
+        }
     }
 
     #[inline]
