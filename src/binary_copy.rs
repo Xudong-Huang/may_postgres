@@ -248,7 +248,7 @@ impl BinaryCopyOutRow {
     {
         match self.try_get(idx) {
             Ok(value) => value,
-            Err(e) => panic!("error retrieving column {}: {}", idx, e),
+            Err(e) => panic!("error retrieving column {idx}: {e}"),
         }
     }
 }

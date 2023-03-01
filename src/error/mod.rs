@@ -371,9 +371,9 @@ impl fmt::Display for Error {
             Kind::Io => fmt.write_str("error communicating with the server")?,
             Kind::UnexpectedMessage => fmt.write_str("unexpected message from server")?,
             // Kind::Tls => fmt.write_str("error performing TLS handshake")?,
-            Kind::ToSql(idx) => write!(fmt, "error serializing parameter {}", idx)?,
-            Kind::FromSql(idx) => write!(fmt, "error deserializing column {}", idx)?,
-            Kind::Column(column) => write!(fmt, "invalid column `{}`", column)?,
+            Kind::ToSql(idx) => write!(fmt, "error serializing parameter {idx}")?,
+            Kind::FromSql(idx) => write!(fmt, "error deserializing column {idx}")?,
+            Kind::Column(column) => write!(fmt, "invalid column `{column}`")?,
             Kind::Closed => fmt.write_str("connection closed")?,
             Kind::Db => fmt.write_str("db error")?,
             Kind::Parse => fmt.write_str("error parsing response from server")?,
@@ -385,7 +385,7 @@ impl fmt::Display for Error {
             Kind::Connect => fmt.write_str("error connecting to server")?,
         };
         if let Some(ref cause) = self.0.cause {
-            write!(fmt, ": {}", cause)?;
+            write!(fmt, ": {cause}")?;
         }
         Ok(())
     }

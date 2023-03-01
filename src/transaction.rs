@@ -223,7 +223,7 @@ impl<'a> Transaction<'a> {
     /// Like `Client::transaction`.
     pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         let depth = self.depth + 1;
-        let query = format!("SAVEPOINT sp{}", depth);
+        let query = format!("SAVEPOINT sp{depth}");
         self.batch_execute(&query)?;
 
         Ok(Transaction {
