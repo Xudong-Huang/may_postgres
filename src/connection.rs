@@ -164,10 +164,6 @@ fn process_write(
     rsp_queue: &mut VecDeque<Response>,
     write_buf: &mut BytesMut,
 ) -> io::Result<()> {
-    let remaining = write_buf.capacity();
-    if remaining < 512 {
-        write_buf.reserve(IO_BUF_SIZE - remaining);
-    }
     while let Some(req) = req_queue.pop() {
         rsp_queue.push_back(Response {
             tag: req.tag,
