@@ -72,26 +72,26 @@ impl Drop for Connection {
 
 // read the socket until no data
 #[inline]
-fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<usize> {
-    let remaining = read_buf.capacity();
+fn process_read(stream: &mut impl Read, req_buf: &mut BytesMut) -> io::Result<usize> {
+    let remaining = req_buf.capacity();
     if remaining < 512 {
-        read_buf.reserve(IO_BUF_SIZE - remaining);
+        req_buf.reserve(IO_BUF_SIZE - remaining);
     }
 
+    let read_buf: &mut [u8] = unsafe { std::mem::transmute(&mut *req_buf.bytes_mut()) };
+    let len = read_buf.len();
     let mut read_cnt = 0;
-    loop {
-        let buf = unsafe { &mut *(read_buf.bytes_mut() as *mut _ as *mut [u8]) };
-        assert!(!buf.is_empty());
-        match stream.read(buf) {
-            Ok(n) if n > 0 => {
-                read_cnt += n;
-                unsafe { read_buf.advance_mut(n) };
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(read_cnt),
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
+    while read_cnt < len {
+        match stream.read(unsafe { read_buf.get_unchecked_mut(read_cnt..) }) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
+            Ok(n) => read_cnt += n,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
             Err(err) => return Err(err),
         }
     }
+
+    unsafe { req_buf.advance_mut(read_cnt) };
+    Ok(read_cnt)
 }
 
 #[inline]
@@ -141,13 +141,16 @@ fn decode_messages(
 #[inline]
 fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Result<usize> {
     let len = write_buf.len();
+    if len == 0 {
+        return Ok(0);
+    }
     let mut written = 0;
     while written < len {
         match stream.write(&write_buf[written..]) {
-            Ok(n) if n > 0 => written += n,
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
+            Ok(n) => written += n,
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
             Err(err) => return Err(err),
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
         }
     }
     write_buf.advance(written);
@@ -233,13 +236,9 @@ fn connection_loop(
         // if !rsp_queue.is_empty() &&
         if process_read(inner_stream, &mut read_buf).map_err(Error::io)? > 0 {
             decode_messages(&mut read_buf, &mut rsp_queue, &mut parameters)?;
-
-            if send_flag.load(Ordering::Relaxed) {
-                continue;
-            }
+        } else {
+            stream.wait_io();
         }
-
-        stream.wait_io();
     }
 }
 
