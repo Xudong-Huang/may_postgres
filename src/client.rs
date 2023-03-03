@@ -503,10 +503,6 @@ impl Client {
         F: FnOnce(&mut BytesMut) -> R,
     {
         let buf = unsafe { &mut *self.buf.get() };
-        let remaining = buf.capacity();
-        if remaining < 512 {
-            buf.reserve(4096 - remaining);
-        }
         f(buf)
     }
 

@@ -81,19 +81,27 @@ impl QueueWriter {
 
     /// return Ok(true) if all data is send out
     pub fn write_data(&self, data: &[u8]) -> io::Result<bool> {
+        #[cfg(feature = "default")]
         let mut inner = self.inner.lock().unwrap();
-        // #[allow(clippy::cast_ref_to_mut)]
-        // let me = unsafe { &mut *(self as *const _ as *mut Self) };
-        // let inner = me.inner.get_mut().unwrap();
+        #[cfg(not(feature = "default"))]
+        let inner = {
+            #[allow(clippy::cast_ref_to_mut)]
+            let me = unsafe { &mut *(self as *const _ as *mut Self) };
+            me.inner.get_mut().unwrap()
+        };
         inner.write_data(data)
     }
 
     /// flush all the data
     pub fn write_flush(&self) -> io::Result<()> {
+        #[cfg(feature = "default")]
         let mut inner = self.inner.lock().unwrap();
-        // #[allow(clippy::cast_ref_to_mut)]
-        // let me = unsafe { &mut *(self as *const _ as *mut Self) };
-        // let inner = me.inner.get_mut().unwrap();
+        #[cfg(not(feature = "default"))]
+        let inner = {
+            #[allow(clippy::cast_ref_to_mut)]
+            let me = unsafe { &mut *(self as *const _ as *mut Self) };
+            me.inner.get_mut().unwrap()
+        };
         inner.write_flush()
     }
 
@@ -110,19 +118,23 @@ impl QueueWriter {
 impl QueueWriterInner {
     #[inline]
     fn write_flush(&mut self) -> io::Result<()> {
-        nonblock_write(self.stream.inner_mut(), &mut self.write_buf)?;
+        let n = nonblock_write(self.stream.inner_mut(), &self.write_buf)?;
+        self.write_buf.advance(n);
         Ok(())
     }
 
     #[inline]
     fn write_data(&mut self, data: &[u8]) -> io::Result<bool> {
-        self.write_buf.extend_from_slice(data);
-
-        if self.write_buf.len() > 840 {
-            self.write_flush()?;
+        if self.write_buf.is_empty() {
+            let n = nonblock_write(self.stream.inner_mut(), data)?;
+            if n == data.len() {
+                return Ok(true);
+            }
+            self.write_buf.extend_from_slice(&data[n..]);
+        } else {
+            self.write_buf.extend_from_slice(data);
         }
-
-        Ok(self.write_buf.is_empty())
+        Ok(false)
     }
 }
 
@@ -214,21 +226,17 @@ fn decode_messages(
 }
 
 #[inline]
-fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Result<usize> {
-    let len = write_buf.len();
-    if len == 0 {
-        return Ok(0);
-    }
+fn nonblock_write(stream: &mut impl Write, data: &[u8]) -> io::Result<usize> {
+    let len = data.len();
     let mut written = 0;
     while written < len {
-        match stream.write(&write_buf[written..]) {
+        match stream.write(&data[written..]) {
             Ok(0) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
             Ok(n) => written += n,
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
             Err(err) => return Err(err),
         }
     }
-    write_buf.advance(written);
     Ok(written)
 }
 
@@ -297,7 +305,7 @@ impl Connection {
     }
 
     #[inline]
-    fn write_req(&self, req: Request) -> io::Result<usize> {
+    fn write_req(&self, req: Request) -> io::Result<()> {
         self.rsp_queue.push(Response {
             tag: req.tag,
             tx: req.sender,
@@ -346,14 +354,12 @@ impl Connection {
             self.send_flag.store(true, Ordering::Release);
             self.waker.wakeup();
         }
-        Ok(0)
+        Ok(())
     }
 
     /// send a request to the connection
     pub fn send(&self, req: Request) {
-        if let Err(e) = self.write_req(req) {
-            println!("send error = {e:?}");
-        }
+        self.write_req(req).unwrap();
     }
 
     #[inline]
