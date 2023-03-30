@@ -272,8 +272,10 @@ impl Connection {
     /// send a request to the connection
     pub fn send(&self, req: Request) {
         self.req_queue.push(req);
-        self.send_flag.store(true, Ordering::Release);
-        self.waker.wakeup();
+        if !self.send_flag.load(Ordering::Relaxed) {
+            self.send_flag.store(true, Ordering::Relaxed);
+            self.waker.wakeup();
+        }
     }
 
     #[inline]

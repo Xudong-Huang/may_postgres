@@ -11,42 +11,33 @@ mod private {
 /// This trait is "sealed", and cannot be implemented outside of this crate.
 pub trait GenericClient: private::Sealed {
     /// Like `Client::execute`.
-    fn execute<T>(&self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error>
+    fn execute<T>(&self, query: &T, params: &[&(dyn ToSql)]) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement + Sync + Send;
 
     /// Like `Client::execute_raw`.
-    fn execute_raw<'b, I, T>(&self, statement: &T, params: I) -> Result<u64, Error>
+    fn execute_raw<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<u64, Error>
     where
-        T: ?Sized + ToStatement + Sync + Send,
-        I: IntoIterator<Item = &'b dyn ToSql> + Sync + Send,
-        I::IntoIter: ExactSizeIterator;
-
+        T: ?Sized + ToStatement + Sync + Send;
     /// Like `Client::query`.
-    fn query<T>(&self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, Error>
+    fn query<T>(&self, query: &T, params: &[&(dyn ToSql)]) -> Result<Vec<Row>, Error>
     where
         T: ?Sized + ToStatement + Sync + Send;
 
     /// Like `Client::query_one`.
-    fn query_one<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Row, Error>
+    fn query_one<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<Row, Error>
     where
         T: ?Sized + ToStatement + Sync + Send;
 
     /// Like `Client::query_opt`.
-    fn query_opt<T>(
-        &self,
-        statement: &T,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Option<Row>, Error>
+    fn query_opt<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<Option<Row>, Error>
     where
         T: ?Sized + ToStatement + Sync + Send;
 
     /// Like `Client::query_raw`.
-    fn query_raw<'b, T, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
+    fn query_raw<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<RowStream, Error>
     where
-        T: ?Sized + ToStatement + Sync + Send,
-        I: IntoIterator<Item = &'b dyn ToSql> + Sync + Send,
-        I::IntoIter: ExactSizeIterator;
+        T: ?Sized + ToStatement + Sync + Send;
 
     /// Like `Client::prepare`.
     fn prepare(&self, query: &str) -> Result<Statement, Error>;
@@ -61,52 +52,44 @@ pub trait GenericClient: private::Sealed {
 impl private::Sealed for Client {}
 
 impl GenericClient for Client {
-    fn execute<T>(&self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error>
+    fn execute<T>(&self, query: &T, params: &[&(dyn ToSql)]) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
     {
         self.execute(query, params)
     }
 
-    fn execute_raw<'b, I, T>(&self, statement: &T, params: I) -> Result<u64, Error>
+    fn execute_raw<'b, T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
-        I: IntoIterator<Item = &'b dyn ToSql> + Sync + Send,
-        I::IntoIter: ExactSizeIterator,
     {
         self.execute_raw(statement, params)
     }
 
-    fn query<T>(&self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, Error>
+    fn query<T>(&self, query: &T, params: &[&(dyn ToSql)]) -> Result<Vec<Row>, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
     {
         self.query(query, params)
     }
 
-    fn query_one<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Row, Error>
+    fn query_one<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<Row, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
     {
         self.query_one(statement, params)
     }
 
-    fn query_opt<T>(
-        &self,
-        statement: &T,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Option<Row>, Error>
+    fn query_opt<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<Option<Row>, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
     {
         self.query_opt(statement, params)
     }
 
-    fn query_raw<'b, T, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
+    fn query_raw<'b, T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<RowStream, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
-        I: IntoIterator<Item = &'b dyn ToSql> + Sync + Send,
-        I::IntoIter: ExactSizeIterator,
     {
         self.query_raw(statement, params)
     }
@@ -127,52 +110,44 @@ impl GenericClient for Client {
 impl private::Sealed for Transaction<'_> {}
 
 impl GenericClient for Transaction<'_> {
-    fn execute<T>(&self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error>
+    fn execute<T>(&self, query: &T, params: &[&(dyn ToSql)]) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
     {
         self.execute(query, params)
     }
 
-    fn execute_raw<'b, I, T>(&self, statement: &T, params: I) -> Result<u64, Error>
+    fn execute_raw<'b, T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
-        I: IntoIterator<Item = &'b dyn ToSql> + Sync + Send,
-        I::IntoIter: ExactSizeIterator,
     {
         self.execute_raw(statement, params)
     }
 
-    fn query<T>(&self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, Error>
+    fn query<T>(&self, query: &T, params: &[&(dyn ToSql)]) -> Result<Vec<Row>, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
     {
         self.query(query, params)
     }
 
-    fn query_one<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Row, Error>
+    fn query_one<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<Row, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
     {
         self.query_one(statement, params)
     }
 
-    fn query_opt<T>(
-        &self,
-        statement: &T,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Option<Row>, Error>
+    fn query_opt<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<Option<Row>, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
     {
         self.query_opt(statement, params)
     }
 
-    fn query_raw<'b, T, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
+    fn query_raw<'b, T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<RowStream, Error>
     where
         T: ?Sized + ToStatement + Sync + Send,
-        I: IntoIterator<Item = &'b dyn ToSql> + Sync + Send,
-        I::IntoIter: ExactSizeIterator,
     {
         self.query_raw(statement, params)
     }

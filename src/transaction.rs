@@ -4,8 +4,8 @@ use crate::copy_out::CopyOutStream;
 use crate::query::RowStream;
 use crate::types::{ToSql, Type};
 use crate::{
-    bind, query, slice_iter, CancelToken, Client, CopyInSink, Error, Portal, Row,
-    SimpleQueryMessage, Statement, ToStatement,
+    bind, query, CancelToken, Client, CopyInSink, Error, Portal, Row, SimpleQueryMessage,
+    Statement, ToStatement,
 };
 use bytes::Buf;
 use postgres_protocol::message::frontend;
@@ -85,7 +85,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Like `Client::query`.
-    pub fn query<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, Error>
+    pub fn query<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<Vec<Row>, Error>
     where
         T: ?Sized + ToStatement,
     {
@@ -93,7 +93,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Like `Client::query_one`.
-    pub fn query_one<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Row, Error>
+    pub fn query_one<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<Row, Error>
     where
         T: ?Sized + ToStatement,
     {
@@ -101,11 +101,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Like `Client::query_opt`.
-    pub fn query_opt<T>(
-        &self,
-        statement: &T,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Option<Row>, Error>
+    pub fn query_opt<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<Option<Row>, Error>
     where
         T: ?Sized + ToStatement,
     {
@@ -113,17 +109,15 @@ impl<'a> Transaction<'a> {
     }
 
     /// Like `Client::query_raw`.
-    pub fn query_raw<'b, T, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
+    pub fn query_raw<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<RowStream, Error>
     where
         T: ?Sized + ToStatement,
-        I: IntoIterator<Item = &'b dyn ToSql>,
-        I::IntoIter: ExactSizeIterator,
     {
         self.client.query_raw(statement, params)
     }
 
     /// Like `Client::execute`.
-    pub fn execute<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error>
+    pub fn execute<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement,
     {
@@ -131,11 +125,9 @@ impl<'a> Transaction<'a> {
     }
 
     /// Like `Client::execute_iter`.
-    pub fn execute_raw<'b, I, T>(&self, statement: &T, params: I) -> Result<u64, Error>
+    pub fn execute_raw<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement,
-        I: IntoIterator<Item = &'b dyn ToSql>,
-        I::IntoIter: ExactSizeIterator,
     {
         self.client.execute_raw(statement, params)
     }
@@ -148,21 +140,19 @@ impl<'a> Transaction<'a> {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn bind<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Portal, Error>
+    pub fn bind<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<Portal, Error>
     where
         T: ?Sized + ToStatement,
     {
-        self.bind_raw(statement, slice_iter(params))
+        self.bind_raw(statement, params)
     }
 
     /// A maximally flexible version of [`bind`].
     ///
     /// [`bind`]: #method.bind
-    pub fn bind_raw<'b, T, I>(&self, statement: &T, params: I) -> Result<Portal, Error>
+    pub fn bind_raw<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<Portal, Error>
     where
         T: ?Sized + ToStatement,
-        I: IntoIterator<Item = &'b dyn ToSql>,
-        I::IntoIter: ExactSizeIterator,
     {
         let statement = statement.__convert().into_statement(self.client)?;
         bind::bind(self.client, statement, params)

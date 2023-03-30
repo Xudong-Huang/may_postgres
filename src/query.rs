@@ -7,11 +7,11 @@ use bytes::{Bytes, BytesMut};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
-pub fn query<'a, I>(client: &Client, statement: Statement, params: I) -> Result<RowStream, Error>
-where
-    I: IntoIterator<Item = &'a dyn ToSql>,
-    I::IntoIter: ExactSizeIterator,
-{
+pub fn query(
+    client: &Client,
+    statement: Statement,
+    params: &[&(dyn ToSql)],
+) -> Result<RowStream, Error> {
     let buf = encode(client, &statement, params)?;
     let responses = start(client, buf)?;
     Ok(RowStream {
@@ -35,11 +35,11 @@ pub fn query_portal(client: &Client, portal: &Portal, max_rows: i32) -> Result<R
     })
 }
 
-pub fn execute<'a, I>(client: &Client, statement: Statement, params: I) -> Result<u64, Error>
-where
-    I: IntoIterator<Item = &'a dyn ToSql>,
-    I::IntoIter: ExactSizeIterator,
-{
+pub fn execute(
+    client: &Client,
+    statement: Statement,
+    params: &[&(dyn ToSql)],
+) -> Result<u64, Error> {
     let buf = encode(client, &statement, params)?;
     let mut responses = start(client, buf)?;
 
@@ -64,15 +64,17 @@ where
     }
 }
 
+#[inline]
 fn start(client: &Client, buf: Bytes) -> Result<Responses, Error> {
     client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))
 }
 
-pub fn encode<'a, I>(client: &Client, statement: &Statement, params: I) -> Result<Bytes, Error>
-where
-    I: IntoIterator<Item = &'a dyn ToSql>,
-    I::IntoIter: ExactSizeIterator,
-{
+#[inline]
+pub fn encode(
+    client: &Client,
+    statement: &Statement,
+    params: &[&(dyn ToSql)],
+) -> Result<Bytes, Error> {
     client.with_buf(|buf| {
         encode_bind(statement, params, "", buf)?;
         frontend::execute("", 0, buf).map_err(Error::encode)?;
@@ -81,24 +83,21 @@ where
     })
 }
 
-pub fn encode_bind<'a, I>(
+#[inline]
+pub fn encode_bind(
     statement: &Statement,
-    params: I,
+    params: &[&(dyn ToSql)],
     portal: &str,
     buf: &mut BytesMut,
-) -> Result<(), Error>
-where
-    I: IntoIterator<Item = &'a dyn ToSql>,
-    I::IntoIter: ExactSizeIterator,
-{
-    let params = params.into_iter();
+) -> Result<(), Error> {
+    let params = params.iter();
 
-    assert!(
-        statement.params().len() == params.len(),
-        "expected {} parameters but got {}",
-        statement.params().len(),
-        params.len()
-    );
+    // assert!(
+    //     statement.params().len() == params.len(),
+    //     "expected {} parameters but got {}",
+    //     statement.params().len(),
+    //     params.len()
+    // );
 
     let mut error_idx = 0;
     let r = frontend::bind(
