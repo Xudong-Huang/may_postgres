@@ -2,8 +2,8 @@ use crate::client::Client;
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::error::SqlState;
+use crate::query;
 use crate::types::{Field, Kind, Oid, Type};
-use crate::{query, slice_iter};
 use crate::{Column, Error, Statement};
 use bytes::Bytes;
 use fallible_iterator::FallibleIterator;
@@ -114,7 +114,7 @@ fn get_type(client: &Client, oid: Oid) -> Result<Type, Error> {
 
     let stmt = typeinfo_statement(client)?;
 
-    let mut rows = query::query(client, stmt, slice_iter(&[&oid]))?;
+    let mut rows = query::query(client, stmt, &[&oid])?;
 
     let row = match rows.next().transpose()? {
         Some(row) => row,
@@ -176,7 +176,7 @@ fn typeinfo_statement(client: &Client) -> Result<Statement, Error> {
 fn get_enum_variants(client: &Client, oid: Oid) -> Result<Vec<String>, Error> {
     let stmt = typeinfo_enum_statement(client)?;
 
-    query::query(client, stmt, slice_iter(&[&oid]))?
+    query::query(client, stmt, &[&oid])?
         .map(|row| row.and_then(|r| r.try_get(0)))
         .collect()
 }
@@ -201,7 +201,7 @@ fn typeinfo_enum_statement(client: &Client) -> Result<Statement, Error> {
 fn get_composite_fields(client: &Client, oid: Oid) -> Result<Vec<Field>, Error> {
     let stmt = typeinfo_composite_statement(client)?;
 
-    let rows = query::query(client, stmt, slice_iter(&[&oid]))?.collect::<Result<Vec<_>, _>>()?;
+    let rows = query::query(client, stmt, &[&oid])?.collect::<Result<Vec<_>, _>>()?;
 
     let mut fields = vec![];
     for row in rows {

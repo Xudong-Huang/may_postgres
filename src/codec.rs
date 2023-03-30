@@ -22,15 +22,12 @@ pub enum BackendMessage {
 
 pub struct BackendMessages {
     pub tag: usize,
-    data: BytesMut,
+    data: Option<BytesMut>,
 }
 
 impl BackendMessages {
     pub fn empty(tag: usize) -> BackendMessages {
-        BackendMessages {
-            tag,
-            data: BytesMut::new(),
-        }
+        BackendMessages { tag, data: None }
     }
 }
 
@@ -40,10 +37,10 @@ impl FallibleIterator for BackendMessages {
 
     #[inline]
     fn next(&mut self) -> io::Result<Option<(usize, backend::Message)>> {
-        if self.data.is_empty() {
-            return Ok(None);
+        match self.data.as_mut() {
+            Some(data) => backend::Message::parse(data).map(|m| m.map(|m| (self.tag, m))),
+            None => Ok(None),
         }
-        backend::Message::parse(&mut self.data).map(|m| m.map(|m| (self.tag, m)))
     }
 }
 
@@ -101,7 +98,7 @@ impl PostgresCodec {
             Ok(Some(BackendMessage::Normal {
                 messages: BackendMessages {
                     tag: 0,
-                    data: src.split_to(idx),
+                    data: Some(src.split_to(idx)),
                 },
                 request_complete,
             }))
