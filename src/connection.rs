@@ -79,8 +79,8 @@ impl QueueWriter {
         &mut inner.stream
     }
 
-    /// return Ok(true) if all data is send out
-    pub fn write_data(&self, data: &[u8]) -> io::Result<bool> {
+    #[inline]
+    pub fn write_data(&self, data: &[u8]) {
         #[cfg(feature = "default")]
         let mut inner = self.inner.lock().unwrap();
         #[cfg(not(feature = "default"))]
@@ -93,6 +93,7 @@ impl QueueWriter {
     }
 
     /// flush all the data
+    #[inline]
     pub fn write_flush(&self) -> io::Result<()> {
         #[cfg(feature = "default")]
         let mut inner = self.inner.lock().unwrap();
@@ -124,17 +125,8 @@ impl QueueWriterInner {
     }
 
     #[inline]
-    fn write_data(&mut self, data: &[u8]) -> io::Result<bool> {
-        if self.write_buf.is_empty() {
-            let n = nonblock_write(self.stream.inner_mut(), data)?;
-            if n == data.len() {
-                return Ok(true);
-            }
-            self.write_buf.extend_from_slice(&data[n..]);
-        } else {
-            self.write_buf.extend_from_slice(data);
-        }
-        Ok(false)
+    fn write_data(&mut self, data: &[u8]) {
+        self.write_buf.extend_from_slice(data);
     }
 }
 
@@ -310,14 +302,14 @@ impl Connection {
             tag: req.tag,
             tx: req.sender,
         });
-        let write_done = match req.messages {
+        match req.messages {
             RequestMessages::Single(msg) => match msg {
-                FrontendMessage::Raw(buf) => self.writer.write_data(&buf)?,
+                FrontendMessage::Raw(buf) => self.writer.write_data(&buf),
                 FrontendMessage::CopyData(data) => {
                     // TODO: optimize this
                     let mut tmp = BytesMut::with_capacity(IO_BUF_SIZE);
                     data.write(&mut tmp);
-                    self.writer.write_data(&tmp)?
+                    self.writer.write_data(&tmp)
                 }
             },
             RequestMessages::CopyIn(mut rcv) => {
@@ -327,13 +319,13 @@ impl Connection {
                         Ok(Some(msg)) => {
                             match msg {
                                 FrontendMessage::Raw(buf) => {
-                                    self.writer.write_data(&buf)?;
+                                    self.writer.write_data(&buf);
                                 }
                                 FrontendMessage::CopyData(data) => {
                                     // TODO: optimize this
                                     let mut tmp = BytesMut::with_capacity(IO_BUF_SIZE);
                                     data.write(&mut tmp);
-                                    self.writer.write_data(&tmp)?;
+                                    self.writer.write_data(&tmp);
                                 }
                             }
                             copy_in_msg = rcv.try_recv();
@@ -344,14 +336,14 @@ impl Connection {
                             // no data found we just write all the data and wait
                             copy_in_msg = rcv.recv();
                         }
-                        Err(_) => break false,
+                        Err(_) => break,
                     }
                 }
             }
         };
 
-        if !write_done {
-            self.send_flag.store(true, Ordering::Release);
+        if !self.send_flag.load(Ordering::Relaxed) {
+            self.send_flag.store(true, Ordering::Relaxed);
             self.waker.wakeup();
         }
         Ok(())
