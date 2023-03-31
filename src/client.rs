@@ -495,9 +495,9 @@ impl Client {
         F: FnOnce(&mut BytesMut) -> R,
     {
         let buf = unsafe { &mut *self.buf.get() };
-        if buf.capacity() < 1024 {
-            buf.reserve(4096 * 8 - buf.capacity());
-        }
+        // if buf.capacity() < 1024 {
+        //     buf.reserve(4096 * 8 - buf.capacity());
+        // }
         f(buf)
     }
 
