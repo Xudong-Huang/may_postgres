@@ -2,7 +2,7 @@ use crate::client::{Client, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::{query, Error, Statement};
-use bytes::{buf::ext::BufExt, Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;

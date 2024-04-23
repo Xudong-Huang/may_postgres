@@ -134,7 +134,7 @@ impl Iterator for BinaryCopyOutStream {
             Some(header) => header.has_oids,
             None => {
                 o_try!(check_remaining(&chunk, HEADER_LEN));
-                if &chunk.bytes()[..MAGIC.len()] != MAGIC {
+                if &chunk.chunk()[..MAGIC.len()] != MAGIC {
                     return Some(Err(Error::parse(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "invalid magic value",

@@ -309,7 +309,14 @@ impl DbError {
 
 impl fmt::Display for DbError {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(fmt, "{}: {}", self.severity, self.message)
+        write!(fmt, "{}: {}", self.severity, self.message)?;
+        if let Some(detail) = &self.detail {
+            write!(fmt, "\nDETAIL: {}", detail)?;
+        }
+        if let Some(hint) = &self.hint {
+            write!(fmt, "\nHINT: {}", hint)?;
+        }
+        Ok(())
     }
 }
 
@@ -337,6 +344,7 @@ enum Kind {
     ToSql(usize),
     FromSql(usize),
     Column(String),
+    // Parameters(usize, usize),
     Closed,
     Db,
     Parse,
@@ -346,6 +354,7 @@ enum Kind {
     Config,
     RowCount,
     Connect,
+    Timeout,
 }
 
 struct ErrorInner {
@@ -374,6 +383,9 @@ impl fmt::Display for Error {
             Kind::ToSql(idx) => write!(fmt, "error serializing parameter {}", idx)?,
             Kind::FromSql(idx) => write!(fmt, "error deserializing column {}", idx)?,
             Kind::Column(column) => write!(fmt, "invalid column `{}`", column)?,
+            // Kind::Parameters(real, expected) => {
+            //     write!(fmt, "expected {expected} parameters but got {real}")?
+            // }
             Kind::Closed => fmt.write_str("connection closed")?,
             Kind::Db => fmt.write_str("db error")?,
             Kind::Parse => fmt.write_str("error parsing response from server")?,
@@ -383,6 +395,7 @@ impl fmt::Display for Error {
             Kind::Config => fmt.write_str("invalid configuration")?,
             Kind::RowCount => fmt.write_str("query returned an unexpected number of rows")?,
             Kind::Connect => fmt.write_str("error connecting to server")?,
+            Kind::Timeout => fmt.write_str("timeout waiting for server")?,
         };
         if let Some(ref cause) = self.0.cause {
             write!(fmt, ": {}", cause)?;
@@ -403,14 +416,23 @@ impl Error {
         self.0.cause
     }
 
+    /// Returns the source of this error if it was a `DbError`.
+    ///
+    /// This is a simple convenience method.
+    pub fn as_db_error(&self) -> Option<&DbError> {
+        self.source().and_then(|e| e.downcast_ref::<DbError>())
+    }
+
+    /// Determines if the error was associated with closed connection.
+    pub fn is_closed(&self) -> bool {
+        self.0.kind == Kind::Closed
+    }
+
     /// Returns the SQLSTATE error code associated with the error.
     ///
-    /// This is a convenience method that downcasts the cause to a `DbError`
-    /// and returns its code.
+    /// This is a convenience method that downcasts the cause to a `DbError` and returns its code.
     pub fn code(&self) -> Option<&SqlState> {
-        self.source()
-            .and_then(|e| e.downcast_ref::<DbError>())
-            .map(DbError::code)
+        self.as_db_error().map(DbError::code)
     }
 
     fn new(kind: Kind, cause: Option<Box<dyn error::Error + Sync + Send>>) -> Error {
@@ -454,6 +476,10 @@ impl Error {
         Error::new(Kind::Column(column), None)
     }
 
+    // pub(crate) fn parameters(real: usize, expected: usize) -> Error {
+    //     Error::new(Kind::Parameters(real, expected), None)
+    // }
+
     // pub(crate) fn tls(e: Box<dyn error::Error + Sync + Send>) -> Error {
     //     Error::new(Kind::Tls, Some(e))
     // }
@@ -480,5 +506,10 @@ impl Error {
 
     pub(crate) fn connect(e: io::Error) -> Error {
         Error::new(Kind::Connect, Some(Box::new(e)))
+    }
+
+    #[doc(hidden)]
+    pub fn __private_api_timeout() -> Error {
+        Error::new(Kind::Timeout, None)
     }
 }

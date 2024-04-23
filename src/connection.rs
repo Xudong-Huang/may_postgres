@@ -4,10 +4,7 @@ use may::coroutine::JoinHandle;
 use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
-#[cfg(feature="default")]
 use may::queue::mpsc::Queue;
-#[cfg(not(feature="default"))]
-use may::queue::spsc::Queue;
 use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -67,31 +64,29 @@ pub(crate) struct Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         let rx = self.io_handle.coroutine();
-        unsafe {
-            rx.cancel();
-        }
+        unsafe { rx.cancel() };
     }
 }
 
 // read the socket until no data
 #[inline]
 fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<usize> {
-    let remaining = read_buf.capacity();
+    let remaining = read_buf.capacity() - read_buf.len();
     if remaining < 512 {
         read_buf.reserve(IO_BUF_SIZE - remaining);
     }
 
     let mut read_cnt = 0;
     loop {
-        let buf = unsafe { &mut *(read_buf.bytes_mut() as *mut _ as *mut [u8]) };
+        let buf: &mut [u8] = unsafe { std::mem::transmute(read_buf.chunk_mut()) };
         assert!(!buf.is_empty());
         match stream.read(buf) {
-            Ok(n) if n > 0 => {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
+            Ok(n) => {
                 read_cnt += n;
                 unsafe { read_buf.advance_mut(n) };
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(read_cnt),
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
             Err(err) => return Err(err),
         }
     }
@@ -146,11 +141,11 @@ fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Resu
     let len = write_buf.len();
     let mut written = 0;
     while written < len {
-        match stream.write(&write_buf[written..]) {
-            Ok(n) if n > 0 => written += n,
+        match stream.write(unsafe { write_buf.get_unchecked(written..) }) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
+            Ok(n) => written += n,
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
             Err(err) => return Err(err),
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
         }
     }
     write_buf.advance(written);
@@ -163,8 +158,8 @@ fn process_write(
     req_queue: &Queue<Request>,
     rsp_queue: &mut VecDeque<Response>,
     write_buf: &mut BytesMut,
-) -> io::Result<()> {
-    let remaining = write_buf.capacity();
+) -> io::Result<usize> {
+    let remaining = write_buf.capacity() - write_buf.len();
     if remaining < 512 {
         write_buf.reserve(IO_BUF_SIZE - remaining);
     }
@@ -201,8 +196,7 @@ fn process_write(
             }
         }
     }
-    nonblock_write(stream, write_buf)?;
-    Ok(())
+    nonblock_write(stream, write_buf)
 }
 
 #[inline]
@@ -227,14 +221,15 @@ fn connection_loop(
     loop {
         stream.reset_io();
         let inner_stream = stream.inner_mut();
+        let mut write_cnt = 0;
         if send_flag.load(Ordering::Acquire) {
             send_flag.store(false, Ordering::Relaxed);
-            process_write(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf)
+            write_cnt = process_write(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf)
                 .map_err(Error::io)?;
         }
 
-        // if !rsp_queue.is_empty() &&
-        if process_read(inner_stream, &mut read_buf).map_err(Error::io)? > 0 {
+        let read_cnt = process_read(inner_stream, &mut read_buf).map_err(Error::io)?;
+        if read_cnt > 0 {
             decode_messages(&mut read_buf, &mut rsp_queue, &mut parameters)?;
 
             if send_flag.load(Ordering::Relaxed) {
@@ -242,7 +237,9 @@ fn connection_loop(
             }
         }
 
-        stream.wait_io();
+        if read_cnt == 0 && (write_buf.is_empty() || write_cnt == 0) {
+            stream.wait_io();
+        }
     }
 }
 
@@ -275,14 +272,11 @@ impl Connection {
     /// send a request to the connection
     pub fn send(&self, req: Request) {
         self.req_queue.push(req);
-        #[cfg(not(feature="default"))]
-        if !self.send_flag.load(Ordering::Relaxed) {
-            self.send_flag.store(true, Ordering::Release);
-            self.waker.wakeup();
-        }
-        #[cfg(feature="default")]
+        if self
+            .send_flag
+            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
         {
-            self.send_flag.store(true, Ordering::Release);
             self.waker.wakeup();
         }
     }

@@ -140,15 +140,13 @@ mod frame_codec {
                 }
                 // try to read more data from stream
                 // read the socket for reqs
-                if self.read_buf.capacity() < 1024 {
-                    self.read_buf.reserve(4096 * 8 - self.read_buf.capacity());
+                let remain = self.read_buf.capacity() - self.read_buf.len();
+                if remain < 1024 {
+                    self.read_buf.reserve(4096 * 8 - remain);
                 }
 
-                let n = {
-                    let read_buf =
-                        unsafe { &mut *(self.read_buf.bytes_mut() as *mut _ as *mut [u8]) };
-                    self.r_stream.read(read_buf)?
-                };
+                let read_buf: &mut [u8] = unsafe { std::mem::transmute(self.read_buf.chunk_mut()) };
+                let n = self.r_stream.read(read_buf)?;
                 //connection was closed
                 if n == 0 {
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
@@ -189,12 +187,12 @@ mod frame_codec {
                 }
                 // try to read more data from stream
                 // read the socket for reqs
-                if self.read_buf.capacity() < 1024 {
-                    self.read_buf.reserve(4096 * 8 - self.read_buf.capacity());
+                let remain = self.read_buf.capacity() - self.read_buf.len();
+                if remain < 1024 {
+                    self.read_buf.reserve(4096 * 8 - remain);
                 }
 
-                let read_buf = unsafe { &mut *(self.read_buf.bytes_mut() as *mut _ as *mut [u8]) };
-
+                let read_buf: &mut [u8] = unsafe { std::mem::transmute(self.read_buf.chunk_mut()) };
                 let n = self.r_stream.read(read_buf)?;
                 //connection was closed
                 if n == 0 {
