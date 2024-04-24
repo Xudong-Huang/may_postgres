@@ -157,12 +157,12 @@ fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Resu
 }
 
 #[inline]
-fn process_write(
+fn process_req(
     stream: &mut impl Write,
     req_queue: &Queue<Request>,
     rsp_queue: &mut VecDeque<Response>,
     write_buf: &mut BytesMut,
-) -> io::Result<usize> {
+) -> io::Result<()> {
     let remaining = write_buf.capacity() - write_buf.len();
     if remaining < 512 {
         write_buf.reserve(IO_BUF_SIZE - remaining);
@@ -200,7 +200,7 @@ fn process_write(
             }
         }
     }
-    nonblock_write(stream, write_buf)
+    Ok(())
 }
 
 #[inline]
@@ -226,12 +226,14 @@ fn connection_loop(
     loop {
         stream.reset_io();
         let inner_stream = stream.inner_mut();
-        let mut write_cnt = 0;
+
         if send_flag.load(Ordering::Acquire) {
             send_flag.store(false, Ordering::Relaxed);
-            write_cnt = process_write(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf)
+            process_req(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf)
                 .map_err(Error::io)?;
         }
+
+        let write_cnt = nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
 
         let read_cnt = process_read(inner_stream, &mut read_buf).map_err(Error::io)?;
         if read_cnt > 0 {
@@ -241,13 +243,12 @@ fn connection_loop(
                 &mut msg_queue,
                 &mut parameters,
             )?;
-
-            if send_flag.load(Ordering::Relaxed) {
-                continue;
-            }
         }
 
-        if read_cnt == 0 && (write_buf.is_empty() || write_cnt == 0) {
+        if read_cnt == 0
+            && (write_buf.is_empty() || write_cnt == 0)
+            && !send_flag.load(Ordering::Relaxed)
+        {
             stream.wait_io();
         }
     }
