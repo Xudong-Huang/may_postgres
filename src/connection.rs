@@ -71,13 +71,12 @@ impl Drop for Connection {
 // read the socket until no data
 #[inline]
 fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<usize> {
-    let remaining = read_buf.capacity() - read_buf.len();
-    if remaining < 512 {
-        read_buf.reserve(IO_BUF_SIZE - remaining);
-    }
-
     let mut read_cnt = 0;
     loop {
+        let remaining = read_buf.capacity() - read_buf.len();
+        if remaining < 1024 {
+            read_buf.reserve(IO_BUF_SIZE - remaining);
+        }
         let buf: &mut [u8] = unsafe { std::mem::transmute(read_buf.chunk_mut()) };
         assert!(!buf.is_empty());
         match stream.read(buf) {
@@ -163,11 +162,11 @@ fn process_req(
     rsp_queue: &mut VecDeque<Response>,
     write_buf: &mut BytesMut,
 ) -> io::Result<()> {
-    let remaining = write_buf.capacity() - write_buf.len();
-    if remaining < 512 {
-        write_buf.reserve(IO_BUF_SIZE - remaining);
-    }
     while let Some(req) = req_queue.pop() {
+        let remaining = write_buf.capacity() - write_buf.len();
+        if remaining < 1024 {
+            write_buf.reserve(IO_BUF_SIZE - remaining);
+        }
         rsp_queue.push_back(Response {
             tag: req.tag,
             tx: req.sender,
