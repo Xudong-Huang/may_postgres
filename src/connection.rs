@@ -16,7 +16,6 @@ use crate::Error;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const IO_BUF_SIZE: usize = 4096 * 16;
@@ -57,7 +56,6 @@ pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
     req_queue: Arc<Queue<Request>>,
     waker: WaitIoWaker,
-    send_flag: Arc<AtomicBool>,
     id: usize,
 }
 
@@ -231,7 +229,6 @@ fn process_req(
     Ok(())
 }
 
-#[inline]
 fn terminate_connection(stream: &mut TcpStream) {
     let mut request = BytesMut::new();
     frontend::terminate(&mut request);
@@ -243,7 +240,6 @@ fn terminate_connection(stream: &mut TcpStream) {
 fn connection_loop(
     stream: &mut TcpStream,
     req_queue: Arc<Queue<Request>>,
-    send_flag: Arc<AtomicBool>,
     mut parameters: HashMap<String, String>,
 ) -> Result<(), Error> {
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
@@ -255,11 +251,7 @@ fn connection_loop(
         stream.reset_io();
         let inner_stream = stream.inner_mut();
 
-        if send_flag.load(Ordering::Acquire) {
-            send_flag.store(false, Ordering::Relaxed);
-            process_req(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf)
-                .map_err(Error::io)?;
-        }
+        process_req(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf).map_err(Error::io)?;
 
         let write_cnt = nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
 
@@ -273,10 +265,7 @@ fn connection_loop(
             )?;
         }
 
-        if read_cnt == 0
-            && (write_buf.is_empty() || write_cnt == 0)
-            && !send_flag.load(Ordering::Relaxed)
-        {
+        if read_cnt == 0 && (write_buf.is_empty() || write_cnt == 0) {
             stream.wait_io();
         }
     }
@@ -290,10 +279,8 @@ impl Connection {
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
-        let send_flag = Arc::new(AtomicBool::new(false));
-        let send_flag_dup = send_flag.clone();
         let io_handle = go!(move || {
-            if let Err(e) = connection_loop(&mut stream, req_queue_dup, send_flag_dup, parameters) {
+            if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters) {
                 log::error!("connection error = {:?}", e);
                 terminate_connection(&mut stream);
             }
@@ -303,7 +290,6 @@ impl Connection {
             io_handle,
             req_queue,
             waker,
-            send_flag,
             id,
         }
     }
@@ -311,13 +297,7 @@ impl Connection {
     /// send a request to the connection
     pub fn send(&self, req: Request) {
         self.req_queue.push(req);
-        if self
-            .send_flag
-            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
-            .is_ok()
-        {
-            self.waker.wakeup();
-        }
+        self.waker.wakeup();
     }
 
     #[inline]
