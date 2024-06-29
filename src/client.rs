@@ -56,7 +56,6 @@ struct State {
     typeinfo_composite: Option<Statement>,
     typeinfo_enum: Option<Statement>,
     types: HashMap<Oid, Type>,
-    // buf: BytesMut,
 }
 
 pub struct InnerClient {

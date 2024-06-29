@@ -68,27 +68,75 @@ impl Drop for Connection {
     }
 }
 
-// read the socket until no data
 #[inline]
-fn process_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<usize> {
-    let mut read_cnt = 0;
-    loop {
-        let remaining = read_buf.capacity() - read_buf.len();
-        if remaining < 1024 {
-            read_buf.reserve(IO_BUF_SIZE - remaining);
-        }
-        let buf: &mut [u8] = unsafe { std::mem::transmute(read_buf.chunk_mut()) };
-        assert!(!buf.is_empty());
-        match stream.read(buf) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
-            Ok(n) => {
-                read_cnt += n;
-                unsafe { read_buf.advance_mut(n) };
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(read_cnt),
-            Err(err) => return Err(err),
+pub(crate) fn reserve_buf(buf: &mut BytesMut) {
+    let rem = buf.capacity() - buf.len();
+    if rem < 1024 {
+        buf.reserve(IO_BUF_SIZE - rem);
+    }
+}
+
+#[inline]
+#[cold]
+fn err<T>(e: io::Error) -> io::Result<T> {
+    Err(e)
+}
+
+#[inline]
+#[cold]
+fn cold() {}
+
+// #[inline]
+// fn likely(b: bool) -> bool {
+//     if !b { cold() }
+//     b
+// }
+
+#[inline]
+fn unlikely(b: bool) -> bool {
+    if b {
+        cold()
+    }
+    b
+}
+
+#[inline]
+fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Result<usize> {
+    let buf = write_buf.chunk();
+    let len = buf.len();
+    if unlikely(len == 0) {
+        return Ok(0);
+    }
+
+    let mut write_cnt = 0;
+    while write_cnt < len {
+        match stream.write(unsafe { buf.get_unchecked(write_cnt..) }) {
+            Ok(0) => return err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
+            Ok(n) => write_cnt += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return err(e),
         }
     }
+    write_buf.advance(write_cnt);
+    Ok(write_cnt)
+}
+
+#[inline]
+fn nonblock_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<usize> {
+    reserve_buf(read_buf);
+    let buf: &mut [u8] = unsafe { std::mem::transmute(read_buf.chunk_mut()) };
+    let len = buf.len();
+    let mut read_cnt = 0;
+    while read_cnt < len {
+        match stream.read(unsafe { buf.get_unchecked_mut(read_cnt..) }) {
+            Ok(0) => return err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
+            Ok(n) => read_cnt += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return err(e),
+        }
+    }
+    unsafe { read_buf.advance_mut(read_cnt) };
+    Ok(read_cnt)
 }
 
 #[inline]
@@ -140,22 +188,6 @@ fn decode_messages(
 }
 
 #[inline]
-fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Result<usize> {
-    let len = write_buf.len();
-    let mut written = 0;
-    while written < len {
-        match stream.write(unsafe { write_buf.get_unchecked(written..) }) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
-            Ok(n) => written += n,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-            Err(err) => return Err(err),
-        }
-    }
-    write_buf.advance(written);
-    Ok(written)
-}
-
-#[inline]
 fn process_req(
     stream: &mut impl Write,
     req_queue: &Queue<Request>,
@@ -163,10 +195,7 @@ fn process_req(
     write_buf: &mut BytesMut,
 ) -> io::Result<()> {
     while let Some(req) = req_queue.pop() {
-        let remaining = write_buf.capacity() - write_buf.len();
-        if remaining < 1024 {
-            write_buf.reserve(IO_BUF_SIZE - remaining);
-        }
+        reserve_buf(write_buf);
         rsp_queue.push_back(Response {
             tag: req.tag,
             tx: req.sender,
@@ -234,7 +263,7 @@ fn connection_loop(
 
         let write_cnt = nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
 
-        let read_cnt = process_read(inner_stream, &mut read_buf).map_err(Error::io)?;
+        let read_cnt = nonblock_read(inner_stream, &mut read_buf).map_err(Error::io)?;
         if read_cnt > 0 {
             decode_messages(
                 &mut read_buf,
