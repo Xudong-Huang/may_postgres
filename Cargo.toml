@@ -48,6 +48,7 @@ fallible-iterator = "0.2"
 postgres-protocol = "0.6"
 
 may = { version = "0.3", default-features = false }
+cueue = { version = "0.3", git = "https://github.com/Xudong-Huang/cueue.git" }
 
 [dev-dependencies]
 env_logger = "0.11"

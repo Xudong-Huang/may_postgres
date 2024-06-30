@@ -510,6 +510,7 @@ impl Client {
             messages,
             sender,
         };
+
         self.inner.sender.send(request);
 
         Ok(Responses {
