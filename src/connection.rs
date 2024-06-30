@@ -119,7 +119,6 @@ fn nonblock_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<
 fn decode_messages(
     read_buf: &mut BytesMut,
     rsp_queue: &mut VecDeque<Response>,
-    msg_queue: &mut VecDeque<BackendMessages>,
     parameters: &mut HashMap<String, String>,
 ) -> Result<(), Error> {
     use crate::codec::PostgresCodec;
@@ -140,12 +139,9 @@ fn decode_messages(
                 };
 
                 messages.tag = response.tag;
-                msg_queue.push_back(messages);
+                response.tx.send(messages).ok();
 
                 if request_complete {
-                    while let Some(messages) = msg_queue.pop_front() {
-                        response.tx.send(messages).ok();
-                    }
                     rsp_queue.pop_front();
                 }
             }
@@ -223,7 +219,6 @@ fn connection_loop(
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut rsp_queue = VecDeque::with_capacity(1000);
-    let mut msg_queue = VecDeque::with_capacity(1000);
 
     loop {
         stream.reset_io();
@@ -234,7 +229,7 @@ fn connection_loop(
         let write_cnt = nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
 
         let read_cnt = nonblock_read(inner_stream, &mut read_buf).map_err(Error::io)?;
-        decode_messages(&mut read_buf, &mut rsp_queue, &mut msg_queue, &mut params)?;
+        decode_messages(&mut read_buf, &mut rsp_queue, &mut params)?;
 
         if read_cnt == 0 && (write_buf.is_empty() || write_cnt == 0) {
             stream.wait_io();
