@@ -500,7 +500,12 @@ impl Client {
     pub(crate) fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
         let tag = self.co_ch.tag();
         let sender = self.co_ch.sender();
-        let request = Request::new(tag, messages, sender);
+        let request = Request {
+            tag,
+            messages,
+            sender,
+        };
+
         self.inner.sender.send(request);
 
         Ok(Responses {
