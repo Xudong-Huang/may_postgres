@@ -56,9 +56,7 @@ pub struct Response {
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
-    // client send part
-    req_writer: Arc<Mutex<Writer<u8>>>,
-    // client receive part
+    req_writer: Mutex<Writer<u8>>,
     rsp_queue: Arc<Queue<Response>>,
     waker: WaitIoWaker,
     id: usize,
@@ -77,6 +75,18 @@ pub(crate) fn reserve_buf(buf: &mut BytesMut) {
     if rem < 1024 {
         buf.reserve(IO_BUF_SIZE - rem);
     }
+}
+
+#[inline]
+#[cold]
+fn cold() {}
+
+#[inline]
+fn unlikely(b: bool) -> bool {
+    if b {
+        cold()
+    }
+    b
 }
 
 #[inline]
@@ -170,22 +180,17 @@ fn decode_messages(
 fn write_req(writer: &mut Writer<u8>, data: &[u8]) {
     let len = data.len();
     let mut write_cnt = 0;
-    loop {
+    while write_cnt < len {
         let mut write_buf = writer.write_chunk();
-        let cnt = write_buf
-            .write(unsafe { data.get_unchecked(write_cnt..) })
-            .unwrap();
-        let buf_empty = write_buf.is_empty();
+        if unlikely(write_buf.is_empty()) {
+            // let the consumer to consume the data and try again
+            may::coroutine::yield_now();
+            continue;
+        }
+        let bytes = unsafe { data.get_unchecked(write_cnt..) };
+        let cnt = write_buf.write(bytes).unwrap();
         writer.commit(cnt);
         write_cnt += cnt;
-        if write_cnt < len {
-            if unlikely(buf_empty) {
-                // let the consumer to consume the data and try again
-                may::coroutine::yield_now();
-            }
-        } else {
-            break;
-        }
     }
 }
 
@@ -199,7 +204,11 @@ fn process_req(req: Request, rsp_queue: &Queue<Response>, write_buf: &Mutex<Writ
     match req.messages {
         RequestMessages::Single(msg) => match msg {
             FrontendMessage::Raw(buf) => write_req(&mut writer, &buf),
-            FrontendMessage::CopyData(_data) => todo!(), // data.write(writer),
+            FrontendMessage::CopyData(data) => {
+                let mut buf = BytesMut::with_capacity(4096);
+                data.write(&mut buf);
+                write_req(&mut writer, &buf);
+            }
         },
         RequestMessages::CopyIn(mut rcv) => {
             let mut copy_in_msg = rcv.try_recv();
@@ -208,7 +217,11 @@ fn process_req(req: Request, rsp_queue: &Queue<Response>, write_buf: &Mutex<Writ
                     Ok(Some(msg)) => {
                         match msg {
                             FrontendMessage::Raw(buf) => write_req(&mut writer, &buf),
-                            FrontendMessage::CopyData(_data) => todo!(), // data.write(write_buf),
+                            FrontendMessage::CopyData(data) => {
+                                let mut buf = BytesMut::with_capacity(4096);
+                                data.write(&mut buf);
+                                write_req(&mut writer, &buf);
+                            }
                         }
                         copy_in_msg = rcv.try_recv();
                     }
@@ -246,16 +259,13 @@ fn connection_loop(
 
         // process_req(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf).map_err(Error::io)?;
         let write_buf = req_reader.read_chunk();
-        let write_buf_len = write_buf.len();
         let write_cnt = nonblock_write(inner_stream, write_buf).map_err(Error::io)?;
         req_reader.commit_read(write_cnt);
 
         let read_cnt = nonblock_read(inner_stream, &mut read_buf).map_err(Error::io)?;
-        if read_cnt > 0 {
-            decode_messages(&mut read_buf, &rsp_queue, &mut msg_queue, &mut parameters)?;
-        }
+        decode_messages(&mut read_buf, &rsp_queue, &mut msg_queue, &mut parameters)?;
 
-        if read_cnt == 0 && (write_buf_len == 0 || write_cnt == 0) {
+        if read_cnt == 0 && write_cnt == 0 {
             stream.wait_io();
         }
     }
@@ -267,7 +277,7 @@ impl Connection {
         let id = stream.as_raw_fd() as usize;
         let waker = stream.waker();
         let (req_writer, req_reader) = cueue::cueue(IO_BUF_SIZE).expect("cueue create failed");
-        let req_writer = Arc::new(Mutex::new(req_writer));
+        let req_writer = Mutex::new(req_writer);
 
         let rsp_queue = Arc::new(Queue::new());
         let rsp_queue_dup = rsp_queue.clone();
