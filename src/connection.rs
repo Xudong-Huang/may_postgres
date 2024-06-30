@@ -81,31 +81,9 @@ fn err<T>(e: io::Error) -> io::Result<T> {
 }
 
 #[inline]
-#[cold]
-fn cold() {}
-
-// #[inline]
-// fn likely(b: bool) -> bool {
-//     if !b { cold() }
-//     b
-// }
-
-#[inline]
-fn unlikely(b: bool) -> bool {
-    if b {
-        cold()
-    }
-    b
-}
-
-#[inline]
 fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Result<usize> {
     let buf = write_buf.chunk();
     let len = buf.len();
-    if unlikely(len == 0) {
-        return Ok(0);
-    }
-
     let mut write_cnt = 0;
     while write_cnt < len {
         match stream.write(unsafe { buf.get_unchecked(write_cnt..) }) {
@@ -240,7 +218,7 @@ fn terminate_connection(stream: &mut TcpStream) {
 fn connection_loop(
     stream: &mut TcpStream,
     req_queue: Arc<Queue<Request>>,
-    mut parameters: HashMap<String, String>,
+    mut params: HashMap<String, String>,
 ) -> Result<(), Error> {
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
@@ -256,14 +234,7 @@ fn connection_loop(
         let write_cnt = nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
 
         let read_cnt = nonblock_read(inner_stream, &mut read_buf).map_err(Error::io)?;
-        if read_cnt > 0 {
-            decode_messages(
-                &mut read_buf,
-                &mut rsp_queue,
-                &mut msg_queue,
-                &mut parameters,
-            )?;
-        }
+        decode_messages(&mut read_buf, &mut rsp_queue, &mut msg_queue, &mut params)?;
 
         if read_cnt == 0 && (write_buf.is_empty() || write_cnt == 0) {
             stream.wait_io();
