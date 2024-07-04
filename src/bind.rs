@@ -15,10 +15,10 @@ pub fn bind(
     params: &[&(dyn ToSql)],
 ) -> Result<Portal, Error> {
     let name = format!("p{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
-    let buf = client.with_buf(|buf| {
-        query::encode_bind(&statement, params, &name, buf)?;
-        frontend::sync(buf);
-        Ok(buf.split().freeze())
+    let buf = client.with_buf(|mut buf| {
+        query::encode_bind(&statement, params, &name, &mut buf)?;
+        frontend::sync(&mut buf);
+        Ok(buf)
     })?;
 
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;

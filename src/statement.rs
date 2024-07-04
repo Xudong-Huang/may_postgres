@@ -19,7 +19,6 @@ impl Drop for StatementInner {
             let mut buf = BytesMut::new();
             frontend::close(b'S', &self.name, &mut buf).unwrap();
             frontend::sync(&mut buf);
-            let buf = buf.freeze();
             let _ = client.raw_send(RequestMessages::Single(FrontendMessage::Raw(buf)));
         }
     }

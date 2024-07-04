@@ -31,9 +31,9 @@ impl<'a> Drop for Transaction<'a> {
         } else {
             format!("ROLLBACK TO sp{}", self.depth)
         };
-        let buf = self.client.with_buf(|buf| {
-            frontend::query(&query, buf).unwrap();
-            buf.split().freeze()
+        let buf = self.client.with_buf(|mut buf| {
+            frontend::query(&query, &mut buf).unwrap();
+            buf
         });
         let _ = self
             .client

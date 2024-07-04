@@ -2,7 +2,7 @@ use crate::client::{Client, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::{Error, SimpleQueryMessage, SimpleQueryRow};
-use bytes::Bytes;
+use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -34,10 +34,10 @@ pub fn batch_execute(client: &Client, query: &str) -> Result<(), Error> {
     }
 }
 
-fn encode(client: &Client, query: &str) -> Result<Bytes, Error> {
-    client.with_buf(|buf| {
-        frontend::query(query, buf).map_err(Error::encode)?;
-        Ok(buf.split().freeze())
+fn encode(client: &Client, query: &str) -> Result<BytesMut, Error> {
+    client.with_buf(|mut buf| {
+        frontend::query(query, &mut buf).map_err(Error::encode)?;
+        Ok(buf)
     })
 }
 

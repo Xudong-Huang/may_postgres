@@ -5,7 +5,7 @@ use crate::error::SqlState;
 use crate::query;
 use crate::types::{Field, Kind, Oid, Type};
 use crate::{Column, Error, Statement};
-use bytes::Bytes;
+use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -94,12 +94,13 @@ pub fn prepare(client: &Client, query: &str, types: &[Type]) -> Result<Statement
     Ok(Statement::new(client.inner(), name, parameters, columns))
 }
 
-fn encode(client: &Client, name: &str, query: &str, types: &[Type]) -> Result<Bytes, Error> {
-    client.with_buf(|buf| {
-        frontend::parse(name, query, types.iter().map(Type::oid), buf).map_err(Error::encode)?;
-        frontend::describe(b'S', name, buf).map_err(Error::encode)?;
-        frontend::sync(buf);
-        Ok(buf.split().freeze())
+fn encode(client: &Client, name: &str, query: &str, types: &[Type]) -> Result<BytesMut, Error> {
+    client.with_buf(|mut buf| {
+        frontend::parse(name, query, types.iter().map(Type::oid), &mut buf)
+            .map_err(Error::encode)?;
+        frontend::describe(b'S', name, &mut buf).map_err(Error::encode)?;
+        frontend::sync(&mut buf);
+        Ok(buf)
     })
 }
 

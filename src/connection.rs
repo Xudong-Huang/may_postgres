@@ -15,25 +15,9 @@ use crate::Error;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::ops::Deref;
 use std::sync::Arc;
 
 const IO_BUF_SIZE: usize = 4096 * 16;
-
-pub enum RefOrValue<'a, T> {
-    Ref(&'a T),
-    Value(T),
-}
-
-impl<'a, T> Deref for RefOrValue<'a, T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            RefOrValue::Ref(r) => r,
-            RefOrValue::Value(ref v) => v,
-        }
-    }
-}
 
 pub enum RequestMessages {
     Single(FrontendMessage),
@@ -41,14 +25,12 @@ pub enum RequestMessages {
 }
 
 pub struct Request {
-    pub tag: usize,
     pub messages: RequestMessages,
-    pub sender: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+    pub sender: spsc::Sender<BackendMessages>,
 }
 
 pub struct Response {
-    tag: usize,
-    tx: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+    tx: spsc::Sender<BackendMessages>,
 }
 
 /// A connection to a PostgreSQL database.
@@ -133,12 +115,11 @@ fn decode_messages(
                 let response = match rsp_queue.front() {
                     Some(response) => response,
                     None => match messages.next().map_err(Error::parse)? {
-                        Some((_, Message::ErrorResponse(error))) => return Err(Error::db(error)),
+                        Some(Message::ErrorResponse(error)) => return Err(Error::db(error)),
                         _ => return Err(Error::unexpected_message()),
                     },
                 };
 
-                messages.tag = response.tag;
                 response.tx.send(messages).ok();
 
                 if request_complete {
@@ -168,10 +149,7 @@ fn process_req(
 ) -> io::Result<()> {
     while let Some(req) = req_queue.pop() {
         reserve_buf(write_buf);
-        rsp_queue.push_back(Response {
-            tag: req.tag,
-            tx: req.sender,
-        });
+        rsp_queue.push_back(Response { tx: req.sender });
         match req.messages {
             RequestMessages::Single(msg) => match msg {
                 FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),

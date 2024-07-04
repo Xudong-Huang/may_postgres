@@ -2,7 +2,7 @@ use crate::client::{Client, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::{query, Error, Statement};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use postgres_protocol::message::backend::Message;
 
 pub fn copy_out(client: &Client, statement: Statement) -> Result<CopyOutStream, Error> {
@@ -11,7 +11,7 @@ pub fn copy_out(client: &Client, statement: Statement) -> Result<CopyOutStream, 
     Ok(CopyOutStream { responses })
 }
 
-fn start(client: &Client, buf: Bytes) -> Result<Responses, Error> {
+fn start(client: &Client, buf: BytesMut) -> Result<Responses, Error> {
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
     match responses.next()? {
