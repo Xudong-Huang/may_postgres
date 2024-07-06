@@ -35,17 +35,15 @@ impl Responses {
             match self.cur.next().map_err(Error::parse)? {
                 Some((_, Message::ErrorResponse(body))) => return Err(Error::db(body)),
                 Some((_, message)) => return Ok(message),
-                None => {}
-            }
-
-            match self.rx.recv() {
-                Ok(messages) => {
-                    if messages.tag != self.tag {
-                        continue;
+                None => match self.rx.recv() {
+                    Ok(messages) => {
+                        if messages.tag != self.tag {
+                            continue;
+                        }
+                        self.cur = messages
                     }
-                    self.cur = messages
-                }
-                Err(_) => return Err(Error::closed()),
+                    Err(_) => return Err(Error::closed()),
+                },
             }
         }
     }

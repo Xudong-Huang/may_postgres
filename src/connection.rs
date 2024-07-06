@@ -27,6 +27,7 @@ pub enum RefOrValue<'a, T> {
 
 impl<'a, T> Deref for RefOrValue<'a, T> {
     type Target = T;
+    #[inline]
     fn deref(&self) -> &Self::Target {
         match self {
             RefOrValue::Ref(r) => r,
@@ -203,6 +204,7 @@ fn process_req(
     Ok(())
 }
 
+#[cold]
 fn terminate_connection(stream: &mut TcpStream) {
     let mut request = BytesMut::new();
     frontend::terminate(&mut request);
@@ -261,6 +263,7 @@ impl Connection {
     }
 
     /// send a request to the connection
+    #[inline]
     pub fn send(&self, req: Request) {
         self.req_queue.push(req);
         self.waker.wakeup();
