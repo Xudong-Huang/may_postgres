@@ -42,6 +42,7 @@ bytes = "1"
 smallvec = "1"
 byteorder = "1"
 crossbeam = "0.8"
+may_waiter = "0.1"
 postgres-types = "0.2"
 percent-encoding = "2"
 fallible-iterator = "0.2"
@@ -68,5 +69,5 @@ time-03 = { version = "0.3", package = "time", features = ["parsing"] }
 [profile.release]
 lto = true
 
-# [patch.crates-io]
-# may = { path = "../may" }
+[patch.crates-io]
+may = { path = "../may" }

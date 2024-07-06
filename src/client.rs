@@ -1,7 +1,7 @@
 use crate::cancel_query;
 use crate::codec::BackendMessages;
 use crate::config::Host;
-use crate::connection::{Connection, RefOrValue, Request, RequestMessages};
+use crate::connection::{Connection, Request, RequestMessages};
 use crate::copy_out::CopyOutStream;
 use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
@@ -12,38 +12,39 @@ use crate::{
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may::sync::spsc;
+use may_waiter::MapWaiter;
 use postgres_protocol::message::backend::Message;
 use spin::Mutex;
 
-use std::cell::{Cell, UnsafeCell};
-use std::collections::HashMap;
-use std::rc::Rc;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 pub struct Responses {
-    tag: usize,
     cur: BackendMessages,
-    rx: Rc<spsc::Receiver<BackendMessages>>,
+    msg: Option<VecDeque<BackendMessages>>,
+    waiter: Arc<MapWaiter<usize, VecDeque<BackendMessages>>>,
 }
 
 impl Responses {
     #[inline]
     pub fn next(&mut self) -> Result<Message, Error> {
+        if self.msg.is_none() {
+            let msg = self.waiter.wait_rsp(None).map_err(Error::parse)?;
+            self.msg = Some(msg);
+        }
+
         loop {
             match self.cur.next().map_err(Error::parse)? {
-                Some((_, Message::ErrorResponse(body))) => return Err(Error::db(body)),
-                Some((_, message)) => return Ok(message),
-                None => match self.rx.recv() {
-                    Ok(messages) => {
-                        if messages.tag != self.tag {
-                            continue;
-                        }
-                        self.cur = messages
+                Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
+                Some(message) => return Ok(message),
+                None => {
+                    let msg = self.msg.as_mut().unwrap();
+                    match msg.pop_front() {
+                        Some(messages) => self.cur = messages,
+                        None => return Err(Error::closed()),
                     }
-                    Err(_) => return Err(Error::closed()),
-                },
+                }
             }
         }
     }
@@ -54,6 +55,7 @@ struct State {
     typeinfo_composite: Option<Statement>,
     typeinfo_enum: Option<Statement>,
     types: HashMap<Oid, Type>,
+    buf: BytesMut,
 }
 
 pub struct InnerClient {
@@ -61,40 +63,12 @@ pub struct InnerClient {
     state: Mutex<State>,
 }
 
-struct CoChannel {
-    tag: Cell<usize>,
-    rx: Rc<spsc::Receiver<BackendMessages>>,
-    tx: spsc::Sender<BackendMessages>,
-}
-
-impl CoChannel {
-    fn sender(&self) -> RefOrValue<'static, spsc::Sender<BackendMessages>> {
-        // Safety:
-        // 1. there is only one sender
-        // 2. we will wait until all response come back
-        let tx: &'static spsc::Sender<BackendMessages> = unsafe { std::mem::transmute(&self.tx) };
-        RefOrValue::Ref(tx)
-    }
-
-    fn tag(&self) -> usize {
-        let tag = self.tag.get();
-        self.tag.set(tag + 1);
-        tag
-    }
-
-    fn receiver(&self) -> Rc<spsc::Receiver<BackendMessages>> {
-        self.rx.clone()
-    }
-}
-
 impl InnerClient {
     /// ignore the result
     pub fn raw_send(&self, messages: RequestMessages) -> Result<(), Error> {
-        let (sender, _rx) = spsc::channel();
         let request = Request {
-            tag: 0,
             messages,
-            sender: RefOrValue::Value(sender),
+            waiter: Arc::new(self.sender.new_waiter()),
         };
         self.sender.send(request);
         Ok(())
@@ -151,8 +125,8 @@ pub struct Client {
     socket_config: Option<SocketConfig>,
     process_id: i32,
     secret_key: i32,
-    buf: UnsafeCell<BytesMut>,
-    co_ch: CoChannel,
+    // buf: UnsafeCell<BytesMut>,
+    // co_ch: CoChannel,
 }
 
 // Client is Send but not Sync
@@ -160,31 +134,19 @@ unsafe impl Send for Client {}
 
 impl Clone for Client {
     fn clone(&self) -> Client {
-        let co_ch = {
-            let (tx, rx) = spsc::channel();
-            let rx = Rc::new(rx);
-            let tag = Cell::new(0);
-            CoChannel { tag, rx, tx }
-        };
         Client {
             inner: self.inner.clone(),
             socket_config: self.socket_config.clone(),
             process_id: self.process_id,
             secret_key: self.secret_key,
-            buf: UnsafeCell::new(BytesMut::with_capacity(4096 * 8)),
-            co_ch,
+            // buf: UnsafeCell::new(BytesMut::with_capacity(4096 * 8)),
+            // co_ch,
         }
     }
 }
 
 impl Client {
     pub(crate) fn new(sender: Connection, process_id: i32, secret_key: i32) -> Client {
-        let co_ch = {
-            let (tx, rx) = spsc::channel();
-            let rx = Rc::new(rx);
-            let tag = Cell::new(0);
-            CoChannel { tag, rx, tx }
-        };
         Client {
             inner: Arc::new(InnerClient {
                 sender,
@@ -193,14 +155,14 @@ impl Client {
                     typeinfo_composite: None,
                     typeinfo_enum: None,
                     types: HashMap::new(),
-                    // buf: BytesMut::new(),
+                    buf: BytesMut::with_capacity(4096 * 8),
                 }),
             }),
             socket_config: None,
             process_id,
             secret_key,
-            buf: UnsafeCell::new(BytesMut::with_capacity(4096)),
-            co_ch,
+            // buf: UnsafeCell::new(BytesMut::with_capacity(4096)),
+            // co_ch,
         }
     }
 
@@ -492,28 +454,29 @@ impl Client {
     where
         F: FnOnce(&mut BytesMut) -> R,
     {
-        let buf = unsafe { &mut *self.buf.get() };
-        // if buf.capacity() < 1024 {
-        //     buf.reserve(4096 * 8 - buf.capacity());
+        // let buf = unsafe { &mut *self.buf.get() };
+        let mut lock = self.inner.state.lock();
+        let buf = &mut lock.buf;
+        // let rem = buf.capacity() - buf.len();
+        // if rem < 1024 {
+        //     buf.reserve(4096 * 8 - rem);
         // }
         f(buf)
     }
 
     #[inline]
     pub(crate) fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
-        let tag = self.co_ch.tag();
-        let sender = self.co_ch.sender();
+        let waiter = Arc::new(self.inner.sender.new_waiter());
         let request = Request {
-            tag,
             messages,
-            sender,
+            waiter: waiter.clone(),
         };
         self.inner.sender.send(request);
 
         Ok(Responses {
-            tag,
-            cur: BackendMessages::empty(tag),
-            rx: self.co_ch.receiver(),
+            cur: BackendMessages::empty(),
+            msg: None,
+            waiter,
         })
     }
 

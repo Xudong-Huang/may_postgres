@@ -4,8 +4,8 @@ use may::coroutine::JoinHandle;
 use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
-use may::queue::mpsc::Queue;
-use may::sync::spsc;
+use may::queue::spsc::Queue;
+use may_waiter::{MapWaiter, WaiterMap};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
@@ -15,26 +15,10 @@ use crate::Error;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::ops::Deref;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const IO_BUF_SIZE: usize = 4096 * 16;
-
-pub enum RefOrValue<'a, T> {
-    Ref(&'a T),
-    Value(T),
-}
-
-impl<'a, T> Deref for RefOrValue<'a, T> {
-    type Target = T;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        match self {
-            RefOrValue::Ref(r) => r,
-            RefOrValue::Value(ref v) => v,
-        }
-    }
-}
 
 pub enum RequestMessages {
     Single(FrontendMessage),
@@ -42,20 +26,20 @@ pub enum RequestMessages {
 }
 
 pub struct Request {
-    pub tag: usize,
     pub messages: RequestMessages,
-    pub sender: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+    pub waiter: Arc<MapWaiter<usize, VecDeque<BackendMessages>>>,
 }
 
 pub struct Response {
-    tag: usize,
-    tx: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+    waiter: Arc<MapWaiter<usize, VecDeque<BackendMessages>>>,
 }
 
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
     req_queue: Arc<Queue<Request>>,
+    rsp_map: Arc<WaiterMap<usize, VecDeque<BackendMessages>>>,
+    req_key: AtomicUsize,
     waker: WaitIoWaker,
     id: usize,
 }
@@ -120,6 +104,7 @@ fn nonblock_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<
 fn decode_messages(
     read_buf: &mut BytesMut,
     rsp_queue: &mut VecDeque<Response>,
+    rsp_messages: &mut VecDeque<BackendMessages>,
     parameters: &mut HashMap<String, String>,
 ) -> Result<(), Error> {
     use crate::codec::PostgresCodec;
@@ -128,22 +113,27 @@ fn decode_messages(
     while let Some(msg) = PostgresCodec.decode(read_buf).map_err(Error::io)? {
         match msg {
             BackendMessage::Normal {
-                mut messages,
+                messages,
                 request_complete,
             } => {
-                let response = match rsp_queue.front() {
-                    Some(response) => response,
-                    None => match messages.next().map_err(Error::parse)? {
-                        Some((_, Message::ErrorResponse(error))) => return Err(Error::db(error)),
-                        _ => return Err(Error::unexpected_message()),
-                    },
-                };
-
-                messages.tag = response.tag;
-                response.tx.send(messages).ok();
+                rsp_messages.push_back(messages);
 
                 if request_complete {
-                    rsp_queue.pop_front();
+                    // rsp_queue.pop_front();
+                    let response = match rsp_queue.pop_front() {
+                        Some(response) => response,
+                        None => {
+                            let mut messages = rsp_messages.pop_back().unwrap();
+                            match messages.next().map_err(Error::parse)? {
+                                Some(Message::ErrorResponse(error)) => {
+                                    return Err(Error::db(error))
+                                }
+                                _ => return Err(Error::unexpected_message()),
+                            }
+                        }
+                    };
+                    let rsp = std::mem::replace(rsp_messages, VecDeque::with_capacity(8));
+                    response.waiter.set_rsp(rsp).unwrap();
                 }
             }
             BackendMessage::Async(Message::NoticeResponse(_body)) => {}
@@ -169,10 +159,7 @@ fn process_req(
 ) -> io::Result<()> {
     while let Some(req) = req_queue.pop() {
         reserve_buf(write_buf);
-        rsp_queue.push_back(Response {
-            tag: req.tag,
-            tx: req.sender,
-        });
+        rsp_queue.push_back(Response { waiter: req.waiter });
         match req.messages {
             RequestMessages::Single(msg) => match msg {
                 FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
@@ -221,17 +208,17 @@ fn connection_loop(
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut rsp_queue = VecDeque::with_capacity(1000);
+    let mut rsp_msg = VecDeque::with_capacity(8);
 
     loop {
         stream.reset_io();
         let inner_stream = stream.inner_mut();
 
         process_req(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf).map_err(Error::io)?;
-
         let write_cnt = nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
 
         let read_cnt = nonblock_read(inner_stream, &mut read_buf).map_err(Error::io)?;
-        decode_messages(&mut read_buf, &mut rsp_queue, &mut params)?;
+        decode_messages(&mut read_buf, &mut rsp_queue, &mut rsp_msg, &mut params)?;
 
         if read_cnt == 0 && (write_buf.is_empty() || write_cnt == 0) {
             stream.wait_io();
@@ -246,7 +233,9 @@ impl Connection {
         let waker = stream.waker();
 
         let req_queue = Arc::new(Queue::new());
+        let rsp_map = Arc::new(WaiterMap::new());
         let req_queue_dup = req_queue.clone();
+        let req_key = AtomicUsize::new(0);
         let io_handle = go!(move || {
             if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters) {
                 log::error!("connection error = {:?}", e);
@@ -257,6 +246,8 @@ impl Connection {
         Connection {
             io_handle,
             req_queue,
+            rsp_map,
+            req_key,
             waker,
             id,
         }
@@ -267,6 +258,12 @@ impl Connection {
     pub fn send(&self, req: Request) {
         self.req_queue.push(req);
         self.waker.wakeup();
+    }
+
+    #[inline]
+    pub fn new_waiter(&self) -> MapWaiter<usize, VecDeque<BackendMessages>> {
+        let key = self.req_key.fetch_add(1, Ordering::Relaxed);
+        self.rsp_map.make_waiter(key)
     }
 
     #[inline]
