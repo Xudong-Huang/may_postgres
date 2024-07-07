@@ -2,9 +2,9 @@ use bytes::{BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
 use may::coroutine::JoinHandle;
 use may::go;
-use may::io::{SplitIo, SplitReader, SplitWriter};
+use may::io::{AsIoData, SplitIo, SplitReader, SplitWriter};
 use may::net::TcpStream;
-use may::queue::spsc::Queue as SpscQueue;
+use may::queue::mpsc::Queue as SpscQueue;
 use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 
@@ -37,6 +37,7 @@ pub struct Response {
 
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
+    id: usize,
     read_handle: JoinHandle<()>,
     writer: QueuedWriter<SplitWriter<TcpStream>>,
 }
@@ -212,6 +213,7 @@ impl Connection {
     pub(crate) fn new(stream: TcpStream, parameters: HashMap<String, String>) -> Connection {
         let (reader, writer) = stream.split().unwrap();
 
+        let id = reader.as_io_data().fd as usize;
         let rsp_queue = Arc::new(SpscQueue::new());
         let rsp_queue_dup = rsp_queue.clone();
 
@@ -222,6 +224,7 @@ impl Connection {
         });
 
         Connection {
+            id,
             read_handle,
             writer: QueuedWriter::new(writer, rsp_queue),
         }
@@ -240,4 +243,8 @@ impl Connection {
     // pub fn flush(&self) {
     //     unimplemented!()
     // }
+
+    pub fn id(&self) -> usize {
+        self.id
+    }
 }

@@ -1,7 +1,7 @@
 use crate::client::{Client, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
-use crate::{query, slice_iter, Error, Statement};
+use crate::{query, Error, Statement};
 use bytes::{buf::ext::BufExt, Buf, BufMut, BytesMut};
 use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
@@ -168,7 +168,7 @@ where
 {
     // debug!("executing copy in statement {}", statement.name());
 
-    let buf = query::encode(client, &statement, slice_iter(&[]))?;
+    let buf = query::encode(client, &statement, &[])?;
 
     let (sender, receiver) = mpsc::channel();
     let receiver = CopyInReceiver::new(receiver);

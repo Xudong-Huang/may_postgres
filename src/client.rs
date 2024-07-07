@@ -7,8 +7,8 @@ use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
 use crate::types::{Oid, ToSql, Type};
 use crate::{
-    copy_in, copy_out, prepare, query, simple_query, slice_iter, CancelToken, CopyInSink, Error,
-    Row, SimpleQueryMessage, Statement, ToStatement, Transaction, TransactionBuilder,
+    copy_in, copy_out, prepare, query, simple_query, CancelToken, CopyInSink, Error, Row,
+    SimpleQueryMessage, Statement, ToStatement, Transaction, TransactionBuilder,
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
@@ -238,11 +238,11 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn query<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, Error>
+    pub fn query<T>(&self, statement: &T, params: &[&dyn ToSql]) -> Result<Vec<Row>, Error>
     where
         T: ?Sized + ToStatement,
     {
-        self.query_raw(statement, slice_iter(params))?.collect()
+        self.query_raw(statement, params)?.collect()
     }
 
     /// Executes a statement which returns a single row, returning it.
@@ -259,11 +259,11 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn query_one<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Row, Error>
+    pub fn query_one<T>(&self, statement: &T, params: &[&dyn ToSql]) -> Result<Row, Error>
     where
         T: ?Sized + ToStatement,
     {
-        let mut stream = self.query_raw(statement, slice_iter(params))?;
+        let mut stream = self.query_raw(statement, params)?;
 
         let row = match stream.next().transpose()? {
             Some(row) => row,
@@ -291,15 +291,11 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn query_opt<T>(
-        &self,
-        statement: &T,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Option<Row>, Error>
+    pub fn query_opt<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<Option<Row>, Error>
     where
         T: ?Sized + ToStatement,
     {
-        let mut stream = self.query_raw(statement, slice_iter(params))?;
+        let mut stream = self.query_raw(statement, params)?;
 
         let row = match stream.next().transpose()? {
             Some(row) => row,
@@ -327,11 +323,9 @@ impl Client {
     /// Panics if the number of parameters provided does not match the number expected.
     ///
     /// [`query`]: #method.query
-    pub fn query_raw<'a, T, I>(&self, statement: &T, params: I) -> Result<RowStream, Error>
+    pub fn query_raw<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<RowStream, Error>
     where
         T: ?Sized + ToStatement,
-        I: IntoIterator<Item = &'a dyn ToSql>,
-        I::IntoIter: ExactSizeIterator,
     {
         let statement = statement.__convert().into_statement(self)?;
         query::query(self, statement, params)
@@ -351,11 +345,11 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn execute<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error>
+    pub fn execute<T>(&self, statement: &T, params: &[&(dyn ToSql)]) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement,
     {
-        self.execute_raw(statement, slice_iter(params))
+        self.execute_raw(statement, params)
     }
 
     /// The maximally flexible version of [`execute`].
@@ -372,11 +366,9 @@ impl Client {
     /// Panics if the number of parameters provided does not match the number expected.
     ///
     /// [`execute`]: #method.execute
-    pub fn execute_raw<'a, T, I>(&self, statement: &T, params: I) -> Result<u64, Error>
+    pub fn execute_raw<T>(&self, statement: &T, params: &[&dyn ToSql]) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement,
-        I: IntoIterator<Item = &'a dyn ToSql>,
-        I::IntoIter: ExactSizeIterator,
     {
         let statement = statement.__convert().into_statement(self)?;
         query::execute(self, statement, params)
@@ -522,5 +514,11 @@ impl Client {
             cur: BackendMessages::empty(tag),
             rx: self.co_ch.receiver(),
         })
+    }
+
+    /// get id
+    #[inline]
+    pub fn id(&self) -> usize {
+        self.inner.sender.id()
     }
 }

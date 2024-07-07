@@ -9,11 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
-pub fn bind<'a, I>(client: &Client, statement: Statement, params: I) -> Result<Portal, Error>
-where
-    I: IntoIterator<Item = &'a dyn ToSql>,
-    I::IntoIter: ExactSizeIterator,
-{
+pub fn bind(client: &Client, statement: Statement, params: &[&dyn ToSql]) -> Result<Portal, Error> {
     let name = format!("p{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
     let buf = client.with_buf(|buf| {
         query::encode_bind(&statement, params, &name, buf)?;

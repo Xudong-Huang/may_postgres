@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use may::queue::mpsc::Queue;
-use may::queue::spsc::Queue as SpscQueue;
+use may::queue::mpsc::Queue as SpscQueue;
 use may::sync::Mutex;
 
 use crate::codec::FrontendMessage;
