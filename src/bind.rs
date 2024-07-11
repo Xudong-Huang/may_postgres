@@ -18,7 +18,7 @@ pub fn bind(
     let buf = client.with_buf(|buf| {
         query::encode_bind(&statement, params, &name, buf)?;
         frontend::sync(buf);
-        Ok(buf.split().freeze())
+        Ok(buf.split())
     })?;
 
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;

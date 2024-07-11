@@ -40,7 +40,7 @@ impl CopyInReceiver {
                 let mut buf = BytesMut::new();
                 frontend::copy_done(&mut buf);
                 frontend::sync(&mut buf);
-                Ok(Some(FrontendMessage::Raw(buf.freeze())))
+                Ok(Some(FrontendMessage::Raw(buf)))
             }
             Err(TryRecvError::Empty) => Ok(None),
             Err(_) => {
@@ -48,7 +48,7 @@ impl CopyInReceiver {
                 let mut buf = BytesMut::new();
                 frontend::copy_fail("", &mut buf).unwrap();
                 frontend::sync(&mut buf);
-                Ok(Some(FrontendMessage::Raw(buf.freeze())))
+                Ok(Some(FrontendMessage::Raw(buf)))
             }
         }
     }
@@ -65,14 +65,14 @@ impl CopyInReceiver {
                 let mut buf = BytesMut::new();
                 frontend::copy_done(&mut buf);
                 frontend::sync(&mut buf);
-                Ok(Some(FrontendMessage::Raw(buf.freeze())))
+                Ok(Some(FrontendMessage::Raw(buf)))
             }
             Err(_) => {
                 self.done = true;
                 let mut buf = BytesMut::new();
                 frontend::copy_fail("", &mut buf).unwrap();
                 frontend::sync(&mut buf);
-                Ok(Some(FrontendMessage::Raw(buf.freeze())))
+                Ok(Some(FrontendMessage::Raw(buf)))
             }
         }
     }

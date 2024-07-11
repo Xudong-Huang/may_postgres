@@ -18,7 +18,6 @@ impl Drop for Inner {
             let mut buf = BytesMut::new();
             frontend::close(b'P', &self.name, &mut buf).unwrap();
             frontend::sync(&mut buf);
-            let buf = buf.freeze();
             let _ = client.raw_send(RequestMessages::Single(FrontendMessage::Raw(buf)));
         }
     }

@@ -33,7 +33,7 @@ impl<'a> Drop for Transaction<'a> {
         };
         let buf = self.client.with_buf(|buf| {
             frontend::query(&query, buf).unwrap();
-            buf.split().freeze()
+            buf.split()
         });
         let _ = self
             .client

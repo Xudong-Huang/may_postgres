@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
 use may::net::TcpStream;
 use postgres_protocol::message::backend;
@@ -8,7 +8,7 @@ use std::io::{self, Read};
 pub use frame_codec::Framed;
 
 pub enum FrontendMessage {
-    Raw(Bytes),
+    Raw(BytesMut),
     CopyData(CopyData<Box<dyn Buf + Send>>),
 }
 

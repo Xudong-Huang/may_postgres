@@ -74,9 +74,7 @@ fn startup(stream: &mut StartupStream, config: &Config) -> Result<(), Error> {
     let mut buf = BytesMut::new();
     frontend::startup_message(params, &mut buf).map_err(Error::encode)?;
 
-    stream
-        .send(FrontendMessage::Raw(buf.freeze()))
-        .map_err(Error::io)
+    stream.send(FrontendMessage::Raw(buf)).map_err(Error::io)
 }
 
 fn authenticate(stream: &mut StartupStream, config: &Config) -> Result<(), Error> {
@@ -134,9 +132,7 @@ fn authenticate_password(stream: &mut StartupStream, password: &[u8]) -> Result<
     let mut buf = BytesMut::new();
     frontend::password_message(password, &mut buf).map_err(Error::encode)?;
 
-    stream
-        .send(FrontendMessage::Raw(buf.freeze()))
-        .map_err(Error::io)
+    stream.send(FrontendMessage::Raw(buf)).map_err(Error::io)
 }
 
 fn authenticate_sasl(
@@ -165,9 +161,7 @@ fn authenticate_sasl(
 
     let mut buf = BytesMut::new();
     frontend::sasl_initial_response(mechanism, scram.message(), &mut buf).map_err(Error::encode)?;
-    stream
-        .send(FrontendMessage::Raw(buf.freeze()))
-        .map_err(Error::io)?;
+    stream.send(FrontendMessage::Raw(buf)).map_err(Error::io)?;
 
     let body = match stream.next_msg().map_err(Error::io)? {
         Message::AuthenticationSaslContinue(body) => body,
@@ -181,9 +175,7 @@ fn authenticate_sasl(
 
     let mut buf = BytesMut::new();
     frontend::sasl_response(scram.message(), &mut buf).map_err(Error::encode)?;
-    stream
-        .send(FrontendMessage::Raw(buf.freeze()))
-        .map_err(Error::io)?;
+    stream.send(FrontendMessage::Raw(buf)).map_err(Error::io)?;
 
     let body = match stream.next_msg().map_err(Error::io)? {
         Message::AuthenticationSaslFinal(body) => body,
