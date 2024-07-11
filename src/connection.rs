@@ -5,7 +5,7 @@ use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
 use may::queue::spsc::Queue;
-use may_waiter::{MapWaiter, WaiterMap};
+use may_waiter::Waiter;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
@@ -15,7 +15,6 @@ use crate::Error;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const IO_BUF_SIZE: usize = 4096 * 16;
@@ -27,19 +26,17 @@ pub enum RequestMessages {
 
 pub struct Request {
     pub messages: RequestMessages,
-    pub waiter: Arc<MapWaiter<usize, VecDeque<BackendMessages>>>,
+    pub waiter: Arc<Waiter<VecDeque<BackendMessages>>>,
 }
 
 pub struct Response {
-    waiter: Arc<MapWaiter<usize, VecDeque<BackendMessages>>>,
+    waiter: Arc<Waiter<VecDeque<BackendMessages>>>,
 }
 
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
     req_queue: Arc<Queue<Request>>,
-    rsp_map: Arc<WaiterMap<usize, VecDeque<BackendMessages>>>,
-    req_key: AtomicUsize,
     waker: WaitIoWaker,
     id: usize,
 }
@@ -119,7 +116,6 @@ fn decode_messages(
                 rsp_messages.push_back(messages);
 
                 if request_complete {
-                    // rsp_queue.pop_front();
                     let response = match rsp_queue.pop_front() {
                         Some(response) => response,
                         None => {
@@ -133,7 +129,7 @@ fn decode_messages(
                         }
                     };
                     let rsp = std::mem::replace(rsp_messages, VecDeque::with_capacity(8));
-                    response.waiter.set_rsp(rsp).unwrap();
+                    response.waiter.set_rsp(rsp);
                 }
             }
             BackendMessage::Async(Message::NoticeResponse(_body)) => {}
@@ -233,9 +229,7 @@ impl Connection {
         let waker = stream.waker();
 
         let req_queue = Arc::new(Queue::new());
-        let rsp_map = Arc::new(WaiterMap::new());
         let req_queue_dup = req_queue.clone();
-        let req_key = AtomicUsize::new(0);
         let io_handle = go!(move || {
             if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters) {
                 log::error!("connection error = {:?}", e);
@@ -246,8 +240,6 @@ impl Connection {
         Connection {
             io_handle,
             req_queue,
-            rsp_map,
-            req_key,
             waker,
             id,
         }
@@ -258,12 +250,6 @@ impl Connection {
     pub fn send(&self, req: Request) {
         self.req_queue.push(req);
         self.waker.wakeup();
-    }
-
-    #[inline]
-    pub fn new_waiter(&self) -> MapWaiter<usize, VecDeque<BackendMessages>> {
-        let key = self.req_key.fetch_add(1, Ordering::Relaxed);
-        self.rsp_map.make_waiter(key)
     }
 
     #[inline]

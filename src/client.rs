@@ -12,7 +12,7 @@ use crate::{
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may_waiter::MapWaiter;
+use may_waiter::Waiter;
 use postgres_protocol::message::backend::Message;
 use spin::Mutex;
 
@@ -23,7 +23,7 @@ use std::time::Duration;
 pub struct Responses {
     cur: BackendMessages,
     msg: Option<VecDeque<BackendMessages>>,
-    waiter: Arc<MapWaiter<usize, VecDeque<BackendMessages>>>,
+    waiter: Arc<Waiter<VecDeque<BackendMessages>>>,
 }
 
 impl Responses {
@@ -68,7 +68,7 @@ impl InnerClient {
     pub fn raw_send(&self, messages: RequestMessages) -> Result<(), Error> {
         let request = Request {
             messages,
-            waiter: Arc::new(self.sender.new_waiter()),
+            waiter: Arc::new(Waiter::new()),
         };
         self.sender.send(request);
         Ok(())
@@ -126,7 +126,6 @@ pub struct Client {
     process_id: i32,
     secret_key: i32,
     // buf: UnsafeCell<BytesMut>,
-    // co_ch: CoChannel,
 }
 
 // Client is Send but not Sync
@@ -140,7 +139,6 @@ impl Clone for Client {
             process_id: self.process_id,
             secret_key: self.secret_key,
             // buf: UnsafeCell::new(BytesMut::with_capacity(4096 * 8)),
-            // co_ch,
         }
     }
 }
@@ -162,7 +160,6 @@ impl Client {
             process_id,
             secret_key,
             // buf: UnsafeCell::new(BytesMut::with_capacity(4096)),
-            // co_ch,
         }
     }
 
@@ -466,7 +463,7 @@ impl Client {
 
     #[inline]
     pub(crate) fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
-        let waiter = Arc::new(self.inner.sender.new_waiter());
+        let waiter = Arc::new(Waiter::new());
         let request = Request {
             messages,
             waiter: waiter.clone(),
