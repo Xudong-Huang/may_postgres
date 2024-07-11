@@ -91,11 +91,7 @@ impl InnerClient {
     /// ignore the result
     pub fn raw_send(&self, messages: RequestMessages) -> Result<(), Error> {
         let (sender, _rx) = spsc::channel();
-        let request = Request {
-            tag: 0,
-            messages,
-            sender: RefOrValue::Value(sender),
-        };
+        let request = Request::new(0, messages, RefOrValue::Value(sender));
         self.sender.send(request);
         Ok(())
     }
@@ -503,11 +499,7 @@ impl Client {
     pub(crate) fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
         let tag = self.co_ch.tag();
         let sender = self.co_ch.sender();
-        let request = Request {
-            tag,
-            messages,
-            sender,
-        };
+        let request = Request::new(tag, messages, sender);
         self.inner.sender.send(request);
 
         Ok(Responses {

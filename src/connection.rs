@@ -42,9 +42,23 @@ pub enum RequestMessages {
 }
 
 pub struct Request {
-    pub tag: usize,
-    pub messages: RequestMessages,
-    pub sender: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+    tag: usize,
+    messages: RequestMessages,
+    sender: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+}
+
+impl Request {
+    pub fn new(
+        tag: usize,
+        messages: RequestMessages,
+        sender: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+    ) -> Request {
+        Request {
+            tag,
+            messages,
+            sender,
+        }
+    }
 }
 
 pub struct Response {
