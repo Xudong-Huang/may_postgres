@@ -48,6 +48,7 @@ pub struct Request {
 }
 
 impl Request {
+    #[inline]
     pub fn new(
         tag: usize,
         messages: RequestMessages,
@@ -241,7 +242,6 @@ fn connection_loop(
         let inner_stream = stream.inner_mut();
 
         process_req(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf).map_err(Error::io)?;
-
         let write_cnt = nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
 
         let read_cnt = nonblock_read(inner_stream, &mut read_buf).map_err(Error::io)?;

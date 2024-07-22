@@ -167,7 +167,7 @@ impl Clone for Client {
             socket_config: self.socket_config.clone(),
             process_id: self.process_id,
             secret_key: self.secret_key,
-            buf: UnsafeCell::new(BytesMut::with_capacity(4096 * 8)),
+            buf: UnsafeCell::new(BytesMut::with_capacity(4096 * 16)),
             co_ch,
         }
     }
@@ -489,9 +489,10 @@ impl Client {
         F: FnOnce(&mut BytesMut) -> R,
     {
         let buf = unsafe { &mut *self.buf.get() };
-        // if buf.capacity() < 1024 {
-        //     buf.reserve(4096 * 8 - buf.capacity());
-        // }
+        let rem = buf.capacity() - buf.len();
+        if rem < 1024 {
+            buf.reserve(4096 * 16 - rem);
+        }
         f(buf)
     }
 
