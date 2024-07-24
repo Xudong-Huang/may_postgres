@@ -114,7 +114,7 @@ fn nonblock_write(stream: &mut impl Write, write_buf: &mut BytesMut) -> io::Resu
 }
 
 #[inline]
-fn nonblock_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<usize> {
+fn nonblock_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<bool> {
     reserve_buf(read_buf);
     let buf: &mut [u8] = unsafe { std::mem::transmute(read_buf.chunk_mut()) };
     let len = buf.len();
@@ -128,7 +128,7 @@ fn nonblock_read(stream: &mut impl Read, read_buf: &mut BytesMut) -> io::Result<
         }
     }
     unsafe { read_buf.advance_mut(read_cnt) };
-    Ok(read_cnt)
+    Ok(read_cnt < len)
 }
 
 #[inline]
@@ -237,19 +237,20 @@ fn connection_loop(
     let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut rsp_queue = VecDeque::with_capacity(1000);
 
+    let mut io_events = 1; // allow read
     loop {
-        stream.reset_io();
         let inner_stream = stream.inner_mut();
 
         process_req(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf).map_err(Error::io)?;
-        let write_cnt = nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
+        nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
 
-        let read_cnt = nonblock_read(inner_stream, &mut read_buf).map_err(Error::io)?;
-        decode_messages(&mut read_buf, &mut rsp_queue, &mut params)?;
-
-        if read_cnt == 0 && (write_buf.is_empty() || write_cnt == 0) {
-            stream.wait_io();
+        let mut read_blocked = true;
+        if io_events & 1 != 0 {
+            read_blocked = nonblock_read(inner_stream, &mut read_buf).map_err(Error::io)?;
+            decode_messages(&mut read_buf, &mut rsp_queue, &mut params)?;
         }
+
+        io_events = if read_blocked { stream.wait_io() } else { 1 }
     }
 }
 
