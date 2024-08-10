@@ -129,6 +129,13 @@ pub struct RowStream {
     responses: Responses,
 }
 
+impl RowStream {
+    /// wait for the next row in the result set
+    pub fn wait(&self) {
+        self.responses.wait()
+    }
+}
+
 impl Iterator for RowStream {
     type Item = Result<Row, Error>;
 

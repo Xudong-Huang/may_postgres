@@ -5,6 +5,7 @@ use crate::connection::{Connection, RefOrValue, Request, RequestMessages};
 use crate::copy_out::CopyOutStream;
 use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
+use crate::tag_queue;
 use crate::types::{Oid, ToSql, Type};
 use crate::{
     copy_in, copy_out, prepare, query, simple_query, CancelToken, CopyInSink, Error, Row,
@@ -12,7 +13,6 @@ use crate::{
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 use spin::Mutex;
 
@@ -25,7 +25,7 @@ use std::time::Duration;
 pub struct Responses {
     tag: usize,
     cur: BackendMessages,
-    rx: Rc<spsc::Receiver<BackendMessages>>,
+    rx: Rc<tag_queue::Receiver<BackendMessages>>,
 }
 
 impl Responses {
@@ -35,17 +35,13 @@ impl Responses {
             match self.cur.next().map_err(Error::parse)? {
                 Some((_, Message::ErrorResponse(body))) => return Err(Error::db(body)),
                 Some((_, message)) => return Ok(message),
-                None => match self.rx.recv() {
-                    Ok(messages) => {
-                        if messages.tag != self.tag {
-                            continue;
-                        }
-                        self.cur = messages
-                    }
-                    Err(_) => return Err(Error::closed()),
-                },
+                None => self.cur = self.rx.recv(self.tag),
             }
         }
+    }
+
+    pub fn wait(&self) {
+        self.rx.wait(self.tag);
     }
 }
 
@@ -63,16 +59,17 @@ pub struct InnerClient {
 
 struct CoChannel {
     tag: Cell<usize>,
-    rx: Rc<spsc::Receiver<BackendMessages>>,
-    tx: spsc::Sender<BackendMessages>,
+    rx: Rc<tag_queue::Receiver<BackendMessages>>,
+    tx: tag_queue::Sender<BackendMessages>,
 }
 
 impl CoChannel {
-    fn sender(&self) -> RefOrValue<'static, spsc::Sender<BackendMessages>> {
+    fn sender(&self) -> RefOrValue<'static, tag_queue::Sender<BackendMessages>> {
         // Safety:
         // 1. there is only one sender
         // 2. we will wait until all response come back
-        let tx: &'static spsc::Sender<BackendMessages> = unsafe { std::mem::transmute(&self.tx) };
+        let tx: &'static tag_queue::Sender<BackendMessages> =
+            unsafe { std::mem::transmute(&self.tx) };
         RefOrValue::Ref(tx)
     }
 
@@ -82,7 +79,7 @@ impl CoChannel {
         tag
     }
 
-    fn receiver(&self) -> Rc<spsc::Receiver<BackendMessages>> {
+    fn receiver(&self) -> Rc<tag_queue::Receiver<BackendMessages>> {
         self.rx.clone()
     }
 }
@@ -90,7 +87,7 @@ impl CoChannel {
 impl InnerClient {
     /// ignore the result
     pub fn raw_send(&self, messages: RequestMessages) -> Result<(), Error> {
-        let (sender, _rx) = spsc::channel();
+        let (sender, _rx) = tag_queue::tag_channel();
         let request = Request::new(0, messages, RefOrValue::Value(sender));
         self.sender.send(request);
         Ok(())
@@ -157,7 +154,7 @@ unsafe impl Send for Client {}
 impl Clone for Client {
     fn clone(&self) -> Client {
         let co_ch = {
-            let (tx, rx) = spsc::channel();
+            let (tx, rx) = tag_queue::tag_channel();
             let rx = Rc::new(rx);
             let tag = Cell::new(0);
             CoChannel { tag, rx, tx }
@@ -176,7 +173,7 @@ impl Clone for Client {
 impl Client {
     pub(crate) fn new(sender: Connection, process_id: i32, secret_key: i32) -> Client {
         let co_ch = {
-            let (tx, rx) = spsc::channel();
+            let (tx, rx) = tag_queue::tag_channel();
             let rx = Rc::new(rx);
             let tag = Cell::new(0);
             CoChannel { tag, rx, tx }

@@ -5,12 +5,12 @@ use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
 use may::queue::mpsc::Queue;
-use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
 use crate::codec::{BackendMessage, BackendMessages, FrontendMessage};
 use crate::copy_in::CopyInReceiver;
+use crate::tag_queue;
 use crate::Error;
 
 use std::collections::{HashMap, VecDeque};
@@ -44,7 +44,7 @@ pub enum RequestMessages {
 pub struct Request {
     tag: usize,
     messages: RequestMessages,
-    sender: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+    sender: RefOrValue<'static, tag_queue::Sender<BackendMessages>>,
 }
 
 impl Request {
@@ -52,7 +52,7 @@ impl Request {
     pub fn new(
         tag: usize,
         messages: RequestMessages,
-        sender: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+        sender: RefOrValue<'static, tag_queue::Sender<BackendMessages>>,
     ) -> Request {
         Request {
             tag,
@@ -64,7 +64,7 @@ impl Request {
 
 pub struct Response {
     tag: usize,
-    tx: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+    tx: RefOrValue<'static, tag_queue::Sender<BackendMessages>>,
 }
 
 /// A connection to a PostgreSQL database.
@@ -155,7 +155,7 @@ fn decode_messages(
                 };
 
                 messages.tag = response.tag;
-                response.tx.send(messages).ok();
+                response.tx.send(messages);
 
                 if request_complete {
                     rsp_queue.pop_front();

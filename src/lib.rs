@@ -108,6 +108,7 @@ mod query;
 pub mod row;
 mod simple_query;
 mod statement;
+pub mod tag_queue;
 mod to_statement;
 mod transaction;
 mod transaction_builder;

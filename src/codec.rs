@@ -25,6 +25,12 @@ pub struct BackendMessages {
     data: Option<BytesMut>,
 }
 
+impl crate::tag_queue::Tagged for BackendMessages {
+    fn tag(&self) -> usize {
+        self.tag
+    }
+}
+
 impl BackendMessages {
     pub fn empty(tag: usize) -> BackendMessages {
         BackendMessages { tag, data: None }
