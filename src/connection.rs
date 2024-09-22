@@ -27,12 +27,12 @@ pub enum RequestMessages {
 pub struct Request {
     pub tag: usize,
     pub messages: RequestMessages,
-    pub sender: spsc::Sender<BackendMessages>,
+    pub sender: Arc<spsc::Sender<BackendMessages>>,
 }
 
 pub struct Response {
     pub tag: usize,
-    pub tx: spsc::Sender<BackendMessages>,
+    pub tx: Arc<spsc::Sender<BackendMessages>>,
 }
 
 /// A connection to a PostgreSQL database.

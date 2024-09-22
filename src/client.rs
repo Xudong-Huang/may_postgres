@@ -66,11 +66,11 @@ pub struct InnerClient {
 struct CoChannel {
     tag: Cell<usize>,
     rx: Rc<spsc::Receiver<BackendMessages>>,
-    tx: spsc::Sender<BackendMessages>,
+    tx: Arc<spsc::Sender<BackendMessages>>,
 }
 
 impl CoChannel {
-    fn sender(&self) -> spsc::Sender<BackendMessages> {
+    fn sender(&self) -> Arc<spsc::Sender<BackendMessages>> {
         self.tx.clone()
     }
 
@@ -92,7 +92,7 @@ impl InnerClient {
         let request = Request {
             tag: 0,
             messages,
-            sender,
+            sender: Arc::new(sender),
         };
         self.sender.send(request);
         Ok(())
@@ -161,6 +161,7 @@ impl Clone for Client {
         let co_ch = {
             let (tx, rx) = spsc::channel();
             let rx = Rc::new(rx);
+            let tx = Arc::new(tx);
             let tag = Cell::new(0);
             CoChannel { tag, rx, tx }
         };
@@ -180,6 +181,7 @@ impl Client {
         let co_ch = {
             let (tx, rx) = spsc::channel();
             let rx = Rc::new(rx);
+            let tx = Arc::new(tx);
             let tag = Cell::new(0);
             CoChannel { tag, rx, tx }
         };
