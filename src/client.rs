@@ -75,7 +75,8 @@ impl CoChannel {
         // Safety:
         // 1. there is only one sender
         // 2. we will wait until all response come back
-        RefOrValue::Ref(unsafe { std::mem::transmute(&self.tx) })
+        let r: &spsc::Sender<BackendMessages> = unsafe { std::mem::transmute(&self.tx) };
+        RefOrValue::Ref(r)
     }
 
     fn tag(&self) -> usize {

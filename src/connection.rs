@@ -73,9 +73,9 @@ impl QueueWriter {
 
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn as_stream(&self) -> &mut TcpStream {
-        #[allow(clippy::cast_ref_to_mut)]
-        let me = unsafe { &mut *(self as *const _ as *mut Self) };
-        let inner = me.inner.get_mut().unwrap();
+        let lock_ptr = &self.inner as *const _ as *mut Mutex<QueueWriterInner>;
+        let lock_ref = unsafe { lock_ptr.as_mut_unchecked() };
+        let inner = lock_ref.get_mut().unwrap();
         &mut inner.stream
     }
 
@@ -85,9 +85,9 @@ impl QueueWriter {
         let mut inner = self.inner.lock().unwrap();
         #[cfg(not(feature = "default"))]
         let inner = {
-            #[allow(clippy::cast_ref_to_mut)]
-            let me = unsafe { &mut *(self as *const _ as *mut Self) };
-            me.inner.get_mut().unwrap()
+            let lock_ptr = &self.inner as *const _ as *mut Mutex<QueueWriterInner>;
+            let lock_ref = unsafe { lock_ptr.as_mut_unchecked() };
+            lock_ref.get_mut().unwrap()
         };
         inner.write_data(data)
     }
@@ -99,9 +99,9 @@ impl QueueWriter {
         let mut inner = self.inner.lock().unwrap();
         #[cfg(not(feature = "default"))]
         let inner = {
-            #[allow(clippy::cast_ref_to_mut)]
-            let me = unsafe { &mut *(self as *const _ as *mut Self) };
-            me.inner.get_mut().unwrap()
+            let lock_ptr = &self.inner as *const _ as *mut Mutex<QueueWriterInner>;
+            let lock_ref = unsafe { lock_ptr.as_mut_unchecked() };
+            lock_ref.get_mut().unwrap()
         };
         inner.write_flush()
     }
@@ -251,7 +251,6 @@ fn connection_loop(
     let stream = unsafe { writer.as_stream() };
 
     loop {
-        stream.reset_io();
         if send_flag.load(Ordering::Acquire) {
             send_flag.store(false, Ordering::Relaxed);
             writer.write_flush().map_err(Error::io)?;

@@ -1,3 +1,5 @@
+#![feature(ptr_as_ref_unchecked)]
+
 //! An asynchronous, pipelined, PostgreSQL client.
 //!
 //! # Example
