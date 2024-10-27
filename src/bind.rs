@@ -1,5 +1,4 @@
 use crate::client::Client;
-use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::types::ToSql;
 use crate::{query, Error, Portal, Statement};
@@ -15,13 +14,13 @@ pub fn bind(
     params: &[&(dyn ToSql)],
 ) -> Result<Portal, Error> {
     let name = format!("p{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
-    let buf = client.with_buf(|buf| {
+    let len = client.with_buf(|buf| {
         query::encode_bind(&statement, params, &name, buf)?;
         frontend::sync(buf);
-        Ok(buf.split())
+        Ok(())
     })?;
 
-    let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+    let mut responses = client.send(RequestMessages::Encoded(len))?;
 
     match responses.next()? {
         Message::BindComplete => {}

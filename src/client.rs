@@ -16,7 +16,7 @@ use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 use spin::Mutex;
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -147,7 +147,6 @@ pub struct Client {
     socket_config: Option<SocketConfig>,
     process_id: i32,
     secret_key: i32,
-    buf: UnsafeCell<BytesMut>,
     co_ch: CoChannel,
 }
 
@@ -167,7 +166,6 @@ impl Clone for Client {
             socket_config: self.socket_config.clone(),
             process_id: self.process_id,
             secret_key: self.secret_key,
-            buf: UnsafeCell::new(BytesMut::with_capacity(4096 * 16)),
             co_ch,
         }
     }
@@ -195,7 +193,6 @@ impl Client {
             socket_config: None,
             process_id,
             secret_key,
-            buf: UnsafeCell::new(BytesMut::with_capacity(4096)),
             co_ch,
         }
     }
@@ -484,16 +481,11 @@ impl Client {
     }
 
     #[inline]
-    pub(crate) fn with_buf<F, R>(&self, f: F) -> R
+    pub(crate) fn with_buf<F, E>(&self, f: F) -> Result<usize, E>
     where
-        F: FnOnce(&mut BytesMut) -> R,
+        F: FnOnce(&mut BytesMut) -> Result<(), E>,
     {
-        let buf = unsafe { &mut *self.buf.get() };
-        let rem = buf.capacity() - buf.len();
-        if rem < 512 {
-            buf.reserve(4096 * 4 - rem);
-        }
-        f(buf)
+        self.inner.sender.with_buf(f)
     }
 
     #[inline]

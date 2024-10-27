@@ -1,11 +1,9 @@
 use crate::client::Client;
-use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::error::SqlState;
 use crate::query;
 use crate::types::{Field, Kind, Oid, Type};
 use crate::{Column, Error, Statement};
-use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -55,8 +53,8 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn prepare(client: &Client, query: &str, types: &[Type]) -> Result<Statement, Error> {
     let name = format!("s{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
-    let buf = encode(client, &name, query, types)?;
-    let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+    let len = encode(client, &name, query, types)?;
+    let mut responses = client.send(RequestMessages::Encoded(len))?;
 
     match responses.next()? {
         Message::ParseComplete => {}
@@ -94,13 +92,15 @@ pub fn prepare(client: &Client, query: &str, types: &[Type]) -> Result<Statement
     Ok(Statement::new(client.inner(), name, parameters, columns))
 }
 
-fn encode(client: &Client, name: &str, query: &str, types: &[Type]) -> Result<BytesMut, Error> {
-    client.with_buf(|buf| {
-        frontend::parse(name, query, types.iter().map(Type::oid), buf).map_err(Error::encode)?;
-        frontend::describe(b'S', name, buf).map_err(Error::encode)?;
-        frontend::sync(buf);
-        Ok(buf.split())
-    })
+fn encode(client: &Client, name: &str, query: &str, types: &[Type]) -> Result<usize, Error> {
+    client
+        .with_buf(|buf| {
+            frontend::parse(name, query, types.iter().map(Type::oid), buf)?;
+            frontend::describe(b'S', name, buf)?;
+            frontend::sync(buf);
+            Ok(())
+        })
+        .map_err(Error::encode)
 }
 
 fn get_type(client: &Client, oid: Oid) -> Result<Type, Error> {

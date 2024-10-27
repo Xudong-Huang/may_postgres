@@ -5,7 +5,7 @@ use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
 use may::queue::mpsc::Queue;
-use may::sync::spsc;
+use may::sync::{spsc, Mutex};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
@@ -37,6 +37,7 @@ impl<T> Deref for RefOrValue<'_, T> {
 }
 
 pub enum RequestMessages {
+    Encoded(usize),
     Single(FrontendMessage),
     CopyIn(CopyInReceiver),
 }
@@ -71,6 +72,7 @@ pub struct Response {
 pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
     req_queue: Arc<Queue<Request>>,
+    write_buf: Arc<Mutex<BytesMut>>,
     waker: WaitIoWaker,
     id: usize,
 }
@@ -183,37 +185,41 @@ fn process_req(
     write_buf: &mut BytesMut,
 ) -> io::Result<()> {
     while let Some(req) = req_queue.pop() {
-        reserve_buf(write_buf);
+        // reserve_buf(write_buf);
         rsp_queue.push_back(Response {
             tag: req.tag,
             tx: req.sender,
         });
         match req.messages {
+            RequestMessages::Encoded(_len) => {
+                // unimplemented!();
+            }
             RequestMessages::Single(msg) => match msg {
                 FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
                 FrontendMessage::CopyData(data) => data.write(write_buf),
             },
-            RequestMessages::CopyIn(mut rcv) => {
-                let mut copy_in_msg = rcv.try_recv();
-                loop {
-                    match copy_in_msg {
-                        Ok(Some(msg)) => {
-                            match msg {
-                                FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
-                                FrontendMessage::CopyData(data) => data.write(write_buf),
-                            }
-                            copy_in_msg = rcv.try_recv();
-                        }
-                        Ok(None) => {
-                            nonblock_write(stream, write_buf)?;
+            _ => unimplemented!(),
+            // RequestMessages::CopyIn(mut rcv) => {
+            //     let mut copy_in_msg = rcv.try_recv();
+            //     loop {
+            //         match copy_in_msg {
+            //             Ok(Some(msg)) => {
+            //                 match msg {
+            //                     FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
+            //                     FrontendMessage::CopyData(data) => data.write(write_buf),
+            //                 }
+            //                 copy_in_msg = rcv.try_recv();
+            //             }
+            //             Ok(None) => {
+            //                 nonblock_write(stream, write_buf)?;
 
-                            // no data found we just write all the data and wait
-                            copy_in_msg = rcv.recv();
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
+            //                 // no data found we just write all the data and wait
+            //                 copy_in_msg = rcv.recv();
+            //             }
+            //             Err(_) => break,
+            //         }
+            //     }
+            // }
         }
     }
     Ok(())
@@ -231,18 +237,20 @@ fn terminate_connection(stream: &mut TcpStream) {
 fn connection_loop(
     stream: &mut TcpStream,
     req_queue: Arc<Queue<Request>>,
+    write_buf: Arc<Mutex<BytesMut>>,
     mut params: HashMap<String, String>,
 ) -> Result<(), Error> {
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
-    let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut rsp_queue = VecDeque::with_capacity(512);
 
     let mut io_events = 1; // allow read
     loop {
         let inner_stream = stream.inner_mut();
 
-        process_req(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf).map_err(Error::io)?;
-        nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
+        let mut w_buf = write_buf.lock().unwrap();
+        process_req(inner_stream, &req_queue, &mut rsp_queue, &mut w_buf).map_err(Error::io)?;
+        nonblock_write(inner_stream, &mut w_buf).map_err(Error::io)?;
+        drop(w_buf);
 
         let mut read_blocked = true;
         if io_events & 1 != 0 {
@@ -259,11 +267,13 @@ impl Connection {
         use std::os::fd::AsRawFd;
         let id = stream.as_raw_fd() as usize;
         let waker = stream.waker();
+        let write_buf = Arc::new(Mutex::new(BytesMut::with_capacity(IO_BUF_SIZE)));
+        let w_buf = write_buf.clone();
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
         let io_handle = go!(move || {
-            if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters) {
+            if let Err(e) = connection_loop(&mut stream, req_queue_dup, w_buf, parameters) {
                 log::error!("connection error = {:?}", e);
                 terminate_connection(&mut stream);
             }
@@ -272,9 +282,22 @@ impl Connection {
         Connection {
             io_handle,
             req_queue,
+            write_buf,
             waker,
             id,
         }
+    }
+
+    #[inline]
+    pub fn with_buf<F, E>(&self, f: F) -> Result<usize, E>
+    where
+        F: FnOnce(&mut BytesMut) -> Result<(), E>,
+    {
+        let mut buf = self.write_buf.lock().unwrap();
+        reserve_buf(&mut buf);
+        let old_len = buf.len();
+        f(&mut buf)?;
+        Ok(buf.len() - old_len)
     }
 
     /// send a request to the connection

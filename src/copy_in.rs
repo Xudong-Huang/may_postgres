@@ -162,36 +162,37 @@ where
     }
 }
 
-pub fn copy_in<T>(client: &Client, statement: Statement) -> Result<CopyInSink<T>, Error>
+pub fn copy_in<T>(_client: &Client, _statement: Statement) -> Result<CopyInSink<T>, Error>
 where
     T: Buf + 'static + Send,
 {
+    unimplemented!()
     // debug!("executing copy in statement {}", statement.name());
 
-    let buf = query::encode(client, &statement, &[])?;
+    // let buf = query::encode(client, &statement, &[])?;
 
-    let (sender, receiver) = mpsc::channel();
-    let receiver = CopyInReceiver::new(receiver);
-    let mut responses = client.send(RequestMessages::CopyIn(receiver))?;
+    // let (sender, receiver) = mpsc::channel();
+    // let receiver = CopyInReceiver::new(receiver);
+    // let mut responses = client.send(RequestMessages::CopyIn(receiver))?;
 
-    sender
-        .send(CopyInMessage::Message(FrontendMessage::Raw(buf)))
-        .map_err(|_| Error::closed())?;
+    // sender
+    //     .send(CopyInMessage::Message(FrontendMessage::Raw(buf)))
+    //     .map_err(|_| Error::closed())?;
 
-    match responses.next()? {
-        Message::BindComplete => {}
-        _ => return Err(Error::unexpected_message()),
-    }
+    // match responses.next()? {
+    //     Message::BindComplete => {}
+    //     _ => return Err(Error::unexpected_message()),
+    // }
 
-    match responses.next()? {
-        Message::CopyInResponse(_) => {}
-        _ => return Err(Error::unexpected_message()),
-    }
+    // match responses.next()? {
+    //     Message::CopyInResponse(_) => {}
+    //     _ => return Err(Error::unexpected_message()),
+    // }
 
-    Ok(CopyInSink {
-        sender,
-        responses,
-        buf: BytesMut::new(),
-        _p: PhantomData,
-    })
+    // Ok(CopyInSink {
+    //     sender,
+    //     responses,
+    //     buf: BytesMut::new(),
+    //     _p: PhantomData,
+    // })
 }

@@ -1,5 +1,4 @@
 use crate::client::{Client, Responses};
-use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::types::{IsNull, ToSql};
 use crate::{Error, Portal, Row, Statement};
@@ -12,8 +11,8 @@ pub fn query(
     statement: Statement,
     params: &[&(dyn ToSql)],
 ) -> Result<RowStream, Error> {
-    let buf = encode(client, &statement, params)?;
-    let responses = start(client, buf)?;
+    let len = encode(client, &statement, params)?;
+    let responses = start(client, len)?;
     Ok(RowStream {
         statement,
         responses,
@@ -21,13 +20,15 @@ pub fn query(
 }
 
 pub fn query_portal(client: &Client, portal: &Portal, max_rows: i32) -> Result<RowStream, Error> {
-    let buf = client.with_buf(|buf| {
-        frontend::execute(portal.name(), max_rows, buf).map_err(Error::encode)?;
-        frontend::sync(buf);
-        Ok(buf.split())
-    })?;
+    let len = client
+        .with_buf(|buf| {
+            frontend::execute(portal.name(), max_rows, buf)?;
+            frontend::sync(buf);
+            Ok(())
+        })
+        .map_err(Error::io)?;
 
-    let responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+    let responses = client.send(RequestMessages::Encoded(len))?;
 
     Ok(RowStream {
         statement: portal.statement().clone(),
@@ -40,8 +41,8 @@ pub fn execute(
     statement: Statement,
     params: &[&(dyn ToSql)],
 ) -> Result<u64, Error> {
-    let buf = encode(client, &statement, params)?;
-    let mut responses = start(client, buf)?;
+    let len = encode(client, &statement, params)?;
+    let mut responses = start(client, len)?;
 
     loop {
         match responses.next()? {
@@ -65,8 +66,8 @@ pub fn execute(
 }
 
 #[inline]
-fn start(client: &Client, buf: BytesMut) -> Result<Responses, Error> {
-    client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))
+fn start(client: &Client, len: usize) -> Result<Responses, Error> {
+    client.send(RequestMessages::Encoded(len))
 }
 
 #[inline]
@@ -74,12 +75,12 @@ pub fn encode(
     client: &Client,
     statement: &Statement,
     params: &[&(dyn ToSql)],
-) -> Result<BytesMut, Error> {
+) -> Result<usize, Error> {
     client.with_buf(|buf| {
         encode_bind(statement, params, "", buf)?;
-        frontend::execute("", 0, buf).map_err(Error::encode)?;
+        frontend::execute("", 0, buf).map_err(Error::io)?;
         frontend::sync(buf);
-        Ok(buf.split())
+        Ok(())
     })
 }
 

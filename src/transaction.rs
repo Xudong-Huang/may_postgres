@@ -1,4 +1,3 @@
-use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::copy_out::CopyOutStream;
 use crate::query::RowStream;
@@ -31,13 +30,11 @@ impl Drop for Transaction<'_> {
         } else {
             format!("ROLLBACK TO sp{}", self.depth)
         };
-        let buf = self.client.with_buf(|buf| {
-            frontend::query(&query, buf).unwrap();
-            buf.split()
-        });
-        let _ = self
+        let len = self
             .client
-            .send(RequestMessages::Single(FrontendMessage::Raw(buf)));
+            .with_buf(|buf| frontend::query(&query, buf))
+            .unwrap();
+        let _ = self.client.send(RequestMessages::Encoded(len));
     }
 }
 
