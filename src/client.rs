@@ -7,8 +7,8 @@ use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
 use crate::types::{Oid, ToSql, Type};
 use crate::{
-    copy_in, copy_out, prepare, query, simple_query, CancelToken, CopyInSink, Error, Row,
-    SimpleQueryMessage, Statement, ToStatement, Transaction, TransactionBuilder,
+    copy_in, copy_out, prepare, query, simple_query, CancelToken, CopyInSink, Error, Notification,
+    Row, SimpleQueryMessage, Statement, ToStatement, Transaction, TransactionBuilder,
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
@@ -174,6 +174,36 @@ impl Clone for Client {
 }
 
 impl Client {
+    /// Asynchronous notifications delivered by the server.
+    ///
+    /// A connection receives notifications after subscribing with `LISTEN`;
+    /// another session raises them with `NOTIFY` or `pg_notify()`. Before this
+    /// existed the connection decoded `NotificationResponse` and discarded it,
+    /// so `LISTEN` could be issued but nothing could ever be observed.
+    ///
+    /// The queue is unbounded and is only drained by the caller, so a client
+    /// that issues `LISTEN` and never reads will grow it without limit. Poll it
+    /// as part of the same loop that does the work:
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), may_postgres::Error> {
+    /// let client = may_postgres::connect("host=localhost user=postgres")?;
+    /// client.batch_execute("LISTEN my_channel")?;
+    ///
+    /// loop {
+    ///     // Any round trip lets the connection surface pending notifications.
+    ///     client.batch_execute("SELECT 1")?;
+    ///     while let Some(notification) = client.notifications().pop() {
+    ///         println!("{}: {}", notification.channel(), notification.payload());
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    #[inline]
+    pub fn notifications(&self) -> &may::queue::mpsc::Queue<Notification> {
+        self.inner.sender.notifications()
+    }
+
     pub(crate) fn new(sender: Connection, process_id: i32, secret_key: i32) -> Client {
         let co_ch = {
             let (tx, rx) = spsc::channel();
