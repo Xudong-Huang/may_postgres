@@ -200,6 +200,12 @@ impl Client {
         }
     }
 
+    /// Waker for this client's connection coroutine, so a streaming request
+    /// can nudge the loop after queuing data outside the request queue.
+    pub(crate) fn connection_waker(&self) -> std::sync::Arc<may::io::WaitIoWaker> {
+        self.inner.sender.waker()
+    }
+
     pub(crate) fn inner(&self) -> &Arc<InnerClient> {
         &self.inner
     }

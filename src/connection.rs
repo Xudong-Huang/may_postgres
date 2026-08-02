@@ -71,7 +71,7 @@ pub struct Response {
 pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
     req_queue: Arc<Queue<Request>>,
-    waker: WaitIoWaker,
+    waker: Arc<WaitIoWaker>,
     id: usize,
 }
 
@@ -175,13 +175,59 @@ fn decode_messages(
     Ok(())
 }
 
+/// Move whatever copy-in data is currently available into the write buffer.
+///
+/// Returns without waiting when the channel is empty, leaving the receiver in
+/// `pending` so the caller retries on the next pass. Clearing `pending` signals
+/// the copy is over — either finished (`Done`, which the receiver turns into
+/// `CopyDone`/`Sync`) or abandoned, when the sender was dropped and the receiver
+/// produces `CopyFail`/`Sync`.
+#[inline]
+fn drain_copy_in(pending: &mut Option<CopyInReceiver>, write_buf: &mut BytesMut) {
+    let Some(rcv) = pending.as_mut() else {
+        return;
+    };
+
+    loop {
+        match rcv.try_recv() {
+            Ok(Some(msg)) => {
+                reserve_buf(write_buf);
+                match msg {
+                    FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
+                    FrontendMessage::CopyData(data) => data.write(write_buf),
+                }
+            }
+            // Nothing queued yet; the client is still writing. Yield so the loop
+            // can service reads, and pick this up again next pass.
+            Ok(None) => return,
+            // The copy has ended, in either direction.
+            Err(()) => {
+                *pending = None;
+                return;
+            }
+        }
+    }
+}
+
 #[inline]
 fn process_req(
-    stream: &mut impl Write,
     req_queue: &Queue<Request>,
     rsp_queue: &mut VecDeque<Response>,
     write_buf: &mut BytesMut,
+    pending_copy_in: &mut Option<CopyInReceiver>,
 ) -> io::Result<()> {
+    // While a copy is in flight the connection is in COPY mode: the server will
+    // only accept CopyData/CopyDone/CopyFail until it ends. Writing any other
+    // queued request now would inject it into the copy stream and the server
+    // would reject the whole thing with "unexpected message type during COPY".
+    //
+    // The previous blocking `rcv.recv()` gave this ordering for free, by never
+    // leaving the copy arm. Draining without blocking means the guard has to be
+    // explicit — requests simply wait their turn.
+    if pending_copy_in.is_some() {
+        return Ok(());
+    }
+
     while let Some(req) = req_queue.pop() {
         reserve_buf(write_buf);
         rsp_queue.push_back(Response {
@@ -193,26 +239,16 @@ fn process_req(
                 FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
                 FrontendMessage::CopyData(data) => data.write(write_buf),
             },
-            RequestMessages::CopyIn(mut rcv) => {
-                let mut copy_in_msg = rcv.try_recv();
-                loop {
-                    match copy_in_msg {
-                        Ok(Some(msg)) => {
-                            match msg {
-                                FrontendMessage::Raw(buf) => write_buf.extend_from_slice(&buf),
-                                FrontendMessage::CopyData(data) => data.write(write_buf),
-                            }
-                            copy_in_msg = rcv.try_recv();
-                        }
-                        Ok(None) => {
-                            nonblock_write(stream, write_buf)?;
-
-                            // no data found we just write all the data and wait
-                            copy_in_msg = rcv.recv();
-                        }
-                        Err(_) => break,
-                    }
-                }
+            RequestMessages::CopyIn(rcv) => {
+                // Take ownership and drain without blocking. Blocking here — as
+                // this used to, via `rcv.recv()` — parks the only coroutine that
+                // reads the socket, while the client waits for a response that
+                // only this coroutine can decode. That is a deadlock between the
+                // two halves of one connection, and it strikes whenever the copy
+                // channel drains before the client has queued more data, which
+                // on an otherwise idle connection is immediately.
+                *pending_copy_in = Some(rcv);
+                drain_copy_in(pending_copy_in, write_buf);
             }
         }
     }
@@ -236,12 +272,21 @@ fn connection_loop(
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut rsp_queue = VecDeque::with_capacity(512);
+    let mut pending_copy_in: Option<CopyInReceiver> = None;
 
     let mut io_events = 1; // allow read
     loop {
         let inner_stream = stream.inner_mut();
 
-        process_req(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf).map_err(Error::io)?;
+        process_req(
+            &req_queue,
+            &mut rsp_queue,
+            &mut write_buf,
+            &mut pending_copy_in,
+        )
+        .map_err(Error::io)?;
+        // An in-flight copy may have had more data queued since the last pass.
+        drain_copy_in(&mut pending_copy_in, &mut write_buf);
         nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
 
         let mut read_blocked = true;
@@ -258,7 +303,7 @@ impl Connection {
     pub(crate) fn new(mut stream: TcpStream, parameters: HashMap<String, String>) -> Connection {
         use std::os::fd::AsRawFd;
         let id = stream.as_raw_fd() as usize;
-        let waker = stream.waker();
+        let waker = Arc::new(stream.waker());
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
@@ -287,5 +332,15 @@ impl Connection {
     #[inline]
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    /// Waker for the connection coroutine.
+    ///
+    /// `send` wakes the loop when a request is queued. A copy-in streams its
+    /// data through a separate channel, so it must do the same, or the loop
+    /// stays parked in `wait_io` with data waiting to be written.
+    #[inline]
+    pub fn waker(&self) -> Arc<WaitIoWaker> {
+        self.waker.clone()
     }
 }

@@ -3,6 +3,7 @@ use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::{query, Error, Statement};
 use bytes::{Buf, BufMut, BytesMut};
+use may::io::WaitIoWaker;
 use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -84,6 +85,12 @@ impl CopyInReceiver {
 /// not, the copy will be aborted.
 pub struct CopyInSink<T> {
     sender: mpsc::Sender<CopyInMessage>,
+    /// Wakes the connection coroutine after data is queued.
+    ///
+    /// Copy data travels on its own channel rather than the request queue, so
+    /// nothing else would tell the loop there is more to write; it would stay
+    /// parked in `wait_io` until unrelated socket activity happened to wake it.
+    waker: std::sync::Arc<WaitIoWaker>,
     responses: Responses,
     buf: BytesMut,
     _p: PhantomData<T>,
@@ -113,7 +120,9 @@ where
         let data = CopyData::new(data).map_err(Error::encode)?;
         self.sender
             .send(CopyInMessage::Message(FrontendMessage::CopyData(data)))
-            .map_err(|_| Error::closed())
+            .map_err(|_| Error::closed())?;
+        self.waker.wakeup();
+        Ok(())
     }
 
     /// send iterator of bufs
@@ -139,11 +148,13 @@ where
             self.sender
                 .send(CopyInMessage::Message(FrontendMessage::CopyData(data)))
                 .map_err(|_| Error::closed())?;
+            self.waker.wakeup();
         }
 
         self.sender
             .send(CopyInMessage::Done)
             .map_err(|_| Error::closed())?;
+        self.waker.wakeup();
 
         match self.responses.next()? {
             Message::CommandComplete(body) => {
@@ -172,11 +183,13 @@ where
 
     let (sender, receiver) = mpsc::channel();
     let receiver = CopyInReceiver::new(receiver);
+    let waker = client.connection_waker();
     let mut responses = client.send(RequestMessages::CopyIn(receiver))?;
 
     sender
         .send(CopyInMessage::Message(FrontendMessage::Raw(buf)))
         .map_err(|_| Error::closed())?;
+    waker.wakeup();
 
     match responses.next()? {
         Message::BindComplete => {}
@@ -190,6 +203,7 @@ where
 
     Ok(CopyInSink {
         sender,
+        waker,
         responses,
         buf: BytesMut::new(),
         _p: PhantomData,
