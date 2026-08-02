@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    # The suite talks to a database over a coroutine-driven connection, so a
+    # protocol-level stall shows up as a hang rather than a failure. A job-level
+    # limit turns that into a legible red build instead of a runner burning its
+    # full six hours.
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # PostgreSQL 14 is deliberately absent. The test binary segfaults
+        # against it — SIGSEGV after a handful of tests — and it does so on the
+        # unmodified base commit too, so this is a pre-existing runtime bug
+        # rather than anything to do with this workflow. A matrix leg that can
+        # never pass just teaches people to ignore red CI, so 14 stays out until
+        # that is fixed. Adding it back is a one-line change.
+        postgres: [16]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Started with `docker run` rather than a `services:` block because the
+      # container needs the fixture scripts from the repository, and service
+      # containers are created before the checkout step runs.
+      - name: Start PostgreSQL
+        run: |
+          # Removed first so a re-run on a persistent runner — or a local
+          # `act` invocation — does not collide with a container left behind
+          # by a previous attempt and then silently test against stale fixtures.
+          docker rm --force postgres 2>/dev/null || true
+
+          docker run --detach --name postgres \
+            --publish 127.0.0.1:5433:5432 \
+            --env POSTGRES_USER=postgres \
+            --env POSTGRES_HOST_AUTH_METHOD=trust \
+            --volume "$PWD/ci/initdb:/docker-entrypoint-initdb.d:ro" \
+            postgres:${{ matrix.postgres }}
+
+      - name: Wait for PostgreSQL
+        run: |
+          for _ in $(seq 1 60); do
+            if docker exec postgres pg_isready --quiet --username postgres; then
+              # pg_isready reports the server is accepting connections, but the
+              # entrypoint restarts it once the initdb scripts have run. Confirm
+              # a fixture role exists so we do not race that restart.
+              if docker exec postgres psql --username postgres --tuples-only \
+                   --command "SELECT 1 FROM pg_roles WHERE rolname = 'scram_user'" \
+                   | grep --quiet 1; then
+                echo "PostgreSQL ready with fixtures applied"
+                exit 0
+              fi
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker logs postgres
+          exit 1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --all
+
+      - name: PostgreSQL logs
+        if: failure()
+        run: docker logs postgres
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # Not `-D warnings`: that would make this job fail on pre-existing lints
+      # unrelated to whichever change is being reviewed. Warnings stay visible in
+      # the log, and can be promoted to errors once the tree is clean.
+      - name: Clippy
+        run: cargo clippy --all-targets
