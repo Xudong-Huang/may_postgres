@@ -73,10 +73,31 @@ pub(crate) struct Connection {
     req_queue: Arc<Queue<Request>>,
     waker: WaitIoWaker,
     id: usize,
+    /// Second handle to the same socket, used only by `Drop`.
+    ///
+    /// The stream itself is moved into the io coroutine, so nothing outside
+    /// that coroutine can close it. Keeping a clone here is what lets the
+    /// socket be shut down when the connection is dropped.
+    shutdown: Option<TcpStream>,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Close the socket BEFORE cancelling the coroutine.
+        //
+        // `cancel()` stops the coroutine but does not run its destructors, and
+        // the `TcpStream` is owned by the coroutine closure - so cancelling
+        // alone leaves the file descriptor open. The server keeps the backend
+        // alive until the whole process exits, which shows up as a connection
+        // leak: N dropped clients leave N backends in `pg_stat_activity`, and
+        // a long-lived process eventually meets "sorry, too many clients
+        // already".
+        //
+        // Shutting the socket down here releases the backend and also unblocks
+        // the coroutine, which is parked in `wait_io()`.
+        if let Some(stream) = self.shutdown.take() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
         let rx = self.io_handle.coroutine();
         unsafe { rx.cancel() };
     }
@@ -259,6 +280,8 @@ impl Connection {
         use std::os::fd::AsRawFd;
         let id = stream.as_raw_fd() as usize;
         let waker = stream.waker();
+        // Cloned BEFORE the stream moves into the coroutine below.
+        let shutdown = stream.try_clone().ok();
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
@@ -274,6 +297,7 @@ impl Connection {
             req_queue,
             waker,
             id,
+            shutdown,
         }
     }
 
