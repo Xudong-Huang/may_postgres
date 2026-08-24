@@ -15,26 +15,10 @@ use crate::Error;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const IO_BUF_SIZE: usize = 4096 * 2;
-
-pub enum RefOrValue<'a, T> {
-    Ref(&'a T),
-    Value(T),
-}
-
-impl<T> Deref for RefOrValue<'_, T> {
-    type Target = T;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        match self {
-            RefOrValue::Ref(r) => r,
-            RefOrValue::Value(ref v) => v,
-        }
-    }
-}
 
 pub enum RequestMessages {
     Single(FrontendMessage),
@@ -44,7 +28,11 @@ pub enum RequestMessages {
 pub struct Request {
     tag: usize,
     messages: RequestMessages,
-    sender: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+    // OWNED (shared) sender, never a transmuted borrow: requests can sit in
+    // the queues after the originating Client is dropped, so a borrow here
+    // would dangle into freed Client memory the moment drop stopped being
+    // an instant kill.
+    sender: Arc<spsc::Sender<BackendMessages>>,
 }
 
 impl Request {
@@ -52,7 +40,7 @@ impl Request {
     pub fn new(
         tag: usize,
         messages: RequestMessages,
-        sender: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+        sender: Arc<spsc::Sender<BackendMessages>>,
     ) -> Request {
         Request {
             tag,
@@ -64,21 +52,36 @@ impl Request {
 
 pub struct Response {
     tag: usize,
-    tx: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+    tx: Arc<spsc::Sender<BackendMessages>>,
 }
 
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
-    io_handle: JoinHandle<()>,
+    /// Held only to keep the io coroutine owned; dropping it DETACHES. The
+    /// coroutine is never cancelled (cancel skips destructors, leaking the
+    /// socket) and never joined (drop can run inside a coroutine that is
+    /// itself being cancelled, where parking to join aborts the process).
+    _io_handle: JoinHandle<()>,
     req_queue: Arc<Queue<Request>>,
     waker: WaitIoWaker,
+    /// Cooperative shutdown: `drop` sets this and wakes the coroutine; the
+    /// connection loop polls it and exits on its own stack, closing its own
+    /// socket. Reaching in from outside (cancelling, or shutting the fd down
+    /// from `drop`) corrupts the coroutine mid-flight.
+    shutdown: Arc<AtomicBool>,
     id: usize,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let rx = self.io_handle.coroutine();
-        unsafe { rx.cancel() };
+        // Signal the loop and wake it out of wait_io(); it exits on its own
+        // stack, sends the protocol Terminate and closes its own socket. This
+        // must NOT block: a Client can be dropped inside a coroutine that is
+        // itself being cancelled, and parking there (to join) aborts. The
+        // waker holds an Arc to the reactor slot, so waking after the loop
+        // has already exited is a harmless no-op.
+        self.shutdown.store(true, Ordering::Release);
+        self.waker.wakeup();
     }
 }
 
@@ -232,6 +235,7 @@ fn connection_loop(
     stream: &mut TcpStream,
     req_queue: Arc<Queue<Request>>,
     mut params: HashMap<String, String>,
+    shutdown: &AtomicBool,
 ) -> Result<(), Error> {
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
@@ -239,6 +243,12 @@ fn connection_loop(
 
     let mut io_events = 1; // allow read
     loop {
+        // Cooperative shutdown, set by Connection::drop. Exiting HERE -
+        // rather than being cancelled from outside - is what guarantees the
+        // stream is dropped on this stack with destructors run.
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let inner_stream = stream.inner_mut();
 
         process_req(inner_stream, &req_queue, &mut rsp_queue, &mut write_buf).map_err(Error::io)?;
@@ -262,17 +272,24 @@ impl Connection {
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_dup = shutdown.clone();
         let io_handle = go!(move || {
-            if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters) {
+            if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters, &shutdown_dup) {
                 log::error!("connection error = {:?}", e);
-                terminate_connection(&mut stream);
             }
+            // On BOTH exit paths: send the protocol Terminate and close the
+            // socket, on this coroutine-s own stack. This is what releases the
+            // server backend the moment the client goes away, instead of at
+            // process exit.
+            terminate_connection(&mut stream);
         });
 
         Connection {
-            io_handle,
+            _io_handle: io_handle,
             req_queue,
             waker,
+            shutdown,
             id,
         }
     }

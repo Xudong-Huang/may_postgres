@@ -710,3 +710,36 @@ fn query_opt() {
         .unwrap();
     client.query_one("SELECT * FROM foo", &[]).err().unwrap();
 }
+
+#[test]
+fn dropping_a_client_closes_the_server_backend() {
+    // The probe connections carry their own application_name so this count is
+    // immune to every other test opening and dropping connections in parallel.
+    const TAG: &str = "drop_leak_probe";
+    let observer = connect("user=postgres dbname=postgres");
+    let backends = || -> i64 {
+        observer
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
+                &[&TAG],
+            )
+            .unwrap()
+            .get(0)
+    };
+
+    for _ in 0..5 {
+        let client = connect(&format!(
+            "user=postgres dbname=postgres application_name={TAG}"
+        ));
+        client.query("SELECT 1", &[]).unwrap();
+        drop(client);
+        // The server reaps the backend once the socket closes; give it a moment.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    let after = backends();
+    assert_eq!(
+        after, 0,
+        "{after} dropped client(s) left their backend open"
+    );
+}

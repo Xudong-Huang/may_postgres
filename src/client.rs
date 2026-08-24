@@ -1,7 +1,7 @@
 use crate::cancel_query;
 use crate::codec::BackendMessages;
 use crate::config::Host;
-use crate::connection::{Connection, RefOrValue, Request, RequestMessages};
+use crate::connection::{Connection, Request, RequestMessages};
 use crate::copy_out::CopyOutStream;
 use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
@@ -64,16 +64,16 @@ pub struct InnerClient {
 struct CoChannel {
     tag: Cell<usize>,
     rx: Rc<spsc::Receiver<BackendMessages>>,
-    tx: spsc::Sender<BackendMessages>,
+    tx: Arc<spsc::Sender<BackendMessages>>,
 }
 
 impl CoChannel {
-    fn sender(&self) -> RefOrValue<'static, spsc::Sender<BackendMessages>> {
-        // Safety:
-        // 1. there is only one sender
-        // 2. we will wait until all response come back
-        let tx: &'static spsc::Sender<BackendMessages> = unsafe { std::mem::transmute(&self.tx) };
-        RefOrValue::Ref(tx)
+    fn sender(&self) -> Arc<spsc::Sender<BackendMessages>> {
+        // Shared ownership, not a transmuted borrow. The old 'static borrow
+        // relied on the client outliving every queued request, which drop
+        // breaks - the io coroutine would then push responses through a
+        // dangling pointer into freed Client memory.
+        self.tx.clone()
     }
 
     fn tag(&self) -> usize {
@@ -91,7 +91,7 @@ impl InnerClient {
     /// ignore the result
     pub fn raw_send(&self, messages: RequestMessages) -> Result<(), Error> {
         let (sender, _rx) = spsc::channel();
-        let request = Request::new(0, messages, RefOrValue::Value(sender));
+        let request = Request::new(0, messages, Arc::new(sender));
         self.sender.send(request);
         Ok(())
     }
@@ -160,7 +160,11 @@ impl Clone for Client {
             let (tx, rx) = spsc::channel();
             let rx = Rc::new(rx);
             let tag = Cell::new(0);
-            CoChannel { tag, rx, tx }
+            CoChannel {
+                tag,
+                rx,
+                tx: Arc::new(tx),
+            }
         };
         Client {
             inner: self.inner.clone(),
@@ -179,7 +183,11 @@ impl Client {
             let (tx, rx) = spsc::channel();
             let rx = Rc::new(rx);
             let tag = Cell::new(0);
-            CoChannel { tag, rx, tx }
+            CoChannel {
+                tag,
+                rx,
+                tx: Arc::new(tx),
+            }
         };
         Client {
             inner: Arc::new(InnerClient {
