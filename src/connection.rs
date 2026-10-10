@@ -1,9 +1,9 @@
+use crate::tls::{tls_read, tls_write, PgStream};
 use bytes::{Buf, BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
 use may::coroutine::JoinHandle;
 use may::go;
 use may::io::{WaitIo, WaitIoWaker};
-use may::net::TcpStream;
 use may::queue::mpsc::Queue;
 use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
@@ -303,16 +303,20 @@ fn process_req(
 }
 
 #[cold]
-fn terminate_connection(stream: &mut TcpStream) {
+fn terminate_connection(stream: &mut PgStream) {
     let mut request = BytesMut::new();
     frontend::terminate(&mut request);
     stream.write_all(&request.freeze()).ok();
-    stream.shutdown(std::net::Shutdown::Both).ok();
+    if let Some(conn) = stream.tls.as_deref_mut() {
+        conn.send_close_notify();
+    }
+    stream.flush().ok();
+    stream.tcp.shutdown(std::net::Shutdown::Both).ok();
 }
 
 #[inline]
 fn connection_loop(
-    stream: &mut TcpStream,
+    stream: &mut PgStream,
     req_queue: &Queue<Request>,
     rsp_queue: &mut VecDeque<Response>,
     mut params: HashMap<String, String>,
@@ -331,34 +335,41 @@ fn connection_loop(
         if shutdown.load(Ordering::Acquire) {
             return Ok(());
         }
-        let inner_stream = stream.inner_mut();
+        let inner_stream = stream.tcp.inner_mut();
 
-        process_req(
-            req_queue,
-            rsp_queue,
-            &mut write_buf,
-            &mut pending_copy_in,
-        )
-        .map_err(Error::io)?;
+        process_req(req_queue, rsp_queue, &mut write_buf, &mut pending_copy_in)
+            .map_err(Error::io)?;
         // An in-flight copy may have had more data queued since the last pass.
         drain_copy_in(&mut pending_copy_in, &mut write_buf);
-        nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
+        match stream.tls.as_deref_mut() {
+            None => nonblock_write(inner_stream, &mut write_buf).map(|_| ()),
+            Some(conn) => tls_write(conn, inner_stream, &mut write_buf),
+        }
+        .map_err(Error::io)?;
 
         let mut read_blocked = true;
         if io_events & 1 != 0 {
-            read_blocked = nonblock_read(inner_stream, &mut read_buf).map_err(Error::io)?;
+            read_blocked = match stream.tls.as_deref_mut() {
+                None => nonblock_read(inner_stream, &mut read_buf),
+                Some(conn) => tls_read(conn, inner_stream, &mut read_buf),
+            }
+            .map_err(Error::io)?;
             decode_messages(&mut read_buf, rsp_queue, &mut params, &notifications)?;
         }
 
-        io_events = if read_blocked { stream.wait_io() } else { 1 }
+        io_events = if read_blocked {
+            stream.tcp.wait_io()
+        } else {
+            1
+        }
     }
 }
 
 impl Connection {
-    pub(crate) fn new(mut stream: TcpStream, parameters: HashMap<String, String>) -> Connection {
+    pub(crate) fn new(mut stream: PgStream, parameters: HashMap<String, String>) -> Connection {
         use std::os::fd::AsRawFd;
-        let id = stream.as_raw_fd() as usize;
-        let waker = Arc::new(stream.waker());
+        let id = stream.tcp.as_raw_fd() as usize;
+        let waker = Arc::new(stream.tcp.waker());
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
@@ -389,41 +400,42 @@ impl Connection {
                 .name("pg-io".to_owned())
                 .stack_size(io_stack),
             move || {
-            let mut rsp_queue: VecDeque<Response> = VecDeque::with_capacity(512);
-            if let Err(e) = connection_loop(
-                &mut stream,
-                &req_queue_dup,
-                &mut rsp_queue,
-                parameters,
-                notifications_dup,
-                &shutdown_dup,
-            ) {
-                log::error!("connection error = {:?}", e);
+                let mut rsp_queue: VecDeque<Response> = VecDeque::with_capacity(512);
+                if let Err(e) = connection_loop(
+                    &mut stream,
+                    &req_queue_dup,
+                    &mut rsp_queue,
+                    parameters,
+                    notifications_dup,
+                    &shutdown_dup,
+                ) {
+                    log::error!("connection error = {:?}", e);
+                }
+                // On EVERY exit (error, EOF, cooperative shutdown): the loop will
+                // never write another request or decode another response, so fail
+                // everything that is still waiting. Without this, a caller blocked
+                // in `Responses::next` waits forever — its channel's only producer
+                // is this coroutine — and that wedge is what starved lifeguard's
+                // pool workers (2026-08-29 tickers outage).
+                //
+                // Order matters: mark dead FIRST, so a sender that enqueues after
+                // our drain sees `dead` on its post-push check and drains its own
+                // request; then drain under the lock. SeqCst pairs with the SeqCst
+                // load in `send` (Dekker pattern: push / load-dead on one side,
+                // store-dead / drain on the other) so no push can slip between the
+                // final drain and a stale `dead == false` read.
+                dead_dup.store(true, Ordering::SeqCst);
+                fail_pending_responses(&mut rsp_queue);
+                {
+                    let _g = drain_lock_dup.lock();
+                    fail_queued_requests(&req_queue_dup);
+                }
+                // Send the protocol Terminate and close the socket, on this
+                // coroutine's own stack. This is what releases the server backend
+                // the moment the client goes away, instead of at process exit.
+                terminate_connection(&mut stream);
             }
-            // On EVERY exit (error, EOF, cooperative shutdown): the loop will
-            // never write another request or decode another response, so fail
-            // everything that is still waiting. Without this, a caller blocked
-            // in `Responses::next` waits forever — its channel's only producer
-            // is this coroutine — and that wedge is what starved lifeguard's
-            // pool workers (2026-08-29 tickers outage).
-            //
-            // Order matters: mark dead FIRST, so a sender that enqueues after
-            // our drain sees `dead` on its post-push check and drains its own
-            // request; then drain under the lock. SeqCst pairs with the SeqCst
-            // load in `send` (Dekker pattern: push / load-dead on one side,
-            // store-dead / drain on the other) so no push can slip between the
-            // final drain and a stale `dead == false` read.
-            dead_dup.store(true, Ordering::SeqCst);
-            fail_pending_responses(&mut rsp_queue);
-            {
-                let _g = drain_lock_dup.lock();
-                fail_queued_requests(&req_queue_dup);
-            }
-            // Send the protocol Terminate and close the socket, on this
-            // coroutine's own stack. This is what releases the server backend
-            // the moment the client goes away, instead of at process exit.
-            terminate_connection(&mut stream);
-        });
+        );
 
         Connection {
             // Builder spawn is fallible (stack allocation); a connection we

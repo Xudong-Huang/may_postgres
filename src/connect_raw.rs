@@ -1,6 +1,7 @@
 use crate::codec::{BackendMessage, BackendMessages, Framed, FrontendMessage, PostgresCodec};
 use crate::config::Config;
 use crate::connection::Connection;
+use crate::tls;
 use crate::{Client, Error};
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
@@ -23,7 +24,9 @@ impl StartupStream {
         let mut encoder = PostgresCodec;
         let mut data = BytesMut::with_capacity(512);
         encoder.encode(msg, &mut data)?;
-        self.inner.inner_mut().write_all(&data)
+        let stream = self.inner.inner_mut();
+        stream.write_all(&data)?;
+        stream.flush()
     }
 
     fn next_msg(&mut self) -> io::Result<Message> {
@@ -40,7 +43,12 @@ impl StartupStream {
     }
 }
 
-pub fn connect_raw(stream: TcpStream, config: &Config) -> Result<Client, Error> {
+pub fn connect_raw(
+    stream: TcpStream,
+    config: &Config,
+    host: Option<&str>,
+) -> Result<Client, Error> {
+    let stream = tls::negotiate(stream, config, host)?;
     let mut stream = StartupStream {
         inner: Framed::new(stream),
         buf: BackendMessages::empty(0),

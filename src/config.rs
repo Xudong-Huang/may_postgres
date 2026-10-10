@@ -48,10 +48,11 @@ pub(crate) enum Host {
 /// * `dbname` - The name of the database to connect to. Defaults to the username.
 /// * `options` - Command line options used to configure the server.
 /// * `application_name` - Sets the `application_name` parameter on the server.
-/// * `sslmode` - This coroutine port does not implement TLS. The explicit value
-///   `disable` is accepted for compatibility with standard PostgreSQL
-///   connection strings; all other values are rejected rather than silently
-///   downgrading the connection.
+/// * `sslmode` - `disable`, `prefer` (default), `require`, `verify-ca` or `verify-full`, as libpq. `require` with
+///   `sslrootcert` behaves as `verify-ca`.
+/// * `sslrootcert` - PEM file of the certificate authority the server certificate must chain to (`verify-ca`,
+///   `verify-full`).
+/// * `sslcert`, `sslkey` - PEM client certificate and private key, presented when the server asks for one.
 /// * `host` - The host to connect to. On Unix platforms, if the host starts with a `/` character it is treated as the
 ///   path to the directory containing Unix domain sockets. Otherwise, it is treated as a hostname. Multiple hosts
 ///   can be specified, separated by commas. Each host will be tried in turn when connecting. Required if connecting
@@ -123,6 +124,10 @@ pub struct Config {
     pub(crate) keepalives: bool,
     pub(crate) keepalives_idle: Duration,
     pub(crate) target_session_attrs: TargetSessionAttrs,
+    pub(crate) ssl_mode: SslMode,
+    pub(crate) ssl_root_cert: Option<std::path::PathBuf>,
+    pub(crate) ssl_cert: Option<std::path::PathBuf>,
+    pub(crate) ssl_key: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -146,6 +151,10 @@ impl Config {
             keepalives: true,
             keepalives_idle: Duration::from_secs(2 * 60 * 60),
             target_session_attrs: TargetSessionAttrs::Any,
+            ssl_mode: SslMode::Prefer,
+            ssl_root_cert: None,
+            ssl_cert: None,
+            ssl_key: None,
         }
     }
 
@@ -262,6 +271,50 @@ impl Config {
         self
     }
 
+    /// Sets the TLS mode. Defaults to `Prefer`.
+    pub fn ssl_mode(&mut self, ssl_mode: SslMode) -> &mut Config {
+        self.ssl_mode = ssl_mode;
+        self
+    }
+
+    /// The TLS mode.
+    pub fn get_ssl_mode(&self) -> SslMode {
+        self.ssl_mode
+    }
+
+    /// Sets the PEM file of the certificate authority the server certificate must chain to.
+    pub fn ssl_root_cert(&mut self, path: impl Into<std::path::PathBuf>) -> &mut Config {
+        self.ssl_root_cert = Some(path.into());
+        self
+    }
+
+    /// The root certificate file, if set.
+    pub fn get_ssl_root_cert(&self) -> Option<&std::path::Path> {
+        self.ssl_root_cert.as_deref()
+    }
+
+    /// Sets the PEM client certificate file (with [`Config::ssl_key`]).
+    pub fn ssl_cert(&mut self, path: impl Into<std::path::PathBuf>) -> &mut Config {
+        self.ssl_cert = Some(path.into());
+        self
+    }
+
+    /// The client certificate file, if set.
+    pub fn get_ssl_cert(&self) -> Option<&std::path::Path> {
+        self.ssl_cert.as_deref()
+    }
+
+    /// Sets the PEM private key file of the client certificate.
+    pub fn ssl_key(&mut self, path: impl Into<std::path::PathBuf>) -> &mut Config {
+        self.ssl_key = Some(path.into());
+        self
+    }
+
+    /// The client key file, if set.
+    pub fn get_ssl_key(&self) -> Option<&std::path::Path> {
+        self.ssl_key.as_deref()
+    }
+
     fn param(&mut self, key: &str, value: &str) -> Result<(), Error> {
         match key {
             "user" => {
@@ -280,9 +333,18 @@ impl Config {
                 self.application_name(value);
             }
             "sslmode" => {
-                if value != "disable" {
-                    return Err(Error::config_parse(Box::new(InvalidValue("sslmode"))));
-                }
+                let mode = SslMode::parse(value)
+                    .ok_or_else(|| Error::config_parse(Box::new(InvalidValue("sslmode"))))?;
+                self.ssl_mode(mode);
+            }
+            "sslrootcert" => {
+                self.ssl_root_cert(value);
+            }
+            "sslcert" => {
+                self.ssl_cert(value);
+            }
+            "sslkey" => {
+                self.ssl_key(value);
             }
             "host" => {
                 for host in value.split(',') {
@@ -355,7 +417,8 @@ impl Config {
     ///
     /// All of the settings other than `user`, `password`, `dbname`, `options`, and `application` name are ignored.
     pub fn connect_raw(&self, stream: TcpStream) -> Result<Client, Error> {
-        connect_raw(stream, self)
+        let host = self.host.first().map(|Host::Tcp(h)| h.as_str());
+        connect_raw(stream, self, host)
     }
 }
 
@@ -386,7 +449,10 @@ impl fmt::Debug for Config {
             .field("dbname", &self.dbname)
             .field("options", &self.options)
             .field("application_name", &self.application_name)
-            // .field("ssl_mode", &self.ssl_mode)
+            .field("ssl_mode", &self.ssl_mode)
+            .field("ssl_root_cert", &self.ssl_root_cert)
+            .field("ssl_cert", &self.ssl_cert)
+            .field("ssl_key", &self.ssl_key)
             .field("host", &self.host)
             .field("port", &self.port)
             .field("connect_timeout", &self.connect_timeout)
@@ -765,5 +831,79 @@ impl<'a> UrlParser<'a> {
         percent_encoding::percent_decode(s.as_bytes())
             .decode_utf8()
             .map_err(|e| Error::config_parse(e.into()))
+    }
+}
+
+/// TLS mode, as libpq's `sslmode`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SslMode {
+    /// Never TLS.
+    Disable,
+    /// TLS when the server offers it; no certificate checks.
+    Prefer,
+    /// TLS or fail; no certificate checks (unless a root certificate is set: then as `VerifyCa`).
+    Require,
+    /// TLS; the server certificate must chain to the root certificate.
+    VerifyCa,
+    /// As `VerifyCa`, and the certificate must name the host.
+    VerifyFull,
+}
+
+impl SslMode {
+    fn parse(s: &str) -> Option<SslMode> {
+        Some(match s {
+            "disable" => SslMode::Disable,
+            "prefer" => SslMode::Prefer,
+            "require" => SslMode::Require,
+            "verify-ca" => SslMode::VerifyCa,
+            "verify-full" => SslMode::VerifyFull,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            SslMode::Disable => "disable",
+            SslMode::Prefer => "prefer",
+            SslMode::Require => "require",
+            SslMode::VerifyCa => "verify-ca",
+            SslMode::VerifyFull => "verify-full",
+        }
+    }
+}
+
+#[cfg(test)]
+mod ssl_config_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_prefer() {
+        assert_eq!(Config::new().get_ssl_mode(), SslMode::Prefer);
+    }
+
+    #[test]
+    fn key_value_ssl_params() {
+        let c: Config =
+            "host=db user=u sslmode=verify-full sslrootcert=/ca.crt sslcert=/c.crt sslkey=/c.key"
+                .parse()
+                .unwrap();
+        assert_eq!(c.get_ssl_mode(), SslMode::VerifyFull);
+        assert_eq!(c.get_ssl_root_cert(), Some(std::path::Path::new("/ca.crt")));
+        assert_eq!(c.get_ssl_cert(), Some(std::path::Path::new("/c.crt")));
+        assert_eq!(c.get_ssl_key(), Some(std::path::Path::new("/c.key")));
+    }
+
+    #[test]
+    fn url_ssl_params() {
+        let c: Config = "postgres://u:p@db:5432/x?sslmode=require".parse().unwrap();
+        assert_eq!(c.get_ssl_mode(), SslMode::Require);
+        let c: Config = "postgres://u@db/x?sslmode=disable".parse().unwrap();
+        assert_eq!(c.get_ssl_mode(), SslMode::Disable);
+    }
+
+    #[test]
+    fn bad_sslmode_rejected() {
+        assert!("host=db sslmode=allow-ish".parse::<Config>().is_err());
     }
 }

@@ -44,7 +44,8 @@ fn connect_once(host: &Host, port: u16, config: &Config) -> Result<Client, Error
         config.keepalives_idle,
     )?;
 
-    let mut client = connect_raw(socket, config)?;
+    let Host::Tcp(hostname) = host;
+    let mut client = connect_raw(socket, config, Some(hostname))?;
 
     if let TargetSessionAttrs::ReadWrite = config.target_session_attrs {
         let mut rows = client.simple_query_raw("SHOW transaction_read_only")?;

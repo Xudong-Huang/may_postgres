@@ -1,6 +1,6 @@
+use crate::tls::PgStream;
 use bytes::{Buf, BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may::net::TcpStream;
 use postgres_protocol::message::backend;
 use postgres_protocol::message::frontend::CopyData;
 use std::io::{self, Read};
@@ -111,13 +111,13 @@ mod frame_codec {
     use super::*;
 
     pub struct Framed {
-        r_stream: TcpStream,
+        r_stream: PgStream,
         read_buf: BytesMut,
         codec: PostgresCodec,
     }
 
     impl Framed {
-        pub fn new(s: TcpStream) -> Self {
+        pub fn new(s: PgStream) -> Self {
             Framed {
                 r_stream: s,
                 read_buf: BytesMut::with_capacity(4096 * 8),
@@ -125,11 +125,11 @@ mod frame_codec {
             }
         }
 
-        pub fn inner_mut(&mut self) -> &mut TcpStream {
+        pub fn inner_mut(&mut self) -> &mut PgStream {
             &mut self.r_stream
         }
 
-        pub fn into_stream(self) -> TcpStream {
+        pub fn into_stream(self) -> PgStream {
             self.r_stream
         }
 

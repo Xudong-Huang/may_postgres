@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use may_postgres::config::{Config, TargetSessionAttrs};
+use may_postgres::config::{Config, SslMode, TargetSessionAttrs};
 
 fn check(s: &str, config: &Config) {
     assert_eq!(s.parse::<Config>().expect(s), *config, "`{}`", s);
@@ -33,6 +33,7 @@ fn settings() {
             .connect_timeout(Duration::from_secs(3))
             .keepalives(false)
             .keepalives_idle(Duration::from_secs(30))
+            .ssl_mode(SslMode::Disable)
             .target_session_attrs(TargetSessionAttrs::ReadWrite),
     );
 }
@@ -72,7 +73,8 @@ fn url() {
             .port(5432)
             .dbname("otherdb")
             .connect_timeout(Duration::from_secs(10))
-            .application_name("myapp"),
+            .application_name("myapp")
+            .ssl_mode(SslMode::Disable),
     );
     check(
         "postgresql://host1:123,host2:456/somedb?target_session_attrs=any&application_name=myapp",
@@ -121,12 +123,18 @@ fn url() {
 }
 
 #[test]
-fn unsupported_ssl_modes_are_rejected() {
-    for mode in ["prefer", "require", "verify-ca", "verify-full", "invalid"] {
+fn ssl_modes() {
+    for (mode, want) in [
+        ("disable", SslMode::Disable),
+        ("prefer", SslMode::Prefer),
+        ("require", SslMode::Require),
+        ("verify-ca", SslMode::VerifyCa),
+        ("verify-full", SslMode::VerifyFull),
+    ] {
         let url = format!("postgresql://localhost/postgres?sslmode={mode}");
-        assert!(
-            url.parse::<Config>().is_err(),
-            "TLS mode {mode} must not silently downgrade to a plaintext connection"
-        );
+        assert_eq!(url.parse::<Config>().unwrap().get_ssl_mode(), want, "{url}");
     }
+    assert!("postgresql://localhost/postgres?sslmode=invalid"
+        .parse::<Config>()
+        .is_err());
 }
