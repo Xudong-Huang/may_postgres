@@ -140,7 +140,10 @@ fn pending_query_fails_when_connection_severed_mid_flight() {
 
     // Phase 2: the client is now dead — new queries fail fast, not block.
     let client = worker.join().unwrap();
-    assert!(client.is_closed(), "client must report closed after severance");
+    assert!(
+        client.is_closed(),
+        "client must report closed after severance"
+    );
     let start = Instant::now();
     let again = client.query_one("SELECT 1", &[]);
     assert!(again.is_err(), "queries on a dead client must error");

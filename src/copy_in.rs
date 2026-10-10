@@ -53,30 +53,6 @@ impl CopyInReceiver {
             }
         }
     }
-
-    pub fn recv(&mut self) -> Result<Option<FrontendMessage>, ()> {
-        if self.done {
-            return Err(());
-        }
-
-        match self.receiver.recv() {
-            Ok(CopyInMessage::Message(message)) => Ok(Some(message)),
-            Ok(CopyInMessage::Done) => {
-                self.done = true;
-                let mut buf = BytesMut::new();
-                frontend::copy_done(&mut buf);
-                frontend::sync(&mut buf);
-                Ok(Some(FrontendMessage::Raw(buf)))
-            }
-            Err(_) => {
-                self.done = true;
-                let mut buf = BytesMut::new();
-                frontend::copy_fail("", &mut buf).unwrap();
-                frontend::sync(&mut buf);
-                Ok(Some(FrontendMessage::Raw(buf)))
-            }
-        }
-    }
 }
 
 /// A sink for `COPY ... FROM STDIN` query data.

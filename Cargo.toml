@@ -73,3 +73,7 @@ lto = true
 
 # [patch.crates-io]
 # may = { path = "../may" }
+
+[lints.rust]
+# Test code that upstream disabled on purpose (no unix-socket support in this port; a geo-types version never added).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(unix_nosupport)", "cfg(feature, values(\"with-geo-0_10\"))"] }
