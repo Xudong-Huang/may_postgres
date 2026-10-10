@@ -4,3 +4,6 @@ Cargo.lock
 .idea
 *.iml
 .vscode
+
+# NFS silly-rename leftovers
+.nfs*
