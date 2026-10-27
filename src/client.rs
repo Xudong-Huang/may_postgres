@@ -192,26 +192,57 @@ impl Client {
     /// so `LISTEN` could be issued but nothing could ever be observed.
     ///
     /// The queue is unbounded and is only drained by the caller, so a client
-    /// that issues `LISTEN` and never reads will grow it without limit. Poll it
-    /// as part of the same loop that does the work:
+    /// that issues `LISTEN` and never reads will grow it without limit. The
+    /// connection fills it as notifications arrive, without any request from
+    /// the client; to wait for the next one rather than poll, use
+    /// [`Client::next_notification`].
+    #[inline]
+    pub fn notifications(&self) -> &may::queue::mpsc::Queue<Notification> {
+        self.inner.sender.notifications().queue()
+    }
+
+    /// Wait up to `timeout` for the next notification.
+    ///
+    /// Returns as soon as one is queued (or immediately if one already is),
+    /// parking the coroutine (or thread) in the meantime, so a `LISTEN`
+    /// consumer needs no polling interval. Returns `None` when `timeout`
+    /// passes with nothing delivered, or when the connection has closed and
+    /// nothing is left in the queue.
     ///
     /// ```no_run
     /// # fn main() -> Result<(), may_postgres::Error> {
+    /// # use std::time::Duration;
     /// let client = may_postgres::connect("host=localhost user=postgres")?;
     /// client.batch_execute("LISTEN my_channel")?;
     ///
-    /// loop {
-    ///     // Any round trip lets the connection surface pending notifications.
-    ///     client.batch_execute("SELECT 1")?;
-    ///     while let Some(notification) = client.notifications().pop() {
-    ///         println!("{}: {}", notification.channel(), notification.payload());
+    /// while !client.is_closed() {
+    ///     if let Some(n) = client.next_notification(Duration::from_secs(1)) {
+    ///         println!("{}: {}", n.channel(), n.payload());
     ///     }
     /// }
+    /// # Ok(())
     /// # }
     /// ```
-    #[inline]
-    pub fn notifications(&self) -> &may::queue::mpsc::Queue<Notification> {
-        self.inner.sender.notifications()
+    pub fn next_notification(&self, timeout: std::time::Duration) -> Option<Notification> {
+        let notifications = self.inner.sender.notifications();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(n) = notifications.queue().pop() {
+                return Some(n);
+            }
+            if self.is_closed() {
+                // Pass the wake-up on, so every waiter on this connection
+                // returns rather than one of them.
+                notifications.ready().post();
+                return notifications.queue().pop();
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() || !notifications.ready().wait_timeout(left) {
+                return notifications.queue().pop();
+            }
+            // A permit can outnumber queued notifications when the queue was
+            // also drained with `notifications().pop()`; loop and re-check.
+        }
     }
 
     pub(crate) fn new(sender: Connection, process_id: i32, secret_key: i32) -> Client {
