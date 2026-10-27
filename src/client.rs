@@ -237,7 +237,14 @@ impl Client {
                 return notifications.queue().pop();
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() || !notifications.ready().wait_timeout(left) {
+            if left.is_zero() {
+                return notifications.queue().pop();
+            }
+            // may keeps park timeouts in whole milliseconds, and releases up to
+            // 0.3.51 truncate anything shorter to "no timeout" (the wait would
+            // never return): never ask it for less than 1 ms.
+            let left = left.max(std::time::Duration::from_millis(1));
+            if !notifications.ready().wait_timeout(left) {
                 return notifications.queue().pop();
             }
             // A permit can outnumber queued notifications when the queue was
