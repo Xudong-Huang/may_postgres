@@ -713,6 +713,27 @@ fn next_notification_returns_queued_notifications_first_and_times_out_empty() {
 }
 
 #[test]
+fn next_notification_returns_for_sub_millisecond_timeouts() {
+    // In a coroutine, so the wait parks on may's timer; a remaining time under
+    // 1 ms must not turn into "no timeout".
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _waiter = may::go!(move || {
+        let client = connect("user=postgres");
+        client.batch_execute("LISTEN test_short_wait").unwrap();
+        for us in [1u64, 100, 500, 999, 1500] {
+            assert!(client
+                .next_notification(std::time::Duration::from_micros(us))
+                .is_none());
+        }
+        tx.send(()).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+        "a sub-millisecond wait did not return"
+    );
+}
+
+#[test]
 fn next_notification_returns_when_the_connection_closes() {
     let client = connect("user=postgres");
     client.batch_execute("LISTEN test_closed").unwrap();
