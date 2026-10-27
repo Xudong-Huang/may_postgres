@@ -787,3 +787,24 @@ fn query_opt() {
         .unwrap();
     client.query_one("SELECT * FROM foo", &[]).err().unwrap();
 }
+
+#[test]
+fn is_closed_reports_a_terminated_connection() {
+    let client = connect("user=postgres");
+    assert!(!client.is_closed());
+    let pid: i32 = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+
+    let admin = connect("user=postgres");
+    admin
+        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !client.is_closed() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(client.is_closed());
+}
