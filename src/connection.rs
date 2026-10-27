@@ -11,7 +11,7 @@ use postgres_protocol::message::frontend;
 
 use crate::codec::{BackendMessage, BackendMessages, FrontendMessage};
 use crate::copy_in::CopyInReceiver;
-use crate::Error;
+use crate::{Error, Notification};
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -71,6 +71,9 @@ pub struct Response {
 pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
     req_queue: Arc<Queue<Request>>,
+    /// Asynchronous notifications delivered by the server, filled by the
+    /// connection coroutine and drained by the client.
+    notifications: Arc<Queue<Notification>>,
     waker: WaitIoWaker,
     id: usize,
 }
@@ -136,6 +139,7 @@ fn decode_messages(
     read_buf: &mut BytesMut,
     rsp_queue: &mut VecDeque<Response>,
     parameters: &mut HashMap<String, String>,
+    notifications: &Queue<Notification>,
 ) -> Result<(), Error> {
     use crate::codec::PostgresCodec;
 
@@ -162,7 +166,13 @@ fn decode_messages(
                 }
             }
             BackendMessage::Async(Message::NoticeResponse(_body)) => {}
-            BackendMessage::Async(Message::NotificationResponse(_body)) => {}
+            BackendMessage::Async(Message::NotificationResponse(body)) => {
+                notifications.push(Notification {
+                    process_id: body.process_id(),
+                    channel: body.channel().map_err(Error::parse)?.to_string(),
+                    payload: body.message().map_err(Error::parse)?.to_string(),
+                });
+            }
             BackendMessage::Async(Message::ParameterStatus(body)) => {
                 parameters.insert(
                     body.name().map_err(Error::parse)?.to_string(),
@@ -232,6 +242,7 @@ fn connection_loop(
     stream: &mut TcpStream,
     req_queue: Arc<Queue<Request>>,
     mut params: HashMap<String, String>,
+    notifications: Arc<Queue<Notification>>,
 ) -> Result<(), Error> {
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
@@ -247,7 +258,7 @@ fn connection_loop(
         let mut read_blocked = true;
         if io_events & 1 != 0 {
             read_blocked = nonblock_read(inner_stream, &mut read_buf).map_err(Error::io)?;
-            decode_messages(&mut read_buf, &mut rsp_queue, &mut params)?;
+            decode_messages(&mut read_buf, &mut rsp_queue, &mut params, &notifications)?;
         }
 
         io_events = if read_blocked { stream.wait_io() } else { 1 }
@@ -262,8 +273,12 @@ impl Connection {
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
+        let notifications = Arc::new(Queue::new());
+        let notifications_dup = notifications.clone();
         let io_handle = go!(move || {
-            if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters) {
+            if let Err(e) =
+                connection_loop(&mut stream, req_queue_dup, parameters, notifications_dup)
+            {
                 log::error!("connection error = {:?}", e);
                 terminate_connection(&mut stream);
             }
@@ -272,6 +287,7 @@ impl Connection {
         Connection {
             io_handle,
             req_queue,
+            notifications,
             waker,
             id,
         }
@@ -287,5 +303,13 @@ impl Connection {
     #[inline]
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    /// Asynchronous notifications received from the server.
+    ///
+    /// Populated by `LISTEN`; see [`crate::Client::notifications`].
+    #[inline]
+    pub fn notifications(&self) -> &Queue<Notification> {
+        &self.notifications
     }
 }
