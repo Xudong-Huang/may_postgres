@@ -5,7 +5,7 @@ use may::coroutine::JoinHandle;
 use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::queue::mpsc::Queue;
-use may::sync::spsc;
+use may::sync::{spsc, Semphore};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
@@ -62,6 +62,41 @@ pub struct Response {
     tx: Arc<spsc::Sender<ResponseResult>>,
 }
 
+/// Asynchronous notifications delivered by the server: a queue the connection
+/// coroutine fills and the client drains, plus a count of pushes a consumer can
+/// park on instead of polling the queue.
+pub(crate) struct Notifications {
+    queue: Queue<Notification>,
+    ready: Semphore,
+}
+
+impl Notifications {
+    fn new() -> Self {
+        Notifications {
+            queue: Queue::new(),
+            ready: Semphore::new(0),
+        }
+    }
+
+    fn push(&self, notification: Notification) {
+        self.queue.push(notification);
+        self.ready.post();
+    }
+
+    /// Wake a consumer without a notification (the connection closed).
+    fn wake(&self) {
+        self.ready.post();
+    }
+
+    pub(crate) fn queue(&self) -> &Queue<Notification> {
+        &self.queue
+    }
+
+    pub(crate) fn ready(&self) -> &Semphore {
+        &self.ready
+    }
+}
+
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
     /// Held only to keep the io coroutine owned; dropping it DETACHES. The
@@ -72,7 +107,7 @@ pub(crate) struct Connection {
     req_queue: Arc<Queue<Request>>,
     /// Asynchronous notifications delivered by the server, filled by the
     /// connection coroutine and drained by the client.
-    notifications: Arc<Queue<Notification>>,
+    notifications: Arc<Notifications>,
     waker: Arc<WaitIoWaker>,
     /// Cooperative shutdown: `drop` sets this and wakes the coroutine; the
     /// connection loop polls it and exits on its own stack, closing its own
@@ -176,7 +211,7 @@ fn decode_messages(
     read_buf: &mut BytesMut,
     rsp_queue: &mut VecDeque<Response>,
     parameters: &mut HashMap<String, String>,
-    notifications: &Queue<Notification>,
+    notifications: &Notifications,
 ) -> Result<(), Error> {
     use crate::codec::PostgresCodec;
 
@@ -320,7 +355,7 @@ fn connection_loop(
     req_queue: &Queue<Request>,
     rsp_queue: &mut VecDeque<Response>,
     mut params: HashMap<String, String>,
-    notifications: Arc<Queue<Notification>>,
+    notifications: Arc<Notifications>,
     shutdown: &AtomicBool,
 ) -> Result<(), Error> {
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
@@ -373,8 +408,9 @@ impl Connection {
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
-        let notifications = Arc::new(Queue::new());
+        let notifications = Arc::new(Notifications::new());
         let notifications_dup = notifications.clone();
+        let notifications_exit = notifications.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_dup = shutdown.clone();
         let dead = Arc::new(AtomicBool::new(false));
@@ -430,6 +466,9 @@ impl Connection {
                     let _g = drain_lock_dup.lock();
                     fail_queued_requests(&req_queue_dup);
                 }
+                // A consumer parked waiting for a notification would otherwise
+                // wait out its timeout on a connection that will never deliver.
+                notifications_exit.wake();
                 // Send the protocol Terminate and close the socket, on this
                 // coroutine's own stack. This is what releases the server backend
                 // the moment the client goes away, instead of at process exit.
@@ -487,7 +526,7 @@ impl Connection {
     ///
     /// Populated by `LISTEN`; see [`crate::Client::notifications`].
     #[inline]
-    pub fn notifications(&self) -> &Queue<Notification> {
+    pub fn notifications(&self) -> &Notifications {
         &self.notifications
     }
 
