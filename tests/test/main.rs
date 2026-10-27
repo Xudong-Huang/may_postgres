@@ -556,37 +556,114 @@ fn copy_out() {
 //     );
 // }
 
-// #[test]
-// fn notifications() {
-//     let (mut client, mut connection) = connect_raw("user=postgres").unwrap();
+#[test]
+fn notifications_are_delivered_to_a_listening_client() {
+    let client = connect("user=postgres");
 
-//     let (tx, rx) = mpsc::unbounded();
-//     let stream = stream::poll_fn(move |cx| connection.poll_message(cx)).map_err(|e| panic!(e));
-//     let connection = stream.forward(tx).map(|r| r.unwrap());
-//     tokio::spawn(connection);
+    client.batch_execute("LISTEN test_notifications").unwrap();
+    assert!(
+        client.notifications().pop().is_none(),
+        "nothing has been raised yet"
+    );
 
-//     client
-//         .batch_execute(
-//             "LISTEN test_notifications;
-//              NOTIFY test_notifications, 'hello';
-//              NOTIFY test_notifications, 'world';",
-//         )
-//         .unwrap();
+    // Raised from a second session, which is the shape that matters: one
+    // connection writes, another reacts.
+    let notifier = connect("user=postgres");
+    notifier
+        .batch_execute("NOTIFY test_notifications, 'hello'")
+        .unwrap();
 
-//     drop(client);
+    let notification =
+        wait_for_notification(&client).expect("a LISTENing client should receive the notification");
 
-//     let notifications = rx
-//         .filter_map(|m| match m {
-//             AsyncMessage::Notification(n) => future::ready(Some(n)),
-//             _ => future::ready(None),
-//         })
-//         .collect::<Vec<_>>();
-//     assert_eq!(notifications.len(), 2);
-//     assert_eq!(notifications[0].channel(), "test_notifications");
-//     assert_eq!(notifications[0].payload(), "hello");
-//     assert_eq!(notifications[1].channel(), "test_notifications");
-//     assert_eq!(notifications[1].payload(), "world");
-// }
+    assert_eq!(notification.channel(), "test_notifications");
+    assert_eq!(notification.payload(), "hello");
+    assert_ne!(
+        notification.process_id(),
+        0,
+        "the notifying backend pid should be reported"
+    );
+}
+
+#[test]
+fn notifications_preserve_order_and_payloads() {
+    let client = connect("user=postgres");
+    client.batch_execute("LISTEN test_ordering").unwrap();
+
+    let notifier = connect("user=postgres");
+    notifier
+        .batch_execute(
+            "NOTIFY test_ordering, 'first';
+             NOTIFY test_ordering, 'second';
+             NOTIFY test_ordering, 'third';",
+        )
+        .unwrap();
+
+    let mut payloads = Vec::new();
+    for _ in 0..3 {
+        let n = wait_for_notification(&client).expect("all three should arrive");
+        payloads.push(n.payload().to_string());
+    }
+
+    // A queue that reordered or coalesced messages would be worse than useless
+    // for change-data-capture, where each row event must be seen exactly once.
+    assert_eq!(payloads, vec!["first", "second", "third"]);
+}
+
+#[test]
+fn only_subscribed_channels_are_queued() {
+    let client = connect("user=postgres");
+    client.batch_execute("LISTEN wanted_channel").unwrap();
+
+    let notifier = connect("user=postgres");
+    notifier
+        .batch_execute(
+            "NOTIFY unwanted_channel, 'ignored';
+             NOTIFY wanted_channel, 'kept';",
+        )
+        .unwrap();
+
+    let notification =
+        wait_for_notification(&client).expect("the subscribed channel should arrive");
+    assert_eq!(notification.channel(), "wanted_channel");
+    assert_eq!(notification.payload(), "kept");
+    assert!(
+        client.notifications().pop().is_none(),
+        "a channel we never subscribed to must not be queued"
+    );
+}
+
+#[test]
+fn a_client_that_never_listens_receives_nothing() {
+    let client = connect("user=postgres");
+
+    let notifier = connect("user=postgres");
+    notifier
+        .batch_execute("NOTIFY some_channel, 'nobody is listening'")
+        .unwrap();
+
+    client.batch_execute("SELECT 1").unwrap();
+    assert!(
+        client.notifications().pop().is_none(),
+        "without LISTEN there is nothing to deliver"
+    );
+}
+
+/// Poll for a notification, giving the connection round trips to surface it.
+///
+/// Notifications arrive asynchronously: the server sends them when it chooses,
+/// and the connection coroutine decodes them during I/O. A test that read the
+/// queue once, immediately, would race and pass or fail at random.
+fn wait_for_notification(client: &Client) -> Option<may_postgres::Notification> {
+    for _ in 0..50 {
+        if let Some(notification) = client.notifications().pop() {
+            return Some(notification);
+        }
+        client.batch_execute("SELECT 1").unwrap();
+        may::coroutine::sleep(std::time::Duration::from_millis(20));
+    }
+    None
+}
 
 #[test]
 fn query_portal() {
@@ -709,4 +786,137 @@ fn query_opt() {
         .unwrap()
         .unwrap();
     client.query_one("SELECT * FROM foo", &[]).err().unwrap();
+}
+
+#[test]
+fn is_closed_reports_a_terminated_connection() {
+    let client = connect("user=postgres");
+    assert!(!client.is_closed());
+    let pid: i32 = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+
+    let admin = connect("user=postgres");
+    admin
+        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !client.is_closed() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(client.is_closed());
+}
+
+#[test]
+fn next_notification_wakes_a_waiting_client_without_polling() {
+    let client = connect("user=postgres");
+    client.batch_execute("LISTEN test_wakeup").unwrap();
+
+    // Raise the notification from another coroutine after the waiter is parked;
+    // the waiter issues no request in the meantime, so only the connection's
+    // own read can deliver it.
+    let notify = may::go!(|| {
+        may::coroutine::sleep(std::time::Duration::from_millis(200));
+        let notifier = connect("user=postgres");
+        notifier
+            .batch_execute("NOTIFY test_wakeup, 'woken'")
+            .unwrap();
+    });
+
+    let started = std::time::Instant::now();
+    let n = client
+        .next_notification(std::time::Duration::from_secs(10))
+        .expect("the notification should wake the waiter");
+    let waited = started.elapsed();
+    notify.join().unwrap();
+
+    assert_eq!(n.payload(), "woken");
+    assert!(
+        waited >= std::time::Duration::from_millis(150),
+        "returned before the notification was raised: {waited:?}"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(5),
+        "the waiter must wake on arrival, not at its timeout: {waited:?}"
+    );
+}
+
+#[test]
+fn next_notification_returns_queued_notifications_first_and_times_out_empty() {
+    let client = connect("user=postgres");
+    client.batch_execute("LISTEN test_queued").unwrap();
+    let notifier = connect("user=postgres");
+    notifier
+        .batch_execute("NOTIFY test_queued, 'a'; NOTIFY test_queued, 'b';")
+        .unwrap();
+
+    let a = client
+        .next_notification(std::time::Duration::from_secs(5))
+        .expect("first");
+    let b = client
+        .next_notification(std::time::Duration::from_secs(5))
+        .expect("second");
+    assert_eq!((a.payload(), b.payload()), ("a", "b"));
+
+    let started = std::time::Instant::now();
+    assert!(client
+        .next_notification(std::time::Duration::from_millis(100))
+        .is_none());
+    let waited = started.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(90)
+            && waited < std::time::Duration::from_secs(2),
+        "an empty wait lasts about its timeout: {waited:?}"
+    );
+}
+
+#[test]
+fn next_notification_returns_when_the_connection_closes() {
+    let client = connect("user=postgres");
+    client.batch_execute("LISTEN test_closed").unwrap();
+    let pid: i32 = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+
+    let killer = may::go!(move || {
+        may::coroutine::sleep(std::time::Duration::from_millis(200));
+        let admin = connect("user=postgres");
+        admin
+            .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+            .unwrap();
+    });
+
+    let started = std::time::Instant::now();
+    assert!(client
+        .next_notification(std::time::Duration::from_secs(10))
+        .is_none());
+    killer.join().unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "a closed connection must release the waiter, not hold it to its timeout"
+    );
+    assert!(client.is_closed());
+}
+
+#[test]
+fn next_notification_returns_for_sub_millisecond_timeouts() {
+    // In a coroutine, so the wait parks on may's timer.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _waiter = may::go!(move || {
+        let client = connect("user=postgres");
+        client.batch_execute("LISTEN test_short_wait").unwrap();
+        for us in [1u64, 100, 500, 999, 1500] {
+            assert!(client
+                .next_notification(std::time::Duration::from_micros(us))
+                .is_none());
+        }
+        tx.send(()).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+        "a sub-millisecond wait did not return"
+    );
 }

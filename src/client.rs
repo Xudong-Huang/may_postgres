@@ -7,8 +7,8 @@ use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
 use crate::types::{Oid, ToSql, Type};
 use crate::{
-    copy_in, copy_out, prepare, query, simple_query, CancelToken, CopyInSink, Error, Row,
-    SimpleQueryMessage, Statement, ToStatement, Transaction, TransactionBuilder,
+    copy_in, copy_out, prepare, query, simple_query, CancelToken, CopyInSink, Error, Notification,
+    Row, SimpleQueryMessage, Statement, ToStatement, Transaction, TransactionBuilder,
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
@@ -174,6 +174,85 @@ impl Clone for Client {
 }
 
 impl Client {
+    /// Asynchronous notifications delivered by the server.
+    ///
+    /// A connection receives notifications after subscribing with `LISTEN`;
+    /// another session raises them with `NOTIFY` or `pg_notify()`. The
+    /// connection coroutine queues each one as it arrives, and the caller
+    /// drains the queue.
+    ///
+    /// The queue is unbounded and is only drained by the caller, so a client
+    /// that issues `LISTEN` and never reads will grow it without limit. To wait
+    /// for the next notification rather than poll, use
+    /// [`Client::next_notification`].
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), may_postgres::Error> {
+    /// let client = may_postgres::connect("host=localhost user=postgres")?;
+    /// client.batch_execute("LISTEN my_channel")?;
+    ///
+    /// while let Some(notification) = client.notifications().pop() {
+    ///     println!("{}: {}", notification.channel(), notification.payload());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn notifications(&self) -> &may::queue::mpsc::Queue<Notification> {
+        self.inner.sender.notifications().queue()
+    }
+
+    /// Wait up to `timeout` for the next notification.
+    ///
+    /// Returns as soon as one is queued (or immediately if one already is),
+    /// parking the coroutine (or thread) in the meantime, so a `LISTEN`
+    /// consumer needs no polling interval. Returns `None` when `timeout`
+    /// passes with nothing delivered, or when the connection has closed and
+    /// nothing is left in the queue.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), may_postgres::Error> {
+    /// # use std::time::Duration;
+    /// let client = may_postgres::connect("host=localhost user=postgres")?;
+    /// client.batch_execute("LISTEN my_channel")?;
+    ///
+    /// while !client.is_closed() {
+    ///     if let Some(n) = client.next_notification(Duration::from_secs(1)) {
+    ///         println!("{}: {}", n.channel(), n.payload());
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn next_notification(&self, timeout: std::time::Duration) -> Option<Notification> {
+        let notifications = self.inner.sender.notifications();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(n) = notifications.queue().pop() {
+                return Some(n);
+            }
+            if self.is_closed() {
+                // Pass the wake-up on, so every waiter on this connection
+                // returns rather than one of them.
+                notifications.ready().post();
+                return notifications.queue().pop();
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return notifications.queue().pop();
+            }
+            // may keeps park timeouts in whole milliseconds and, up to 0.3.51,
+            // truncates a shorter one to "no timeout", so a wait under 1 ms
+            // would never return: never ask for less than 1 ms.
+            let left = left.max(std::time::Duration::from_millis(1));
+            if !notifications.ready().wait_timeout(left) {
+                return notifications.queue().pop();
+            }
+            // A permit can outnumber queued notifications when the queue was
+            // also drained with `notifications()`; loop and re-check.
+        }
+    }
+
     pub(crate) fn new(sender: Connection, process_id: i32, secret_key: i32) -> Client {
         let co_ch = {
             let (tx, rx) = spsc::channel();
@@ -478,9 +557,8 @@ impl Client {
     /// Determines if the connection to the server has already closed.
     ///
     /// In that case, all future queries will fail.
-    pub fn _is_closed(&self) -> bool {
-        // self.inner.sender.is_closed()
-        unimplemented!()
+    pub fn is_closed(&self) -> bool {
+        self.inner.sender.is_closed()
     }
 
     #[inline]

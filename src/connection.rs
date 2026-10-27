@@ -5,17 +5,18 @@ use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
 use may::queue::mpsc::Queue;
-use may::sync::spsc;
+use may::sync::{spsc, Semphore};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
 use crate::codec::{BackendMessage, BackendMessages, FrontendMessage};
 use crate::copy_in::CopyInReceiver;
-use crate::Error;
+use crate::{Error, Notification};
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const IO_BUF_SIZE: usize = 4096 * 2;
@@ -67,10 +68,50 @@ pub struct Response {
     tx: RefOrValue<'static, spsc::Sender<BackendMessages>>,
 }
 
+/// Asynchronous notifications delivered by the server: a queue the connection
+/// coroutine fills and the client drains, and a count of pushes a consumer can
+/// park on instead of polling the queue.
+pub(crate) struct Notifications {
+    queue: Queue<Notification>,
+    ready: Semphore,
+}
+
+impl Notifications {
+    fn new() -> Self {
+        Notifications {
+            queue: Queue::new(),
+            ready: Semphore::new(0),
+        }
+    }
+
+    fn push(&self, notification: Notification) {
+        self.queue.push(notification);
+        self.ready.post();
+    }
+
+    /// Wake a consumer without a notification (the connection closed).
+    fn wake(&self) {
+        self.ready.post();
+    }
+
+    pub(crate) fn queue(&self) -> &Queue<Notification> {
+        &self.queue
+    }
+
+    pub(crate) fn ready(&self) -> &Semphore {
+        &self.ready
+    }
+}
+
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
     req_queue: Arc<Queue<Request>>,
+    /// Asynchronous notifications delivered by the server, filled by the
+    /// connection coroutine and drained by the client.
+    notifications: Arc<Notifications>,
+    /// Set by the connection coroutine when its loop exits.
+    closed: Arc<AtomicBool>,
     waker: WaitIoWaker,
     id: usize,
 }
@@ -136,6 +177,7 @@ fn decode_messages(
     read_buf: &mut BytesMut,
     rsp_queue: &mut VecDeque<Response>,
     parameters: &mut HashMap<String, String>,
+    notifications: &Notifications,
 ) -> Result<(), Error> {
     use crate::codec::PostgresCodec;
 
@@ -162,7 +204,13 @@ fn decode_messages(
                 }
             }
             BackendMessage::Async(Message::NoticeResponse(_body)) => {}
-            BackendMessage::Async(Message::NotificationResponse(_body)) => {}
+            BackendMessage::Async(Message::NotificationResponse(body)) => {
+                notifications.push(Notification {
+                    process_id: body.process_id(),
+                    channel: body.channel().map_err(Error::parse)?.to_string(),
+                    payload: body.message().map_err(Error::parse)?.to_string(),
+                });
+            }
             BackendMessage::Async(Message::ParameterStatus(body)) => {
                 parameters.insert(
                     body.name().map_err(Error::parse)?.to_string(),
@@ -232,6 +280,7 @@ fn connection_loop(
     stream: &mut TcpStream,
     req_queue: Arc<Queue<Request>>,
     mut params: HashMap<String, String>,
+    notifications: Arc<Notifications>,
 ) -> Result<(), Error> {
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
@@ -247,7 +296,7 @@ fn connection_loop(
         let mut read_blocked = true;
         if io_events & 1 != 0 {
             read_blocked = nonblock_read(inner_stream, &mut read_buf).map_err(Error::io)?;
-            decode_messages(&mut read_buf, &mut rsp_queue, &mut params)?;
+            decode_messages(&mut read_buf, &mut rsp_queue, &mut params, &notifications)?;
         }
 
         io_events = if read_blocked { stream.wait_io() } else { 1 }
@@ -262,16 +311,27 @@ impl Connection {
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
+        let notifications = Arc::new(Notifications::new());
+        let notifications_dup = notifications.clone();
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_dup = closed.clone();
         let io_handle = go!(move || {
-            if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters) {
+            let waiters = notifications_dup.clone();
+            if let Err(e) =
+                connection_loop(&mut stream, req_queue_dup, parameters, notifications_dup)
+            {
                 log::error!("connection error = {:?}", e);
                 terminate_connection(&mut stream);
             }
+            closed_dup.store(true, Ordering::Release);
+            waiters.wake();
         });
 
         Connection {
             io_handle,
             req_queue,
+            notifications,
+            closed,
             waker,
             id,
         }
@@ -287,5 +347,20 @@ impl Connection {
     #[inline]
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    /// Asynchronous notifications received from the server.
+    ///
+    /// Populated by `LISTEN`; see [`crate::Client::notifications`].
+    #[inline]
+    pub(crate) fn notifications(&self) -> &Notifications {
+        &self.notifications
+    }
+
+    /// Whether the connection coroutine has exited: the connection failed or
+    /// the server closed it, so no request can complete any more.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 }
