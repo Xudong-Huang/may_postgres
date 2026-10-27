@@ -808,3 +808,115 @@ fn is_closed_reports_a_terminated_connection() {
     }
     assert!(client.is_closed());
 }
+
+#[test]
+fn next_notification_wakes_a_waiting_client_without_polling() {
+    let client = connect("user=postgres");
+    client.batch_execute("LISTEN test_wakeup").unwrap();
+
+    // Raise the notification from another coroutine after the waiter is parked;
+    // the waiter issues no request in the meantime, so only the connection's
+    // own read can deliver it.
+    let notify = may::go!(|| {
+        may::coroutine::sleep(std::time::Duration::from_millis(200));
+        let notifier = connect("user=postgres");
+        notifier
+            .batch_execute("NOTIFY test_wakeup, 'woken'")
+            .unwrap();
+    });
+
+    let started = std::time::Instant::now();
+    let n = client
+        .next_notification(std::time::Duration::from_secs(10))
+        .expect("the notification should wake the waiter");
+    let waited = started.elapsed();
+    notify.join().unwrap();
+
+    assert_eq!(n.payload(), "woken");
+    assert!(
+        waited >= std::time::Duration::from_millis(150),
+        "returned before the notification was raised: {waited:?}"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(5),
+        "the waiter must wake on arrival, not at its timeout: {waited:?}"
+    );
+}
+
+#[test]
+fn next_notification_returns_queued_notifications_first_and_times_out_empty() {
+    let client = connect("user=postgres");
+    client.batch_execute("LISTEN test_queued").unwrap();
+    let notifier = connect("user=postgres");
+    notifier
+        .batch_execute("NOTIFY test_queued, 'a'; NOTIFY test_queued, 'b';")
+        .unwrap();
+
+    let a = client
+        .next_notification(std::time::Duration::from_secs(5))
+        .expect("first");
+    let b = client
+        .next_notification(std::time::Duration::from_secs(5))
+        .expect("second");
+    assert_eq!((a.payload(), b.payload()), ("a", "b"));
+
+    let started = std::time::Instant::now();
+    assert!(client
+        .next_notification(std::time::Duration::from_millis(100))
+        .is_none());
+    let waited = started.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(90)
+            && waited < std::time::Duration::from_secs(2),
+        "an empty wait lasts about its timeout: {waited:?}"
+    );
+}
+
+#[test]
+fn next_notification_returns_when_the_connection_closes() {
+    let client = connect("user=postgres");
+    client.batch_execute("LISTEN test_closed").unwrap();
+    let pid: i32 = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+
+    let killer = may::go!(move || {
+        may::coroutine::sleep(std::time::Duration::from_millis(200));
+        let admin = connect("user=postgres");
+        admin
+            .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+            .unwrap();
+    });
+
+    let started = std::time::Instant::now();
+    assert!(client
+        .next_notification(std::time::Duration::from_secs(10))
+        .is_none());
+    killer.join().unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "a closed connection must release the waiter, not hold it to its timeout"
+    );
+    assert!(client.is_closed());
+}
+
+#[test]
+fn next_notification_returns_for_sub_millisecond_timeouts() {
+    // In a coroutine, so the wait parks on may's timer.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _waiter = may::go!(move || {
+        let client = connect("user=postgres");
+        client.batch_execute("LISTEN test_short_wait").unwrap();
+        for us in [1u64, 100, 500, 999, 1500] {
+            assert!(client
+                .next_notification(std::time::Duration::from_micros(us))
+                .is_none());
+        }
+        tx.send(()).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+        "a sub-millisecond wait did not return"
+    );
+}
