@@ -16,6 +16,7 @@ use crate::Error;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const IO_BUF_SIZE: usize = 4096 * 2;
@@ -71,6 +72,8 @@ pub struct Response {
 pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
     req_queue: Arc<Queue<Request>>,
+    /// Set by the connection coroutine when its loop exits.
+    closed: Arc<AtomicBool>,
     waker: WaitIoWaker,
     id: usize,
 }
@@ -262,16 +265,20 @@ impl Connection {
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_dup = closed.clone();
         let io_handle = go!(move || {
             if let Err(e) = connection_loop(&mut stream, req_queue_dup, parameters) {
                 log::error!("connection error = {:?}", e);
                 terminate_connection(&mut stream);
             }
+            closed_dup.store(true, Ordering::Release);
         });
 
         Connection {
             io_handle,
             req_queue,
+            closed,
             waker,
             id,
         }
@@ -287,5 +294,12 @@ impl Connection {
     #[inline]
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    /// Whether the connection coroutine has exited: the connection failed or
+    /// the server closed it, so no request can complete any more.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 }
