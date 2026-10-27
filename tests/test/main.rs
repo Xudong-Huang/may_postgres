@@ -628,6 +628,54 @@ fn query_portal() {
 }
 
 #[test]
+fn row_stream_reports_rows_affected() {
+    let client = connect("user=postgres");
+    client
+        .batch_execute(
+            "CREATE TEMPORARY TABLE rows_affected_test (id INT PRIMARY KEY, n INT);
+             INSERT INTO rows_affected_test VALUES (1, 0), (2, 0), (3, 0);",
+        )
+        .unwrap();
+
+    // A write without RETURNING: no rows, but a count, as `execute` reports.
+    let stmt = client
+        .prepare("UPDATE rows_affected_test SET n = n + 1 WHERE id <= $1")
+        .unwrap();
+    let mut stream = client.query_raw(&stmt, &[&2i32]).unwrap();
+    assert_eq!(
+        stream.rows_affected(),
+        None,
+        "unknown until the stream ends"
+    );
+    assert!(stream.next().is_none());
+    assert_eq!(stream.rows_affected(), Some(2));
+
+    // With RETURNING: the rows and the count.
+    let stmt = client
+        .prepare("UPDATE rows_affected_test SET n = n + 1 RETURNING id")
+        .unwrap();
+    let mut stream = client.query_raw(&stmt, &[]).unwrap();
+    let rows = stream.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(stream.rows_affected(), Some(3));
+
+    // Pipelined: both statements are sent before either is read, and each
+    // stream reports its own count.
+    let insert = client
+        .prepare("INSERT INTO rows_affected_test VALUES ($1, 0)")
+        .unwrap();
+    let delete = client
+        .prepare("DELETE FROM rows_affected_test WHERE id <= $1")
+        .unwrap();
+    let mut a = client.query_raw(&insert, &[&10i32]).unwrap();
+    let mut b = client.query_raw(&delete, &[&3i32]).unwrap();
+    assert!(a.next().is_none());
+    assert!(b.next().is_none());
+    assert_eq!(a.rows_affected(), Some(1));
+    assert_eq!(b.rows_affected(), Some(3));
+}
+
+#[test]
 fn check_send() {
     fn is_send<T: Send>(_: &T) {}
 
