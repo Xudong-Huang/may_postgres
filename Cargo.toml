@@ -48,6 +48,8 @@ fallible-iterator = "0.2"
 postgres-protocol = "0.6"
 
 may = { version = "0.3", default-features = false }
+# TCP keepalive idle / interval / retry count (std exposes none of them).
+socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
 env_logger = "0.11"

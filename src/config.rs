@@ -60,9 +60,15 @@ pub(crate) enum Host {
 /// * `connect_timeout` - The time limit in seconds applied to each socket-level connection attempt. Note that hostnames
 ///   can resolve to multiple IP addresses, and this limit is applied to each address. Defaults to no timeout.
 /// * `keepalives` - Controls the use of TCP keepalive. A value of 0 disables keepalive and nonzero integers enable it.
-///   This option is ignored when connecting with Unix sockets. Defaults to on.
+///   Defaults to off.
 /// * `keepalives_idle` - The number of seconds of inactivity after which a keepalive message is sent to the server.
-///   This option is ignored when connecting with Unix sockets. Defaults to 2 hours.
+///   Defaults to 2 hours.
+/// * `keepalives_interval` - The number of seconds between keepalive probes. Defaults to the operating system's value.
+/// * `keepalives_retries` - The number of unanswered keepalive probes after which the connection is dropped.
+///   Defaults to the operating system's value.
+/// * `tcp_nodelay` - Controls `TCP_NODELAY` (0 off, nonzero on). With it off, a small write waits for earlier data
+///   to be acknowledged before it is sent (Nagle's algorithm), which costs a round trip when requests are
+///   pipelined. Defaults to off.
 /// * `target_session_attrs` - Specifies requirements of the session. If set to `read-write`, the client will check that
 ///   the `transaction_read_write` session parameter is set to `on`. This can be used to connect to the primary server
 ///   in a database cluster as opposed to the secondary read-only mirrors. Defaults to `all`.
@@ -120,6 +126,9 @@ pub struct Config {
     pub(crate) connect_timeout: Option<Duration>,
     pub(crate) keepalives: bool,
     pub(crate) keepalives_idle: Duration,
+    pub(crate) keepalives_interval: Option<Duration>,
+    pub(crate) keepalives_retries: Option<u32>,
+    pub(crate) tcp_nodelay: bool,
     pub(crate) target_session_attrs: TargetSessionAttrs,
 }
 
@@ -141,8 +150,11 @@ impl Config {
             host: vec![],
             port: vec![],
             connect_timeout: None,
-            keepalives: true,
+            keepalives: false,
             keepalives_idle: Duration::from_secs(2 * 60 * 60),
+            keepalives_interval: None,
+            keepalives_retries: None,
+            tcp_nodelay: false,
             target_session_attrs: TargetSessionAttrs::Any,
         }
     }
@@ -232,20 +244,83 @@ impl Config {
         self
     }
 
-    /// Controls the use of TCP keepalive.
+    /// Controls the use of TCP keepalive (`SO_KEEPALIVE`). Defaults to off.
     ///
-    /// This is ignored for Unix domain socket connections. Defaults to `true`.
+    /// Keepalive probes detect a peer that vanished without closing the connection (a half-open
+    /// socket), and keep idle connections alive through firewalls and NAT that drop idle flows.
     pub fn keepalives(&mut self, keepalives: bool) -> &mut Config {
         self.keepalives = keepalives;
         self
     }
 
+    /// Gets the setting of TCP keepalive.
+    pub fn get_keepalives(&self) -> bool {
+        self.keepalives
+    }
+
     /// Sets the amount of idle time before a keepalive packet is sent on the connection.
     ///
-    /// This is ignored for Unix domain sockets, or if the `keepalives` option is disabled. Defaults to 2 hours.
+    /// Ignored if the `keepalives` option is disabled. Defaults to 2 hours.
     pub fn keepalives_idle(&mut self, keepalives_idle: Duration) -> &mut Config {
         self.keepalives_idle = keepalives_idle;
         self
+    }
+
+    /// Gets the configured keepalive idle time.
+    pub fn get_keepalives_idle(&self) -> Duration {
+        self.keepalives_idle
+    }
+
+    /// Sets the time between keepalive probes (`TCP_KEEPINTVL`).
+    ///
+    /// Ignored if the `keepalives` option is disabled. Defaults to the operating system's value.
+    pub fn keepalives_interval(&mut self, keepalives_interval: Duration) -> &mut Config {
+        self.keepalives_interval = Some(keepalives_interval);
+        self
+    }
+
+    /// Gets the configured time between keepalive probes.
+    pub fn get_keepalives_interval(&self) -> Option<Duration> {
+        self.keepalives_interval
+    }
+
+    /// Sets the number of unanswered keepalive probes before the connection is dropped
+    /// (`TCP_KEEPCNT`).
+    ///
+    /// Ignored if the `keepalives` option is disabled. Defaults to the operating system's value.
+    pub fn keepalives_retries(&mut self, keepalives_retries: u32) -> &mut Config {
+        self.keepalives_retries = Some(keepalives_retries);
+        self
+    }
+
+    /// Gets the configured number of keepalive probes.
+    pub fn get_keepalives_retries(&self) -> Option<u32> {
+        self.keepalives_retries
+    }
+
+    /// Controls `TCP_NODELAY`. Defaults to off.
+    ///
+    /// With it off, the kernel holds a small write until earlier data is acknowledged (Nagle's
+    /// algorithm). A client that pipelines requests, or sends a request while an earlier reply is
+    /// still outstanding, then waits up to a round trip per write.
+    pub fn tcp_nodelay(&mut self, tcp_nodelay: bool) -> &mut Config {
+        self.tcp_nodelay = tcp_nodelay;
+        self
+    }
+
+    /// Gets the setting of `TCP_NODELAY`.
+    pub fn get_tcp_nodelay(&self) -> bool {
+        self.tcp_nodelay
+    }
+
+    pub(crate) fn socket_options(&self) -> crate::connect_socket::SocketOptions {
+        crate::connect_socket::SocketOptions {
+            nodelay: self.tcp_nodelay,
+            keepalives: self.keepalives,
+            keepalives_idle: self.keepalives_idle,
+            keepalives_interval: self.keepalives_interval,
+            keepalives_retries: self.keepalives_retries,
+        }
     }
 
     /// Sets the requirements of the session.
@@ -314,6 +389,26 @@ impl Config {
                 if keepalives_idle > 0 {
                     self.keepalives_idle(Duration::from_secs(keepalives_idle as u64));
                 }
+            }
+            "keepalives_interval" => {
+                let interval = value.parse::<i64>().map_err(|_| {
+                    Error::config_parse(Box::new(InvalidValue("keepalives_interval")))
+                })?;
+                if interval > 0 {
+                    self.keepalives_interval(Duration::from_secs(interval as u64));
+                }
+            }
+            "keepalives_retries" => {
+                let retries = value.parse::<u32>().map_err(|_| {
+                    Error::config_parse(Box::new(InvalidValue("keepalives_retries")))
+                })?;
+                self.keepalives_retries(retries);
+            }
+            "tcp_nodelay" => {
+                let nodelay = value
+                    .parse::<u64>()
+                    .map_err(|_| Error::config_parse(Box::new(InvalidValue("tcp_nodelay"))))?;
+                self.tcp_nodelay(nodelay != 0);
             }
             "target_session_attrs" => {
                 let target_session_attrs = match value {
@@ -385,6 +480,9 @@ impl fmt::Debug for Config {
             .field("connect_timeout", &self.connect_timeout)
             .field("keepalives", &self.keepalives)
             .field("keepalives_idle", &self.keepalives_idle)
+            .field("keepalives_interval", &self.keepalives_interval)
+            .field("keepalives_retries", &self.keepalives_retries)
+            .field("tcp_nodelay", &self.tcp_nodelay)
             .field("target_session_attrs", &self.target_session_attrs)
             .finish()
     }
@@ -758,5 +856,38 @@ impl<'a> UrlParser<'a> {
         percent_encoding::percent_decode(s.as_bytes())
             .decode_utf8()
             .map_err(|e| Error::config_parse(e.into()))
+    }
+}
+
+#[cfg(test)]
+mod socket_option_tests {
+    use super::*;
+
+    #[test]
+    fn socket_options_parse_from_the_connection_string() {
+        let c: Config =
+            "host=h keepalives=1 keepalives_idle=30 keepalives_interval=7 keepalives_retries=3 tcp_nodelay=0"
+                .parse()
+                .unwrap();
+        assert!(c.get_keepalives());
+        assert_eq!(c.get_keepalives_idle(), Duration::from_secs(30));
+        assert_eq!(c.get_keepalives_interval(), Some(Duration::from_secs(7)));
+        assert_eq!(c.get_keepalives_retries(), Some(3));
+        assert!(!c.get_tcp_nodelay());
+        let u: Config = "postgresql://u@h/db?keepalives=0&tcp_nodelay=1"
+            .parse()
+            .unwrap();
+        assert!(!u.get_keepalives());
+        assert!(u.get_tcp_nodelay());
+    }
+
+    #[test]
+    fn defaults() {
+        let c = Config::new();
+        assert!(!c.get_tcp_nodelay());
+        assert!(!c.get_keepalives());
+        assert_eq!(c.get_keepalives_idle(), Duration::from_secs(2 * 60 * 60));
+        assert_eq!(c.get_keepalives_interval(), None);
+        assert_eq!(c.get_keepalives_retries(), None);
     }
 }
