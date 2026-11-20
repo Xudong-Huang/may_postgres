@@ -17,6 +17,7 @@ pub fn query(
     Ok(RowStream {
         statement,
         responses,
+        rows_affected: None,
     })
 }
 
@@ -32,6 +33,7 @@ pub fn query_portal(client: &Client, portal: &Portal, max_rows: i32) -> Result<R
     Ok(RowStream {
         statement: portal.statement().clone(),
         responses,
+        rows_affected: None,
     })
 }
 
@@ -123,6 +125,20 @@ pub fn encode_bind(
 pub struct RowStream {
     statement: Statement,
     responses: Responses,
+    rows_affected: Option<u64>,
+}
+
+impl RowStream {
+    /// The number of rows the statement affected, from its `CommandComplete`
+    /// tag (`INSERT 0 3`, `UPDATE 5`, `SELECT 2`, ...).
+    ///
+    /// `None` until the stream has been read to its end, and for a portal
+    /// that was suspended before completing. This lets a statement sent with
+    /// `query_raw` (for example to pipeline it with others) report its count
+    /// the way `execute` does, without a second round trip.
+    pub fn rows_affected(&self) -> Option<u64> {
+        self.rows_affected
+    }
 }
 
 impl Iterator for RowStream {
@@ -135,9 +151,19 @@ impl Iterator for RowStream {
                 Message::DataRow(body) => {
                     return Some(Ok(o_try!(Row::new(self.statement.clone(), body))))
                 }
-                Message::EmptyQueryResponse
-                | Message::CommandComplete(_)
-                | Message::PortalSuspended => return None,
+                Message::CommandComplete(body) => {
+                    self.rows_affected = body
+                        .tag()
+                        .ok()
+                        .and_then(|tag| tag.rsplit(' ').next())
+                        .and_then(|n| n.parse().ok());
+                    return None;
+                }
+                Message::EmptyQueryResponse => {
+                    self.rows_affected = Some(0);
+                    return None;
+                }
+                Message::PortalSuspended => return None,
                 Message::ErrorResponse(body) => return Some(Err(Error::db(body))),
                 Message::BindComplete => {}
                 _ => return Some(Err(Error::unexpected_message())),
