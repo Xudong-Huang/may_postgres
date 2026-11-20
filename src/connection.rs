@@ -5,7 +5,7 @@ use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
 use may::queue::mpsc::Queue;
-use may::sync::spsc;
+use may::sync::{spsc, Semphore};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
@@ -16,6 +16,7 @@ use crate::{Error, Notification};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const IO_BUF_SIZE: usize = 4096 * 2;
@@ -67,13 +68,56 @@ pub struct Response {
     tx: RefOrValue<'static, spsc::Sender<BackendMessages>>,
 }
 
+/// Asynchronous notifications delivered by the server: a queue the connection
+/// coroutine fills and the client drains, and a count of pushes a consumer can
+/// park on instead of polling the queue.
+pub(crate) struct Notifications {
+    queue: Queue<Notification>,
+    ready: Semphore,
+    /// Set when the connection coroutine exits.
+    closed: AtomicBool,
+}
+
+impl Notifications {
+    fn new() -> Self {
+        Notifications {
+            queue: Queue::new(),
+            ready: Semphore::new(0),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn push(&self, notification: Notification) {
+        self.queue.push(notification);
+        self.ready.post();
+    }
+
+    /// The connection closed: no more notifications; wake a consumer.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.ready.post();
+    }
+
+    pub(crate) fn queue(&self) -> &Queue<Notification> {
+        &self.queue
+    }
+
+    pub(crate) fn ready(&self) -> &Semphore {
+        &self.ready
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
 /// A connection to a PostgreSQL database.
 pub(crate) struct Connection {
     io_handle: JoinHandle<()>,
     req_queue: Arc<Queue<Request>>,
     /// Asynchronous notifications delivered by the server, filled by the
     /// connection coroutine and drained by the client.
-    notifications: Arc<Queue<Notification>>,
+    notifications: Arc<Notifications>,
     waker: Arc<WaitIoWaker>,
     id: usize,
 }
@@ -139,7 +183,7 @@ fn decode_messages(
     read_buf: &mut BytesMut,
     rsp_queue: &mut VecDeque<Response>,
     parameters: &mut HashMap<String, String>,
-    notifications: &Queue<Notification>,
+    notifications: &Notifications,
 ) -> Result<(), Error> {
     use crate::codec::PostgresCodec;
 
@@ -278,7 +322,7 @@ fn connection_loop(
     stream: &mut TcpStream,
     req_queue: Arc<Queue<Request>>,
     mut params: HashMap<String, String>,
-    notifications: Arc<Queue<Notification>>,
+    notifications: Arc<Notifications>,
 ) -> Result<(), Error> {
     let mut read_buf = BytesMut::with_capacity(IO_BUF_SIZE);
     let mut write_buf = BytesMut::with_capacity(IO_BUF_SIZE);
@@ -318,15 +362,17 @@ impl Connection {
 
         let req_queue = Arc::new(Queue::new());
         let req_queue_dup = req_queue.clone();
-        let notifications = Arc::new(Queue::new());
+        let notifications = Arc::new(Notifications::new());
         let notifications_dup = notifications.clone();
         let io_handle = go!(move || {
+            let waiters = notifications_dup.clone();
             if let Err(e) =
                 connection_loop(&mut stream, req_queue_dup, parameters, notifications_dup)
             {
                 log::error!("connection error = {:?}", e);
                 terminate_connection(&mut stream);
             }
+            waiters.close();
         });
 
         Connection {
@@ -364,7 +410,7 @@ impl Connection {
     ///
     /// Populated by `LISTEN`; see [`crate::Client::notifications`].
     #[inline]
-    pub fn notifications(&self) -> &Queue<Notification> {
+    pub(crate) fn notifications(&self) -> &Notifications {
         &self.notifications
     }
 }
