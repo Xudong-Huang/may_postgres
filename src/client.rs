@@ -1,7 +1,7 @@
 use crate::cancel_query;
 use crate::codec::BackendMessages;
 use crate::config::Host;
-use crate::connection::{Connection, RefOrValue, Request, RequestMessages};
+use crate::connection::{Connection, Request, RequestMessages};
 use crate::copy_out::CopyOutStream;
 use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
@@ -12,7 +12,7 @@ use crate::{
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may::sync::spsc;
+use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
 use spin::Mutex;
 
@@ -25,7 +25,7 @@ use std::time::Duration;
 pub struct Responses {
     tag: usize,
     cur: BackendMessages,
-    rx: Rc<spsc::Receiver<BackendMessages>>,
+    rx: Rc<mpsc::Receiver<BackendMessages>>,
 }
 
 impl Responses {
@@ -63,17 +63,22 @@ pub struct InnerClient {
 
 struct CoChannel {
     tag: Cell<usize>,
-    rx: Rc<spsc::Receiver<BackendMessages>>,
-    tx: spsc::Sender<BackendMessages>,
+    rx: Rc<mpsc::Receiver<BackendMessages>>,
+    tx: mpsc::Sender<BackendMessages>,
 }
 
 impl CoChannel {
-    fn sender(&self) -> RefOrValue<'static, spsc::Sender<BackendMessages>> {
-        // Safety:
-        // 1. there is only one sender
-        // 2. we will wait until all response come back
-        let tx: &'static spsc::Sender<BackendMessages> = unsafe { std::mem::transmute(&self.tx) };
-        RefOrValue::Ref(tx)
+    fn sender(&self) -> mpsc::Sender<BackendMessages> {
+        // Shared ownership, not a transmuted borrow. The old 'static borrow
+        // relied on the client outliving every queued request, which drop
+        // breaks - the io coroutine would then push responses through a
+        // dangling pointer into freed Client memory.
+        //
+        // An owned mpsc Sender, not an Arc<spsc::Sender>: may 0.3.52 made
+        // spsc::Sender !Sync (its push is unsynchronised), so an Arc of one
+        // cannot cross to the io coroutine. mpsc's Sender is cloneable and
+        // safe to share; the receiving side stays single-consumer.
+        self.tx.clone()
     }
 
     fn tag(&self) -> usize {
@@ -82,7 +87,7 @@ impl CoChannel {
         tag
     }
 
-    fn receiver(&self) -> Rc<spsc::Receiver<BackendMessages>> {
+    fn receiver(&self) -> Rc<mpsc::Receiver<BackendMessages>> {
         self.rx.clone()
     }
 }
@@ -90,8 +95,8 @@ impl CoChannel {
 impl InnerClient {
     /// ignore the result
     pub fn raw_send(&self, messages: RequestMessages) -> Result<(), Error> {
-        let (sender, _rx) = spsc::channel();
-        let request = Request::new(0, messages, RefOrValue::Value(sender));
+        let (sender, _rx) = mpsc::channel();
+        let request = Request::new(0, messages, sender);
         self.sender.send(request);
         Ok(())
     }
@@ -156,7 +161,7 @@ unsafe impl Send for Client {}
 impl Clone for Client {
     fn clone(&self) -> Client {
         let co_ch = {
-            let (tx, rx) = spsc::channel();
+            let (tx, rx) = mpsc::channel();
             let rx = Rc::new(rx);
             let tag = Cell::new(0);
             CoChannel { tag, rx, tx }
@@ -256,7 +261,7 @@ impl Client {
 
     pub(crate) fn new(sender: Connection, process_id: i32, secret_key: i32) -> Client {
         let co_ch = {
-            let (tx, rx) = spsc::channel();
+            let (tx, rx) = mpsc::channel();
             let rx = Rc::new(rx);
             let tag = Cell::new(0);
             CoChannel { tag, rx, tx }
