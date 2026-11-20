@@ -26,8 +26,7 @@ pub(crate) fn cancel_query(
         &config.host,
         config.port,
         config.connect_timeout,
-        config.keepalives,
-        config.keepalives_idle,
+        &config.socket,
     )?;
 
     cancel_query_raw::cancel_query_raw(socket, process_id, secret_key)
