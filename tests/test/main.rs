@@ -498,6 +498,31 @@ fn copy_in_error() {
 }
 
 #[test]
+fn a_copy_in_that_fails_to_start_leaves_the_connection_usable() {
+    let client = connect("user=postgres");
+    client
+        .batch_execute("CREATE TEMPORARY TABLE copy_target (n INT)")
+        .unwrap();
+    // Prepares fine (COPY's options are only checked when it runs); fails when executed, before
+    // the server enters COPY mode.
+    let error = client
+        .copy_in::<_, Bytes>("COPY copy_target FROM STDIN WITH (FORMAT nonsense)")
+        .map(drop)
+        .expect_err("an unknown format");
+    assert_eq!(
+        error.code(),
+        Some(&SqlState::INVALID_PARAMETER_VALUE),
+        "{error}"
+    );
+    // Not a COPY at all: the answer is rows, not CopyInResponse.
+    assert!(client.copy_in::<_, Bytes>("SELECT 1").is_err());
+    for _ in 0..3 {
+        assert_eq!(client.execute("SELECT 1", &[]).unwrap(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
 fn copy_out() {
     let client = connect("user=postgres");
 
