@@ -13,6 +13,12 @@ use std::marker::PhantomData;
 enum CopyInMessage {
     Message(FrontendMessage),
     Done,
+    /// The server never entered COPY mode: the statement failed before it started (or answered
+    /// with something other than CopyInResponse). The request already ended with the Sync sent
+    /// after Execute, so there is nothing to abort: sending CopyFail and Sync now would draw a
+    /// ReadyForQuery that no request is waiting for, and the connection would be dropped as
+    /// out of step.
+    NotStarted,
 }
 
 pub struct CopyInReceiver {
@@ -36,6 +42,10 @@ impl CopyInReceiver {
 
         match self.receiver.try_recv() {
             Ok(CopyInMessage::Message(message)) => Ok(Some(message)),
+            Ok(CopyInMessage::NotStarted) => {
+                self.done = true;
+                Err(())
+            }
             Ok(CopyInMessage::Done) => {
                 self.done = true;
                 let mut buf = BytesMut::new();
@@ -167,14 +177,21 @@ where
         .map_err(|_| Error::closed())?;
     waker.wakeup();
 
-    match responses.next()? {
-        Message::BindComplete => {}
-        _ => return Err(Error::unexpected_message()),
-    }
-
-    match responses.next()? {
-        Message::CopyInResponse(_) => {}
-        _ => return Err(Error::unexpected_message()),
+    let started = (|| {
+        match responses.next()? {
+            Message::BindComplete => {}
+            _ => return Err(Error::unexpected_message()),
+        }
+        match responses.next()? {
+            Message::CopyInResponse(_) => Ok(()),
+            _ => Err(Error::unexpected_message()),
+        }
+    })();
+    if let Err(e) = started {
+        // Ignored when the connection is gone: then nothing is listening either way.
+        let _ = sender.send(CopyInMessage::NotStarted);
+        waker.wakeup();
+        return Err(e);
     }
 
     Ok(CopyInSink {
