@@ -53,6 +53,8 @@ socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
 env_logger = "0.11"
+# examples/pgload.rs: latency percentiles for the load tests.
+hdrhistogram = { version = "7", default-features = false }
 
 bit-vec-06 = { version = "0.6", package = "bit-vec" }
 chrono-04 = { version = "0.4", package = "chrono", default-features = false }
@@ -72,3 +74,7 @@ lto = true
 
 # [patch.crates-io]
 # may = { path = "../may" }
+
+[lints.rust]
+# Test code that is disabled on purpose (no unix-socket support in this port; a geo-types version never added).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(unix_nosupport)", "cfg(feature, values(\"with-geo-0_10\"))"] }
