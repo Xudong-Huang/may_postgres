@@ -9,8 +9,15 @@ use may_postgres::types::{Kind, Type};
 use may_postgres::{Client, Config, Error, IsolationLevel, SimpleQueryMessage};
 
 mod binary_copy;
+mod cancel;
+mod db_errors;
+mod edges;
+mod fake_server;
+mod generic_client;
 mod parse;
+mod rows;
 mod runtime;
+mod transactions;
 mod types;
 
 fn connect_raw(s: &str) -> Result<Client, Error> {
