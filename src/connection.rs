@@ -350,7 +350,21 @@ fn connection_loop(
         )
         .map_err(Error::io)?;
         // An in-flight copy may have had more data queued since the last pass.
+        let copying = pending_copy_in.is_some();
         drain_copy_in(&mut pending_copy_in, &mut write_buf);
+        if copying && pending_copy_in.is_none() {
+            // The copy ended on this pass. Requests queued behind it were held back above, and
+            // their wake-up has been spent: send them now, or they wait for unrelated socket
+            // activity (forever, when the copy never started and the server has nothing more
+            // to say).
+            process_req(
+                &req_queue,
+                &mut rsp_queue,
+                &mut write_buf,
+                &mut pending_copy_in,
+            )
+            .map_err(Error::io)?;
+        }
         nonblock_write(inner_stream, &mut write_buf).map_err(Error::io)?;
 
         let mut read_blocked = true;
