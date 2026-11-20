@@ -5,7 +5,7 @@ use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
 use may::queue::mpsc::Queue;
-use may::sync::{spsc, Semphore};
+use may::sync::{mpsc, Semphore};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 
@@ -45,7 +45,7 @@ pub enum RequestMessages {
 pub struct Request {
     tag: usize,
     messages: RequestMessages,
-    sender: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+    sender: RefOrValue<'static, mpsc::Sender<BackendMessages>>,
 }
 
 impl Request {
@@ -53,7 +53,7 @@ impl Request {
     pub fn new(
         tag: usize,
         messages: RequestMessages,
-        sender: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+        sender: RefOrValue<'static, mpsc::Sender<BackendMessages>>,
     ) -> Request {
         Request {
             tag,
@@ -65,7 +65,7 @@ impl Request {
 
 pub struct Response {
     tag: usize,
-    tx: RefOrValue<'static, spsc::Sender<BackendMessages>>,
+    tx: RefOrValue<'static, mpsc::Sender<BackendMessages>>,
 }
 
 /// Asynchronous notifications delivered by the server: a queue the connection

@@ -12,7 +12,7 @@ use crate::{
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may::sync::spsc;
+use may::sync::mpsc;
 use postgres_protocol::message::backend::Message;
 use spin::Mutex;
 
@@ -25,7 +25,7 @@ use std::time::Duration;
 pub struct Responses {
     tag: usize,
     cur: BackendMessages,
-    rx: Rc<spsc::Receiver<BackendMessages>>,
+    rx: Rc<mpsc::Receiver<BackendMessages>>,
 }
 
 impl Responses {
@@ -63,16 +63,16 @@ pub struct InnerClient {
 
 struct CoChannel {
     tag: Cell<usize>,
-    rx: Rc<spsc::Receiver<BackendMessages>>,
-    tx: spsc::Sender<BackendMessages>,
+    rx: Rc<mpsc::Receiver<BackendMessages>>,
+    tx: mpsc::Sender<BackendMessages>,
 }
 
 impl CoChannel {
-    fn sender(&self) -> RefOrValue<'static, spsc::Sender<BackendMessages>> {
+    fn sender(&self) -> RefOrValue<'static, mpsc::Sender<BackendMessages>> {
         // Safety:
         // 1. there is only one sender
         // 2. we will wait until all response come back
-        let tx: &'static spsc::Sender<BackendMessages> = unsafe { std::mem::transmute(&self.tx) };
+        let tx: &'static mpsc::Sender<BackendMessages> = unsafe { std::mem::transmute(&self.tx) };
         RefOrValue::Ref(tx)
     }
 
@@ -82,7 +82,7 @@ impl CoChannel {
         tag
     }
 
-    fn receiver(&self) -> Rc<spsc::Receiver<BackendMessages>> {
+    fn receiver(&self) -> Rc<mpsc::Receiver<BackendMessages>> {
         self.rx.clone()
     }
 }
@@ -90,7 +90,7 @@ impl CoChannel {
 impl InnerClient {
     /// ignore the result
     pub fn raw_send(&self, messages: RequestMessages) -> Result<(), Error> {
-        let (sender, _rx) = spsc::channel();
+        let (sender, _rx) = mpsc::channel();
         let request = Request::new(0, messages, RefOrValue::Value(sender));
         self.sender.send(request);
         Ok(())
@@ -156,7 +156,7 @@ unsafe impl Send for Client {}
 impl Clone for Client {
     fn clone(&self) -> Client {
         let co_ch = {
-            let (tx, rx) = spsc::channel();
+            let (tx, rx) = mpsc::channel();
             let rx = Rc::new(rx);
             let tag = Cell::new(0);
             CoChannel { tag, rx, tx }
@@ -256,7 +256,7 @@ impl Client {
 
     pub(crate) fn new(sender: Connection, process_id: i32, secret_key: i32) -> Client {
         let co_ch = {
-            let (tx, rx) = spsc::channel();
+            let (tx, rx) = mpsc::channel();
             let rx = Rc::new(rx);
             let tag = Cell::new(0);
             CoChannel { tag, rx, tx }
