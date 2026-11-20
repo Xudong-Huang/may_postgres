@@ -948,6 +948,47 @@ fn next_notification_returns_for_sub_millisecond_timeouts() {
 }
 
 #[test]
+fn is_closed_reports_a_terminated_connection() {
+    let client = connect("user=postgres");
+    assert!(!client.is_closed());
+    let pid: i32 = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+
+    let admin = connect("user=postgres");
+    admin
+        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !client.is_closed() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(client.is_closed());
+}
+
+#[test]
+fn a_failed_parameter_encode_leaves_the_connection_usable() {
+    let client = connect("user=postgres");
+    let stmt = client.prepare("SELECT $1::INT").unwrap();
+    // The text value fails to serialize as INT4 half-way through the Bind message.
+    let e = client
+        .query(&stmt, &[&"not an int"])
+        .map(drop)
+        .expect_err("a serialization error");
+    assert!(
+        e.to_string().contains("error serializing parameter 0"),
+        "{e}"
+    );
+    // The partial Bind must not lead the next request.
+    assert_eq!(
+        client.query_one(&stmt, &[&5i32]).unwrap().get::<_, i32>(0),
+        5
+    );
+}
+
+#[test]
 fn dropping_a_client_closes_the_server_backend() {
     // The probe connections carry their own application_name so this count is
     // immune to every other test opening and dropping connections in parallel.
