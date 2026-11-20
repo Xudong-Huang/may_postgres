@@ -433,4 +433,12 @@ impl Connection {
     pub(crate) fn notifications(&self) -> &Notifications {
         &self.notifications
     }
+
+    /// Whether the connection coroutine has exited: the connection failed or
+    /// the server closed it, so no request can complete any more.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        // The coroutine closes its notification queue when the loop exits.
+        self.notifications.is_closed()
+    }
 }
