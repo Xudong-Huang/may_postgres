@@ -946,3 +946,23 @@ fn next_notification_returns_for_sub_millisecond_timeouts() {
         "a sub-millisecond wait did not return"
     );
 }
+
+#[test]
+fn a_failed_parameter_encode_leaves_the_connection_usable() {
+    let client = connect("user=postgres");
+    let stmt = client.prepare("SELECT $1::INT").unwrap();
+    // The text value fails to serialize as INT4 half-way through the Bind message.
+    let e = client
+        .query(&stmt, &[&"not an int"])
+        .map(drop)
+        .expect_err("a serialization error");
+    assert!(
+        e.to_string().contains("error serializing parameter 0"),
+        "{e}"
+    );
+    // The partial Bind must not lead the next request.
+    assert_eq!(
+        client.query_one(&stmt, &[&5i32]).unwrap().get::<_, i32>(0),
+        5
+    );
+}
