@@ -575,6 +575,11 @@ impl Client {
         F: FnOnce(&mut BytesMut) -> R,
     {
         let buf = unsafe { &mut *self.buf.get() };
+        // Every caller splits off what it encoded, so the buffer is empty here unless an earlier
+        // encode failed half-way (a parameter whose ToSql failed after the Bind header was
+        // written). Those bytes must not lead the next request: the server would read a broken
+        // message and end the session.
+        buf.clear();
         let rem = buf.capacity() - buf.len();
         if rem < 512 {
             buf.reserve(4096 * 4 - rem);
