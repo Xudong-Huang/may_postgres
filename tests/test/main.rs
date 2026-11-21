@@ -9,8 +9,15 @@ use may_postgres::types::{Kind, Type};
 use may_postgres::{Client, Config, Error, IsolationLevel, SimpleQueryMessage};
 
 mod binary_copy;
+mod cancel;
+mod db_errors;
+mod edges;
+mod fake_server;
+mod generic_client;
 mod parse;
+mod rows;
 mod runtime;
+mod transactions;
 mod types;
 
 fn connect_raw(s: &str) -> Result<Client, Error> {
@@ -498,6 +505,31 @@ fn copy_in_error() {
 }
 
 #[test]
+fn a_copy_in_that_fails_to_start_leaves_the_connection_usable() {
+    let client = connect("user=postgres");
+    client
+        .batch_execute("CREATE TEMPORARY TABLE copy_target (n INT)")
+        .unwrap();
+    // Prepares fine (COPY's options are only checked when it runs); fails when executed, before
+    // the server enters COPY mode.
+    let error = client
+        .copy_in::<_, Bytes>("COPY copy_target FROM STDIN WITH (FORMAT nonsense)")
+        .map(drop)
+        .expect_err("an unknown format");
+    assert_eq!(
+        error.code(),
+        Some(&SqlState::INVALID_PARAMETER_VALUE),
+        "{error}"
+    );
+    // Not a COPY at all: the answer is rows, not CopyInResponse.
+    assert!(client.copy_in::<_, Bytes>("SELECT 1").is_err());
+    for _ in 0..3 {
+        assert_eq!(client.execute("SELECT 1", &[]).unwrap(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
 fn copy_out() {
     let client = connect("user=postgres");
 
@@ -944,5 +976,25 @@ fn next_notification_returns_for_sub_millisecond_timeouts() {
     assert!(
         rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
         "a sub-millisecond wait did not return"
+    );
+}
+
+#[test]
+fn a_failed_parameter_encode_leaves_the_connection_usable() {
+    let client = connect("user=postgres");
+    let stmt = client.prepare("SELECT $1::INT").unwrap();
+    // The text value fails to serialize as INT4 half-way through the Bind message.
+    let e = client
+        .query(&stmt, &[&"not an int"])
+        .map(drop)
+        .expect_err("a serialization error");
+    assert!(
+        e.to_string().contains("error serializing parameter 0"),
+        "{e}"
+    );
+    // The partial Bind must not lead the next request.
+    assert_eq!(
+        client.query_one(&stmt, &[&5i32]).unwrap().get::<_, i32>(0),
+        5
     );
 }

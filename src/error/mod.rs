@@ -514,3 +514,238 @@ impl Error {
         Error::new(Kind::Timeout, None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::{BufMut, BytesMut};
+    use postgres_protocol::message::backend::Message;
+
+    /// An `ErrorResponse` message with these fields, parsed the way the connection parses it.
+    fn error_response(fields: &[(u8, &str)]) -> ErrorResponseBody {
+        let mut body = BytesMut::new();
+        for (kind, value) in fields {
+            body.put_u8(*kind);
+            body.put_slice(value.as_bytes());
+            body.put_u8(0);
+        }
+        body.put_u8(0);
+        let mut message = BytesMut::new();
+        message.put_u8(b'E');
+        message.put_i32(body.len() as i32 + 4);
+        message.put_slice(&body);
+        match Message::parse(&mut message).unwrap().unwrap() {
+            Message::ErrorResponse(body) => body,
+            _ => unreachable!("an ErrorResponse"),
+        }
+    }
+
+    fn parse(fields: &[(u8, &str)]) -> io::Result<DbError> {
+        DbError::parse(&mut error_response(fields).fields())
+    }
+
+    const MINIMAL: [(u8, &str); 3] = [(b'S', "ERROR"), (b'C', "23505"), (b'M', "duplicate key")];
+
+    #[test]
+    fn every_field_is_parsed() {
+        let e = parse(&[
+            (b'S', "ERREUR"),
+            (b'V', "ERROR"),
+            (b'C', "23505"),
+            (b'M', "duplicate key value"),
+            (b'D', "Key (id)=(1) already exists."),
+            (b'H', "Use another key."),
+            (b'P', "15"),
+            (b'W', "SQL function \"f\""),
+            (b's', "public"),
+            (b't', "accounts"),
+            (b'c', "id"),
+            (b'd', "int4"),
+            (b'n', "accounts_pkey"),
+            (b'F', "nbtinsert.c"),
+            (b'L', "666"),
+            (b'R', "_bt_check_unique"),
+            (b'Z', "an unknown field is ignored"),
+        ])
+        .unwrap();
+        assert_eq!(e.severity(), "ERREUR");
+        assert_eq!(e.parsed_severity(), Some(Severity::Error));
+        assert_eq!(e.code(), &SqlState::UNIQUE_VIOLATION);
+        assert_eq!(e.message(), "duplicate key value");
+        assert_eq!(e.detail(), Some("Key (id)=(1) already exists."));
+        assert_eq!(e.hint(), Some("Use another key."));
+        assert_eq!(e.position(), Some(&ErrorPosition::Original(15)));
+        assert_eq!(e.where_(), Some("SQL function \"f\""));
+        assert_eq!(e.schema(), Some("public"));
+        assert_eq!(e.table(), Some("accounts"));
+        assert_eq!(e.column(), Some("id"));
+        assert_eq!(e.datatype(), Some("int4"));
+        assert_eq!(e.constraint(), Some("accounts_pkey"));
+        assert_eq!(e.file(), Some("nbtinsert.c"));
+        assert_eq!(e.line(), Some(666));
+        assert_eq!(e.routine(), Some("_bt_check_unique"));
+        assert_eq!(
+            e.to_string(),
+            "ERREUR: duplicate key value\nDETAIL: Key (id)=(1) already exists.\nHINT: Use another key."
+        );
+    }
+
+    #[test]
+    fn optional_fields_default_to_none() {
+        let e = parse(&MINIMAL).unwrap();
+        assert_eq!(e.parsed_severity(), None);
+        assert_eq!(e.detail(), None);
+        assert_eq!(e.hint(), None);
+        assert_eq!(e.position(), None);
+        assert_eq!(e.line(), None);
+        assert_eq!(e.to_string(), "ERROR: duplicate key");
+    }
+
+    #[test]
+    fn an_internal_position_carries_its_query() {
+        let e = parse(&[
+            MINIMAL[0],
+            MINIMAL[1],
+            MINIMAL[2],
+            (b'p', "8"),
+            (b'q', "SELECT x"),
+        ])
+        .unwrap();
+        assert_eq!(
+            e.position(),
+            Some(&ErrorPosition::Internal {
+                position: 8,
+                query: "SELECT x".into()
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_fields_are_rejected() {
+        let with = |extra: (u8, &'static str)| {
+            let fields = [MINIMAL[0], MINIMAL[1], MINIMAL[2], extra];
+            parse(&fields).unwrap_err().to_string()
+        };
+        assert!(with((b'P', "x")).contains("`P` field"));
+        assert!(with((b'p', "x")).contains("`p` field"));
+        assert!(with((b'p', "3")).contains("`q` field missing"));
+        assert!(with((b'L', "x")).contains("`L` field"));
+        assert!(with((b'V', "LOUD")).contains("`V` field"));
+        for (missing, name) in [(0, "`S`"), (1, "`C`"), (2, "`M`")] {
+            let fields: Vec<_> = MINIMAL
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != missing)
+                .map(|(_, f)| *f)
+                .collect();
+            assert!(parse(&fields).unwrap_err().to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn severities_round_trip() {
+        for s in [
+            "PANIC", "FATAL", "ERROR", "WARNING", "NOTICE", "DEBUG", "INFO", "LOG",
+        ] {
+            assert_eq!(Severity::from_str(s).unwrap().to_string(), s);
+        }
+        assert_eq!(Severity::from_str("LOUD"), None);
+    }
+
+    #[test]
+    fn db_errors_and_parse_failures() {
+        let db = Error::db(error_response(&MINIMAL));
+        assert_eq!(db.code(), Some(&SqlState::UNIQUE_VIOLATION));
+        assert_eq!(db.as_db_error().unwrap().message(), "duplicate key");
+        assert_eq!(db.to_string(), "db error: ERROR: duplicate key");
+        assert!(db.source().is_some());
+        assert!(!db.is_closed());
+        assert!(format!("{db:?}").contains("Db"));
+        assert!(db.into_source().unwrap().is::<DbError>());
+
+        let unparsable = Error::db(error_response(&[(b'S', "ERROR")]));
+        assert_eq!(unparsable.code(), None);
+        assert!(unparsable
+            .to_string()
+            .starts_with("error parsing response from server"));
+    }
+
+    #[test]
+    fn every_kind_has_a_message() {
+        let io = || io::Error::other("cause");
+        let boxed = || -> Box<dyn error::Error + Sync + Send> { "cause".into() };
+        let cases = [
+            (
+                Error::io(io()),
+                "error communicating with the server: cause",
+            ),
+            (
+                Error::unexpected_message(),
+                "unexpected message from server",
+            ),
+            (
+                Error::to_sql(boxed(), 2),
+                "error serializing parameter 2: cause",
+            ),
+            (
+                Error::from_sql(boxed(), 3),
+                "error deserializing column 3: cause",
+            ),
+            (Error::column("missing".into()), "invalid column `missing`"),
+            (Error::closed(), "connection closed"),
+            (
+                Error::parse(io()),
+                "error parsing response from server: cause",
+            ),
+            (
+                Error::encode(io()),
+                "error encoding message to server: cause",
+            ),
+            (
+                Error::authentication(boxed()),
+                "authentication error: cause",
+            ),
+            (
+                Error::config_parse(boxed()),
+                "invalid connection string: cause",
+            ),
+            (Error::config(boxed()), "invalid configuration: cause"),
+            (
+                Error::row_count(),
+                "query returned an unexpected number of rows",
+            ),
+            (Error::connect(io()), "error connecting to server: cause"),
+            (Error::__private_api_timeout(), "timeout waiting for server"),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), message);
+            assert!(error.as_db_error().is_none());
+        }
+        assert!(Error::closed().is_closed());
+        assert!(Error::closed().into_source().is_none());
+    }
+
+    /// Every code `sqlstate.rs` knows maps to its constant and back, and anything else is kept as is.
+    #[test]
+    fn every_sqlstate_round_trips() {
+        let source = include_str!("sqlstate.rs");
+        let codes: Vec<&str> = source
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let rest = line.strip_prefix("Inner::E")?;
+                let (_, code) = rest.split_once(" => \"")?;
+                code.strip_suffix("\",")
+            })
+            .collect();
+        assert!(codes.len() > 250, "found {} codes", codes.len());
+        for code in codes {
+            let state = SqlState::from_code(code);
+            assert_eq!(state.code(), code);
+            assert_eq!(state, SqlState::from_code(code).clone());
+        }
+        let other = SqlState::from_code("ZZ999");
+        assert_eq!(other.code(), "ZZ999");
+        assert_ne!(other, SqlState::UNIQUE_VIOLATION);
+    }
+}

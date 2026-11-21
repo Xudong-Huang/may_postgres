@@ -891,3 +891,145 @@ mod socket_option_tests {
         assert_eq!(c.get_keepalives_retries(), None);
     }
 }
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    fn parse(s: &str) -> Config {
+        s.parse().unwrap_or_else(|e| panic!("{s:?}: {e}"))
+    }
+
+    fn error(s: &str) -> String {
+        s.parse::<Config>().unwrap_err().to_string()
+    }
+
+    fn hosts(config: &Config) -> Vec<&str> {
+        config.host.iter().map(|Host::Tcp(h)| h.as_str()).collect()
+    }
+
+    #[test]
+    fn key_value_options() {
+        let c = parse(
+            "user=u password=p dbname=d options='-c search_path=x' application_name=app \
+             host=a,b port=5433, connect_timeout=7 keepalives=0 keepalives_idle=30 \
+             keepalives_interval=5 keepalives_retries=3 tcp_nodelay=0 \
+             target_session_attrs=read-write",
+        );
+        assert_eq!(c.user.as_deref(), Some("u"));
+        assert_eq!(c.password.as_deref(), Some(&b"p"[..]));
+        assert_eq!(c.dbname.as_deref(), Some("d"));
+        assert_eq!(c.options.as_deref(), Some("-c search_path=x"));
+        assert_eq!(c.application_name.as_deref(), Some("app"));
+        assert_eq!(hosts(&c), ["a", "b"]);
+        assert_eq!(c.port, [5433, 5432]);
+        assert_eq!(c.connect_timeout, Some(Duration::from_secs(7)));
+        assert!(!c.get_keepalives());
+        assert_eq!(c.get_keepalives_idle(), Duration::from_secs(30));
+        assert_eq!(c.get_keepalives_interval(), Some(Duration::from_secs(5)));
+        assert_eq!(c.get_keepalives_retries(), Some(3));
+        assert!(!c.get_tcp_nodelay());
+        assert_eq!(c.target_session_attrs, TargetSessionAttrs::ReadWrite);
+    }
+
+    #[test]
+    fn non_positive_durations_leave_the_defaults() {
+        let c = parse(
+            "connect_timeout=0 keepalives_idle=-1 keepalives_interval=0 target_session_attrs=any",
+        );
+        assert_eq!(c.connect_timeout, Config::new().connect_timeout);
+        assert_eq!(c.get_keepalives_idle(), Config::new().get_keepalives_idle());
+        assert_eq!(
+            c.get_keepalives_interval(),
+            Config::new().get_keepalives_interval()
+        );
+        assert_eq!(c.target_session_attrs, TargetSessionAttrs::Any);
+    }
+
+    #[test]
+    fn quoting_and_escapes() {
+        let c = parse(r"  user = 'a b\'c'   password=x\ y dbname=''  ");
+        assert_eq!(c.user.as_deref(), Some("a b'c"));
+        assert_eq!(c.password.as_deref(), Some(&b"x y"[..]));
+        assert_eq!(c.dbname.as_deref(), Some(""));
+        assert_eq!(parse("").user, None);
+    }
+
+    #[test]
+    fn key_value_errors() {
+        assert!(error("user").contains("unexpected EOF"));
+        assert!(error("user x").contains("expected `=` but got `x`"));
+        assert!(error("user=").contains("unexpected EOF"));
+        assert!(error("user='abc").contains("unterminated quoted"));
+        assert!(error("bogus=1").contains("unknown option `bogus`"));
+        for key in [
+            "port",
+            "connect_timeout",
+            "keepalives",
+            "keepalives_idle",
+            "keepalives_interval",
+            "keepalives_retries",
+            "tcp_nodelay",
+            "target_session_attrs",
+        ] {
+            assert!(
+                error(&format!("{key}=nope"))
+                    .contains(&format!("invalid value for option `{key}`")),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn urls() {
+        let c = parse(
+            "postgresql://us%20er:p%40ss@h1:5433,[::1]:5434,h3/db%2Fx?application_name=a%26b",
+        );
+        assert_eq!(c.user.as_deref(), Some("us er"));
+        assert_eq!(c.password.as_deref(), Some(&b"p@ss"[..]));
+        assert_eq!(hosts(&c), ["h1", "::1", "h3"]);
+        assert_eq!(c.port, [5433, 5434, 5432]);
+        assert_eq!(c.dbname.as_deref(), Some("db/x"));
+        assert_eq!(c.application_name.as_deref(), Some("a&b"));
+
+        let c = parse("postgres://[::1]?host=other&port=6000");
+        assert_eq!(hosts(&c), ["::1", "other"]);
+        assert_eq!(c.port, [5432, 6000]);
+
+        let c = parse("postgres://user@");
+        assert_eq!(c.user.as_deref(), Some("user"));
+        assert!(c.host.is_empty());
+        let c = parse("postgres://h/");
+        assert_eq!(c.dbname, None);
+        assert_eq!(hosts(&parse("postgres://h")), ["h"]);
+    }
+
+    #[test]
+    fn url_errors() {
+        assert!(error("postgres://[::1").contains("invalid value for option `host`"));
+        assert!(error("postgres://[::1]x").contains("invalid value for option `host`"));
+        assert!(error("postgres://h?novalue").contains("unterminated parameter"));
+        assert!(error("postgres://h/%ff").contains("invalid connection string"));
+        assert!(error("postgres://%ff@h").contains("invalid connection string"));
+        assert!(error("postgres://h?x=1").contains("unknown option `x`"));
+    }
+
+    #[test]
+    fn builder_and_debug() {
+        let mut c = Config::default();
+        c.user("u")
+            .password("secret")
+            .dbname("d")
+            .host("h")
+            .port(1)
+            .connect_timeout(Duration::from_secs(2))
+            .keepalives(true)
+            .keepalives_idle(Duration::from_secs(3))
+            .tcp_nodelay(true)
+            .target_session_attrs(TargetSessionAttrs::Any);
+        let debug = format!("{c:?}");
+        assert!(debug.contains("password: Some(_)"), "{debug}");
+        assert!(!debug.contains("secret"));
+        assert_eq!(c.clone(), c);
+    }
+}

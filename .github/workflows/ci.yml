@@ -1,47 +1,74 @@
 name: CI
 
+# Same shape as may_minihttp's CI: lints, the test suite under nextest with reports, load tests,
+# one combined report (posted on pull requests) and a summary.
+#
+# - Lints: fmt and clippy -D warnings on Linux and macOS. Not Windows: the crate is unix-only
+#   (Connection::new takes the socket's raw fd).
+# - Tests: the full suite (unit, integration, types) against PostgreSQL 15, 16 and 17, with the
+#   auth-method fixtures from ci/initdb. PostgreSQL 14 stays out: the test binary segfaults against
+#   it on the unmodified base too, a pre-existing runtime bug; adding it back is one matrix entry.
+# - Coverage: the suite under cargo-llvm-cov against PostgreSQL 17 with the fixtures; fails below
+#   COVERAGE_MIN_LINES of lines. The lcov file is uploaded for tooling.
+# - Load tests: pgbench's workloads through libpq (pgbench) and through may_postgres
+#   (examples/pgload.rs) against the same server; hack/load-test.sh writes the comparison and fails
+#   on failed transactions or when may_postgres falls below LOAD_MIN_RATIO of pgbench's tps.
+
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - '**.md'
   pull_request:
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  test:
-    name: Test (PostgreSQL ${{ matrix.postgres }})
-    runs-on: ubuntu-latest
-    # The suite talks to a database over a coroutine-driven connection, so a
-    # protocol-level stall shows up as a hang rather than a failure. A job-level
-    # limit turns that into a legible red build instead of a runner burning its
-    # full six hours.
+  lints:
+    name: Lints (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
-
     strategy:
       fail-fast: false
       matrix:
-        # PostgreSQL 14 is deliberately absent. The test binary segfaults
-        # against it — SIGSEGV after a handful of tests — and it does so on the
-        # unmodified base commit too, so this is a pre-existing runtime bug
-        # rather than anything to do with this workflow. A matrix leg that can
-        # never pass just teaches people to ignore red CI, so 14 stays out until
-        # that is fixed. Adding it back is a one-line change.
-        postgres: [16]
-
+        os:
+          - ubuntu-latest
+          - macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
 
-      # Started with `docker run` rather than a `services:` block because the
-      # container needs the fixture scripts from the repository, and service
-      # containers are created before the checkout step runs.
+  tests:
+    name: Tests (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    needs: [lints]
+    # The suite talks to a database over a coroutine-driven connection, so a protocol-level stall
+    # shows up as a hang rather than a failure. A job-level limit turns that into a red build.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [15, 16, 17]
+    steps:
+      - uses: actions/checkout@v5
+
+      # `docker run` rather than `services:`: the container needs the fixture scripts from the
+      # repository, and service containers start before the checkout.
       - name: Start PostgreSQL
         run: |
-          # Removed first so a re-run on a persistent runner — or a local
-          # `act` invocation — does not collide with a container left behind
-          # by a previous attempt and then silently test against stale fixtures.
           docker rm --force postgres 2>/dev/null || true
-
           docker run --detach --name postgres \
             --publish 127.0.0.1:5433:5432 \
             --env POSTGRES_USER=postgres \
@@ -52,16 +79,13 @@ jobs:
       - name: Wait for PostgreSQL
         run: |
           for _ in $(seq 1 60); do
-            if docker exec postgres pg_isready --quiet --username postgres; then
-              # pg_isready reports the server is accepting connections, but the
-              # entrypoint restarts it once the initdb scripts have run. Confirm
-              # a fixture role exists so we do not race that restart.
-              if docker exec postgres psql --username postgres --tuples-only \
-                   --command "SELECT 1 FROM pg_roles WHERE rolname = 'scram_user'" \
-                   | grep --quiet 1; then
-                echo "PostgreSQL ready with fixtures applied"
-                exit 0
-              fi
+            # pg_isready passes before the entrypoint's restart after the initdb scripts; a fixture
+            # role existing means the final server is up.
+            if docker exec postgres psql --username postgres --tuples-only \
+                 --command "SELECT 1 FROM pg_roles WHERE rolname = 'scram_user'" 2>/dev/null \
+                 | grep --quiet 1; then
+              echo "PostgreSQL ready with fixtures applied"
+              exit 0
             fi
             sleep 1
           done
@@ -70,34 +94,293 @@ jobs:
           exit 1
 
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
 
-      - name: Test
-        run: cargo test --all
+      - name: Run the suite with nextest
+        shell: bash
+        run: |
+          mkdir -p target/nextest
+          set +e
+          NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 \
+            cargo nextest run --workspace --no-fail-fast \
+              --message-format libtest-json \
+              2>&1 > target/nextest/tests-pg${{ matrix.postgres }}.json
+          status=$?
+          set -e
+          python3 hack/nextest-report.py \
+            --title "Tests — PostgreSQL ${{ matrix.postgres }}" \
+            --output-json target/nextest/tests-pg${{ matrix.postgres }}-summary.json \
+            target/nextest/tests-pg${{ matrix.postgres }}.json \
+            > target/nextest/tests-pg${{ matrix.postgres }}-report.md
+          cat target/nextest/tests-pg${{ matrix.postgres }}-report.md
+          exit $status
 
       - name: PostgreSQL logs
         if: failure()
         run: docker logs postgres
 
-  lint:
-    name: Lint
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-pg${{ matrix.postgres }}
+          path: target/nextest/
+          retention-days: 7
+
+  coverage:
+    name: Coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    needs: [lints]
+    timeout-minutes: 25
+    env:
+      COVERAGE_MIN_LINES: "95"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: Start PostgreSQL 17
+        run: |
+          docker rm --force postgres 2>/dev/null || true
+          docker run --detach --name postgres \
+            --publish 127.0.0.1:5433:5432 \
+            --env POSTGRES_USER=postgres \
+            --env POSTGRES_HOST_AUTH_METHOD=trust \
+            --volume "$PWD/ci/initdb:/docker-entrypoint-initdb.d:ro" \
+            postgres:17
+          for _ in $(seq 1 60); do
+            if docker exec postgres psql --username postgres --tuples-only \
+                 --command "SELECT 1 FROM pg_roles WHERE rolname = 'scram_user'" 2>/dev/null \
+                 | grep --quiet 1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs postgres
+          exit 1
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,nextest
 
-      - name: Format
-        run: cargo fmt --all -- --check
+      - name: Suite under coverage
+        run: cargo llvm-cov --no-report nextest --workspace
 
-      # Not `-D warnings`: that would make this job fail on pre-existing lints
-      # unrelated to whichever change is being reviewed. Warnings stay visible in
-      # the log, and can be promoted to errors once the tree is clean.
-      - name: Clippy
-        run: cargo clippy --all-targets
+      - name: Coverage report
+        shell: bash
+        run: |
+          mkdir -p target/coverage
+          cargo llvm-cov report --lcov --output-path target/coverage/lcov.info
+          cargo llvm-cov report --json --summary-only --output-path target/coverage/summary.json
+          cargo llvm-cov report --summary-only
+          set +e
+          python3 hack/coverage-report.py --min-lines "$COVERAGE_MIN_LINES" \
+            target/coverage/summary.json > target/coverage/coverage-report.md
+          status=$?
+          set -e
+          cat target/coverage/coverage-report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/coverage/
+          retention-days: 7
+
+  load-tests:
+    name: Load tests
+    runs-on: ubuntu-latest
+    needs: [tests]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: load
+
+      - name: Start PostgreSQL 17
+        run: |
+          docker rm --force postgres 2>/dev/null || true
+          docker run --detach --name postgres \
+            --publish 127.0.0.1:5433:5432 \
+            --env POSTGRES_HOST_AUTH_METHOD=trust \
+            postgres:17 -c max_connections=200 -c shared_buffers=256MB
+          for _ in $(seq 1 60); do
+            docker exec postgres pg_isready --quiet --host 127.0.0.1 --username postgres && sleep 2 \
+              && docker exec postgres pg_isready --quiet --host 127.0.0.1 --username postgres && exit 0
+            sleep 1
+          done
+          docker logs postgres
+          exit 1
+
+      - name: pgbench
+        run: |
+          if ! command -v pgbench >/dev/null && ! ls /usr/lib/postgresql/*/bin/pgbench >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-16 >/dev/null
+          fi
+          ls /usr/lib/postgresql/*/bin/pgbench || command -v pgbench
+
+      - name: Run load tests (pgbench vs may_postgres)
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5433"
+          PGUSER: postgres
+          LOAD_SCALE: "10"
+          LOAD_CLIENTS: "8"
+          LOAD_DURATION: "20"
+          LOAD_WARMUP: "5"
+          LOAD_MIN_RATIO: "0.5"
+        run: hack/load-test.sh
+
+      - name: Upload load reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-reports
+          path: |
+            target/load/*.md
+            target/load/*.json
+            target/load/*.out
+          retention-days: 7
+
+  generate-reports:
+    name: Generate test reports
+    runs-on: ubuntu-latest
+    needs: [tests, coverage, load-tests]
+    if: always()
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download test reports
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: reports-pg*
+          path: reports/
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: coverage-report
+          path: reports/coverage/
+
+      # The load job only runs when every test job passed; when it was skipped there is no
+      # artifact, and the combined report says so. Its absence must not fail this job.
+      - name: Download load reports
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: load-reports
+          path: reports/load/
+
+      - name: Build combined report
+        shell: bash
+        run: |
+          OUT=target/reports/combined.md
+          mkdir -p target/reports
+          {
+            echo "## Test Report"
+            echo
+            for pg in 15 16 17; do
+              echo "---"
+              echo "### Tests (PostgreSQL $pg)"
+              echo
+              if ls reports/reports-pg$pg/tests-pg$pg-report.md >/dev/null 2>&1; then
+                cat reports/reports-pg$pg/tests-pg$pg-report.md
+              else
+                echo "Skipped (no test artifacts)"
+              fi
+              echo
+            done
+            echo "---"
+            echo "### Coverage"
+            echo
+            if [[ -f reports/coverage/coverage-report.md ]]; then
+              cat reports/coverage/coverage-report.md
+            else
+              echo "Skipped (no coverage report found)"
+            fi
+            echo
+            echo "---"
+            echo "### Load tests"
+            echo
+            if [[ -f reports/load/load-report.md ]]; then
+              cat reports/load/load-report.md
+            else
+              echo "Skipped (no load report found)"
+            fi
+          } > "$OUT"
+          jsons=$(ls reports/reports-pg*/tests-pg??.json 2>/dev/null || true)
+          if [[ -n "$jsons" ]]; then
+            python3 hack/nextest-report.py --title "Combined Test Report" \
+              --output-json target/reports/combined.json $jsons > target/reports/summary.md || true
+          fi
+
+      - name: Upload combined reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-reports
+          path: target/reports/
+          retention-days: 7
+
+      # Pull requests only. Posting the report is a convenience: failing to post it never fails CI.
+      - name: Post PR comment with reports
+        if: github.event.pull_request != null
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          if [[ -f target/reports/combined.md ]]; then
+            head -c 50000 target/reports/combined.md > /tmp/pr-body.md
+          else
+            echo "⚠️ Report generation failed" > /tmp/pr-body.md
+          fi
+          COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("## Test Report"))) | .id' \
+            2>/dev/null | head -1 || true)
+          if [[ "$COMMENT_ID" =~ ^[0-9]+$ ]]; then
+            gh api repos/${{ github.repository }}/issues/comments/${COMMENT_ID} --method PATCH \
+              --field body="$(cat /tmp/pr-body.md)" > /dev/null \
+              || echo "::warning::could not update the PR comment"
+          else
+            gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+              --field body="$(cat /tmp/pr-body.md)" > /dev/null \
+              || echo "::warning::could not create the PR comment"
+          fi
+
+  ci-summary:
+    name: CI summary
+    runs-on: ubuntu-latest
+    needs: [lints, tests, coverage, load-tests, generate-reports]
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "## CI Summary"
+            echo
+            echo "| Job | Status |"
+            echo "|-----|--------|"
+            echo "| Lints | ${{ needs.lints.result }} |"
+            echo "| Tests | ${{ needs.tests.result }} |"
+            echo "| Coverage | ${{ needs.coverage.result }} |"
+            echo "| Load tests | ${{ needs.load-tests.result }} |"
+            echo "| Generate reports | ${{ needs.generate-reports.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Fail when a required job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
