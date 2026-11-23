@@ -1,7 +1,7 @@
 use crate::cancel_query;
 use crate::codec::BackendMessages;
 use crate::config::Host;
-use crate::connection::{Connection, Request, RequestMessages};
+use crate::connection::{Connection, Request, RequestMessages, ResponseSender};
 use crate::copy_out::CopyOutStream;
 use crate::query::RowStream;
 use crate::simple_query::SimpleQueryStream;
@@ -12,7 +12,7 @@ use crate::{
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
-use may::sync::mpsc;
+use may::sync::spsc;
 use postgres_protocol::message::backend::Message;
 use spin::Mutex;
 
@@ -25,7 +25,7 @@ use std::time::Duration;
 pub struct Responses {
     tag: usize,
     cur: BackendMessages,
-    rx: Rc<mpsc::Receiver<BackendMessages>>,
+    rx: Rc<spsc::Receiver<BackendMessages>>,
 }
 
 impl Responses {
@@ -63,21 +63,17 @@ pub struct InnerClient {
 
 struct CoChannel {
     tag: Cell<usize>,
-    rx: Rc<mpsc::Receiver<BackendMessages>>,
-    tx: mpsc::Sender<BackendMessages>,
+    rx: Rc<spsc::Receiver<BackendMessages>>,
+    tx: ResponseSender,
 }
 
 impl CoChannel {
-    fn sender(&self) -> mpsc::Sender<BackendMessages> {
-        // Shared ownership, not a transmuted borrow. The old 'static borrow
-        // relied on the client outliving every queued request, which drop
-        // breaks - the io coroutine would then push responses through a
-        // dangling pointer into freed Client memory.
-        //
-        // An owned mpsc Sender, not an Arc<spsc::Sender>: may 0.3.52 made
-        // spsc::Sender !Sync (its push is unsynchronised), so an Arc of one
-        // cannot cross to the io coroutine. mpsc's Sender is cloneable and
-        // safe to share; the receiving side stays single-consumer.
+    fn sender(&self) -> ResponseSender {
+        // The response channel is genuinely single-producer (the connection
+        // loop) and single-consumer (this client handle), so it is an spsc
+        // channel. Its Sender is !Sync - its push is unsynchronised - so it
+        // crosses to the io coroutine inside an Arc<Mutex>; the lock is
+        // uncontended because that loop is the only place that pushes.
         self.tx.clone()
     }
 
@@ -87,7 +83,7 @@ impl CoChannel {
         tag
     }
 
-    fn receiver(&self) -> Rc<mpsc::Receiver<BackendMessages>> {
+    fn receiver(&self) -> Rc<spsc::Receiver<BackendMessages>> {
         self.rx.clone()
     }
 }
@@ -95,8 +91,8 @@ impl CoChannel {
 impl InnerClient {
     /// ignore the result
     pub fn raw_send(&self, messages: RequestMessages) -> Result<(), Error> {
-        let (sender, _rx) = mpsc::channel();
-        let request = Request::new(0, messages, sender);
+        let (sender, _rx) = spsc::channel();
+        let request = Request::new(0, messages, Arc::new(Mutex::new(sender)));
         self.sender.send(request);
         Ok(())
     }
@@ -161,10 +157,14 @@ unsafe impl Send for Client {}
 impl Clone for Client {
     fn clone(&self) -> Client {
         let co_ch = {
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = spsc::channel();
             let rx = Rc::new(rx);
             let tag = Cell::new(0);
-            CoChannel { tag, rx, tx }
+            CoChannel {
+                tag,
+                rx,
+                tx: Arc::new(Mutex::new(tx)),
+            }
         };
         Client {
             inner: self.inner.clone(),
@@ -261,10 +261,14 @@ impl Client {
 
     pub(crate) fn new(sender: Connection, process_id: i32, secret_key: i32) -> Client {
         let co_ch = {
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = spsc::channel();
             let rx = Rc::new(rx);
             let tag = Cell::new(0);
-            CoChannel { tag, rx, tx }
+            CoChannel {
+                tag,
+                rx,
+                tx: Arc::new(Mutex::new(tx)),
+            }
         };
         Client {
             inner: Arc::new(InnerClient {

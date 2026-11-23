@@ -5,9 +5,11 @@ use may::go;
 use may::io::{WaitIo, WaitIoWaker};
 use may::net::TcpStream;
 use may::queue::mpsc::Queue;
-use may::sync::{mpsc, Semphore};
+use may::sync::spsc;
+use may::sync::Semphore;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
+use spin::Mutex;
 
 use crate::codec::{BackendMessage, BackendMessages, FrontendMessage};
 use crate::copy_in::CopyInReceiver;
@@ -25,23 +27,30 @@ pub enum RequestMessages {
     CopyIn(CopyInReceiver),
 }
 
+/// Owned, shareable handle to one client handle's response channel.
+///
+/// The response channel is single-producer (only the connection loop pushes)
+/// and single-consumer (only the client handle reads), which is exactly what
+/// `spsc` is for. Its `Sender` is neither cloneable nor `Sync` - `push` is
+/// unsynchronised - so it reaches the io coroutine behind an `Arc<Mutex>`.
+/// The lock is uncontended by construction: `decode_messages` is its only
+/// lock site, and every request carrying this handle belongs to one
+/// connection, whose loop is the only sender. Hence the spin lock.
+///
+/// Shared ownership, not a transmuted borrow: requests can sit in the queues
+/// after the originating Client is dropped, so a borrow here would dangle
+/// into freed Client memory the moment drop stopped being an instant kill.
+pub(crate) type ResponseSender = Arc<Mutex<spsc::Sender<BackendMessages>>>;
+
 pub struct Request {
     tag: usize,
     messages: RequestMessages,
-    // OWNED (shared) sender, never a transmuted borrow: requests can sit in
-    // the queues after the originating Client is dropped, so a borrow here
-    // would dangle into freed Client memory the moment drop stopped being
-    // an instant kill.
-    sender: mpsc::Sender<BackendMessages>,
+    sender: ResponseSender,
 }
 
 impl Request {
     #[inline]
-    pub fn new(
-        tag: usize,
-        messages: RequestMessages,
-        sender: mpsc::Sender<BackendMessages>,
-    ) -> Request {
+    pub fn new(tag: usize, messages: RequestMessages, sender: ResponseSender) -> Request {
         Request {
             tag,
             messages,
@@ -52,7 +61,7 @@ impl Request {
 
 pub struct Response {
     tag: usize,
-    tx: mpsc::Sender<BackendMessages>,
+    tx: ResponseSender,
 }
 
 /// Asynchronous notifications delivered by the server: a queue the connection
@@ -205,7 +214,9 @@ fn decode_messages(
                 };
 
                 messages.tag = response.tag;
-                response.tx.send(messages).ok();
+                // Uncontended by construction: this loop is the only writer
+                // of any response channel (see ResponseSender).
+                response.tx.lock().send(messages).ok();
 
                 if request_complete {
                     rsp_queue.pop_front();
