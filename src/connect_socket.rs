@@ -131,11 +131,11 @@ mod tests {
         let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(socket.as_raw_fd()) };
         let sock = socket2::SockRef::from(&fd);
         (
-            sock.nodelay().unwrap(),
+            sock.tcp_nodelay().unwrap(),
             sock.keepalive().unwrap(),
-            sock.keepalive_time().unwrap(),
-            sock.keepalive_interval().unwrap(),
-            sock.keepalive_retries().unwrap(),
+            sock.tcp_keepalive_time().unwrap(),
+            sock.tcp_keepalive_interval().unwrap(),
+            sock.tcp_keepalive_retries().unwrap(),
         )
     }
 

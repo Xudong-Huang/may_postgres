@@ -37,7 +37,7 @@ js = ["postgres-protocol/js", "postgres-types/js"]
 [dependencies]
 log = "0.4"
 phf = "0.11"
-spin = "0.9"
+spin = "0.12"
 bytes = "1"
 smallvec = "1"
 byteorder = "1"
@@ -49,7 +49,7 @@ postgres-protocol = "0.6"
 
 may = { version = "0.3", default-features = false }
 # TCP keepalive idle / interval / retry count (std exposes none of them).
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 env_logger = "0.11"
